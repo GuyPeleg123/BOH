@@ -1,3 +1,23 @@
+/*
+ * ArgManager.cc — Command-line argument parsing for LTESniffer.
+ *
+ * This file implements the three static methods of ArgManager:
+ *
+ *   defaultArgs()  — Populate an Args struct with safe, sane default values.
+ *                    Called automatically by parseArgs(); safe to call first
+ *                    if you want a fully initialised struct before getopt runs.
+ *
+ *   usage()        — Print a human-readable help message to stdout listing
+ *                    every supported flag together with its current default.
+ *
+ *   parseArgs()    — Walk argv with getopt(), map each flag character to the
+ *                    corresponding Args field, and validate that mandatory
+ *                    options (RF frequency or input file) have been supplied.
+ *
+ * All flags are single-character (POSIX getopt style).  See ArgManager.h for
+ * a detailed description of every field and its associated flag.
+ */
+
 //#include "falcon/common/Settings.h"
 #include "include/ArgManager.h"
 

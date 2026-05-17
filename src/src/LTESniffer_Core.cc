@@ -1,3 +1,59 @@
+/*
+ * LTESniffer_Core.cc — Main runtime core for LTESniffer.
+ *
+ * Overview
+ * --------
+ * This file contains the top-level run loop that drives the entire passive LTE
+ * capture session.  Starting from a set of CLI arguments (Args), the core:
+ *
+ *   1. Opens the RF device (USRP B210 or similar via UHD/srsRAN RF layer) or,
+ *      in offline mode, opens a pre-recorded IQ sample file.
+ *
+ *   2. Optionally performs automatic cell search (PSS/SSS/PBCH) to discover the
+ *      target eNodeB.  If cell search is disabled, the cell is configured
+ *      manually from Args::cell_id and Args::nof_prb.
+ *
+ *   3. Initialises srsRAN's ue_sync engine for LTE frame synchronisation and
+ *      timing recovery.  The callback srsran_rf_recv_wrapper() feeds raw IQ
+ *      samples from the RF device into ue_sync on every call.
+ *
+ *   4. Enters the main subframe loop:
+ *        a. Calls srsran_ue_sync_zerocopy() to obtain one time-aligned LTE
+ *           subframe (1 ms) of IQ data.
+ *        b. State DECODE_MIB  — waits for subframe index 0 and decodes the
+ *           Master Information Block (MIB/PBCH) to obtain the System Frame
+ *           Number (SFN) and final cell parameters.  Transitions to
+ *           DECODE_PDSCH once the MIB is found.
+ *        c. State DECODE_PDSCH — hands the subframe buffer to a free
+ *           SubframeWorker thread from the Phy pool.  Each worker blindly
+ *           decodes PDCCH (DCI), then decodes PDSCH (DL data) or PUSCH (UL
+ *           data) for every active RNTI found.
+ *
+ *   5. Writes decoded MAC PDUs to a PCAP file so they can be opened directly
+ *      in Wireshark:
+ *        - Downlink mode : ltesniffer_dl_mode.pcap
+ *        - Uplink mode   : ltesniffer_ul_mode.pcap
+ *
+ *   6. Periodically updates the MCS-tracking database and, when HARQ mode is
+ *      enabled, the HARQ retransmission database.  Prints a one-line per-second
+ *      subframe throughput report to stdout.
+ *
+ * Key state machine
+ * -----------------
+ *   DECODE_MIB  -->  (MIB found)  -->  DECODE_PDSCH
+ *   DECODE_PDSCH --> (sync lost > 5 frames) --> DECODE_MIB  (re-sync)
+ *
+ * Output files
+ * ------------
+ *   ltesniffer_dl_mode.pcap  — MAC-LTE PCAP (DL mode, DLT=147)
+ *   ltesniffer_ul_mode.pcap  — MAC-LTE PCAP (UL mode, DLT=147)
+ *
+ * Dependencies
+ * ------------
+ *   srsRAN (ue_sync, rf, pbch, chest), FALCON (falcon_ue_dl, RNTIManager),
+ *   Phy, SubframeWorker, MCSTracking, HARQ, ULSchedule, PcapWriter.
+ */
+
 #include <stdio.h>
 #include <iostream>
 #include <assert.h>
@@ -587,6 +643,24 @@ LTESniffer_Core::~LTESniffer_Core(){
   printf("Deleted DL Sniffer core\n");
 }
 
+/*
+ * srsran_rf_recv_wrapper — srsRAN ue_sync receive callback.
+ *
+ * This function is registered as the sample-source callback when initialising
+ * ue_sync via srsran_ue_sync_init_multi_decim().  On every call, ue_sync
+ * requests exactly 'nsamples' complex samples; this wrapper forwards the call
+ * to srsran_rf_recv_with_time_multi(), which performs the blocking SDR receive
+ * (e.g. over a USB 3.0 link to a USRP B210).  The received IQ data is placed
+ * directly into the SubframeWorker's pre-allocated buffers (zero-copy path).
+ *
+ * Parameters:
+ *   h         — opaque handle cast to srsran_rf_t* (the open RF device)
+ *   data_     — array of per-antenna IQ buffers (up to SRSRAN_MAX_PORTS)
+ *   nsamples  — number of complex samples requested by ue_sync
+ *   t         — optional srsRAN timestamp struct (not used here; passed as NULL)
+ *
+ * Returns the number of samples actually received, or a negative error code.
+ */
 /*function to receive sample from SDR (usrp...)*/
 int srsran_rf_recv_wrapper( void* h,
                             cf_t* data_[SRSRAN_MAX_PORTS], 

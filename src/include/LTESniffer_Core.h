@@ -78,11 +78,34 @@ static SRSRAN_AGC_CALLBACK(srsran_rf_set_rx_gain_th_wrapper_)
   srsran_rf_set_rx_gain_th((srsran_rf_t*)h, gain_db);
 }
 
+/* srsran_rf_recv_wrapper — see LTESniffer_Core.cc for full documentation.
+ * Registered as the ue_sync receive callback; reads IQ samples from the RF
+ * device into the SubframeWorker buffers on every ue_sync iteration. */
 int srsran_rf_recv_wrapper( void* h,
-                            cf_t* data_[SRSRAN_MAX_PORTS], 
-                            uint32_t nsamples, 
+                            cf_t* data_[SRSRAN_MAX_PORTS],
+                            uint32_t nsamples,
                             srsran_timestamp_t* t);
 
+/*
+ * LTESniffer_Core — top-level runtime controller for a passive LTE capture
+ * session.
+ *
+ * Responsibilities
+ * ----------------
+ *   - Opens the RF front-end (or IQ file) and configures the receive chain.
+ *   - Runs optional automatic PSS/SSS/MIB cell search.
+ *   - Initialises srsRAN ue_sync for continuous LTE frame synchronisation.
+ *   - Drives the subframe state machine (DECODE_MIB → DECODE_PDSCH).
+ *   - Dispatches time-aligned subframe buffers to a pool of SubframeWorker
+ *     threads (managed by Phy) for blind PDCCH / PDSCH / PUSCH decoding.
+ *   - Collects decoded MAC PDUs and writes them to a PCAP file via PcapWriter.
+ *   - Maintains MCS-tracking and HARQ retransmission databases.
+ *   - Handles OS signals (SIGINT / SIGTERM) to initiate a clean shutdown.
+ *
+ * The class is non-copyable.  Create exactly one instance per capture session
+ * and call run() from the main thread; call stop() from a signal handler or
+ * another thread to request a graceful exit.
+ */
 class LTESniffer_Core : public SignalHandler {
 public:
   LTESniffer_Core(const Args& args);
@@ -102,22 +125,24 @@ private:
 
   void handleSignal() override;
 
-  Args                    args;
-  int                     nof_workers;
-  int                     sniffer_mode;     //-m
-  int                     api_mode    ;     // -z
-  bool                    go_exit = false;
-  enum receiver_state     { DECODE_MIB, DECODE_PDSCH} state;
-  std::mutex              harq_map_mutex;
-  Phy                     *phy;
-  LTESniffer_pcap_writer  pcapwriter;
-  srsran::mac_pcap        mac_pcap;
-  int                     mcs_tracking_mode;
-  MCSTracking             mcs_tracking;
-  ULSchedule              ulsche;
-  UL_Sniffer_ta_buffer_t  ta_buffer;
-  std::atomic<float>      est_cfo; //cfo from chest in subframe workers
-  UL_HARQ                 ul_harq; // test UL_HARQ
-  HARQ                    harq; // test HARQ function
-  int                     harq_mode;
+  Args                    args;             // full copy of CLI arguments passed to the constructor
+  int                     nof_workers;      // number of SubframeWorker threads (= args.nof_sniffer_thread)
+  int                     sniffer_mode;     // -m : DL_MODE=0 or UL_MODE=1
+  int                     api_mode    ;     // -z : security API mode (-1=off, 0–3=various levels)
+  bool                    go_exit = false;  // set to true by stop()/handleSignal() to break the main loop
+  enum receiver_state     { DECODE_MIB, DECODE_PDSCH} state; // current subframe processing state
+  std::mutex              harq_map_mutex;   // protects concurrent access to the HARQ database
+  Phy                     *phy;             // owns the SubframeWorker pool and common PHY state
+  LTESniffer_pcap_writer  pcapwriter;       // writes decoded MAC PDUs to a PCAP file
+  srsran::mac_pcap        mac_pcap;         // srsRAN MAC PCAP helper (backup / API path)
+  int                     mcs_tracking_mode; // -q : 0=disabled, 1=enabled MCS/256-QAM tracking
+  MCSTracking             mcs_tracking;     // per-RNTI MCS and 256-QAM modulation tracker
+  ULSchedule              ulsche;           // uplink scheduling oracle (maps DL DCI to UL grants)
+  UL_Sniffer_ta_buffer_t  ta_buffer;        // temporary IQ buffer used to receive UL samples
+                                            //   slightly ahead of the DL timing reference
+  std::atomic<float>      est_cfo;          // latest CFO estimate fed back from SubframeWorkers
+                                            //   (chest-based); used to steer the RF centre frequency
+  UL_HARQ                 ul_harq;          // uplink HARQ process tracker
+  HARQ                    harq;             // downlink HARQ retransmission tracker
+  int                     harq_mode;        // 0=HARQ disabled, 1=HARQ tracking enabled
 };
