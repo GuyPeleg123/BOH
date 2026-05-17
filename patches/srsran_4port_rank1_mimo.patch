@@ -1,0 +1,66 @@
+--- a/srsRAN-src/lib/src/phy/mimo/precoding.c
++++ b/srsRAN-src/lib/src/phy/mimo/precoding.c
+@@ -1812,6 +1812,56 @@
+   return SRSRAN_SUCCESS;
+ }
+
++/* 4-port rank-1 MRC equalizer for spatial multiplexing.
++ *
++ * Applies one of the four primary LTE 4-port rank-1 DFT codebook vectors
++ * (3GPP TS 36.211 Table 6.3.4.2.3-2, first group) selected by codebook_idx,
++ * then performs MRC combining across all receive antennas.
++ *
++ *   idx 0 -> w = [1, 1, 1, 1]/2
++ *   idx 1 -> w = [1, j,-1,-j]/2
++ *   idx 2 -> w = [1,-1, 1,-1]/2
++ *   idx 3 -> w = [1,-j,-1, j]/2
++ *
++ * Indices 4-15 fall back to idx 0; CRC rejects mis-matched decodes.
++ * TX power normalisation is 1/2 for these vectors, so norm = 2/scaling.
++ */
++static int srsran_predecoding_multiplex_4x1_mrc(cf_t* y[SRSRAN_MAX_PORTS],
++                                                cf_t* h[SRSRAN_MAX_PORTS][SRSRAN_MAX_PORTS],
++                                                cf_t* x[SRSRAN_MAX_LAYERS],
++                                                int   nof_rxant,
++                                                int   codebook_idx,
++                                                int   nof_symbols,
++                                                float scaling)
++{
++  /* 3GPP TS 36.211 Table 6.3.4.2.3-2, rank-1, indices 0-3 (DFT columns). */
++  static const cf_t cb[4][4] = {
++    { 1.0f+0.0fi,  1.0f+0.0fi,  1.0f+0.0fi,  1.0f+0.0fi },  /* W_0 [1, 1, 1, 1] */
++    { 1.0f+0.0fi,  0.0f+1.0fi, -1.0f+0.0fi,  0.0f-1.0fi },  /* W_1 [1, j,-1,-j] */
++    { 1.0f+0.0fi, -1.0f+0.0fi,  1.0f+0.0fi, -1.0f+0.0fi },  /* W_2 [1,-1, 1,-1] */
++    { 1.0f+0.0fi,  0.0f-1.0fi, -1.0f+0.0fi,  0.0f+1.0fi },  /* W_3 [1,-j,-1, j] */
++  };
++  int   cb_idx = (codebook_idx < 4) ? codebook_idx : 0;
++  float norm   = 2.0f / scaling;
++
++  for (int i = 0; i < nof_symbols; i++) {
++    float hh = 0.0f;
++    cf_t  x0 = 0.0f;
++    for (int rx = 0; rx < nof_rxant; rx++) {
++      cf_t h_eff = h[0][rx][i] * cb[cb_idx][0] + h[1][rx][i] * cb[cb_idx][1]
++                 + h[2][rx][i] * cb[cb_idx][2] + h[3][rx][i] * cb[cb_idx][3];
++      hh += crealf(h_eff) * crealf(h_eff) + cimagf(h_eff) * cimagf(h_eff);
++      x0 += conjf(h_eff) * y[rx][i];
++    }
++    x[0][i] = (hh > 0.0f) ? x0 * (norm / hh) : 0.0f;
++  }
++  return SRSRAN_SUCCESS;
++}
++
+ static int srsran_predecoding_multiplex(cf_t*  y[SRSRAN_MAX_PORTS],
+                                         cf_t*  h[SRSRAN_MAX_PORTS][SRSRAN_MAX_PORTS],
+                                         cf_t*  x[SRSRAN_MAX_LAYERS],
+@@ -1849,7 +1899,11 @@
+     }
+   } else if (nof_ports == 4) {
+-    ERROR("Error predecoding multiplex: not implemented for %d Tx ports", nof_ports);
++    if (nof_layers == 1) {
++      return srsran_predecoding_multiplex_4x1_mrc(y, h, x, nof_rxant, codebook_idx, nof_symbols, scaling);
++    }
++    ERROR("Error predecoding multiplex: 4 Tx ports with %d layers not implemented", nof_layers);
+   } else {
+     ERROR("Error predecoding multiplex: Invalid combination of ports %d and rx antennas %d", nof_ports, nof_rxant);
+   }

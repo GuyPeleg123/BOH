@@ -183,10 +183,14 @@ int dl_sniffer_config_mimo_pmi(const srsran_cell_t* cell, const srsran_dci_dl_t*
   uint32_t nof_tb = grant->nof_tb;
   if (grant->tx_scheme == SRSRAN_TXSCHEME_SPATIALMUX) {
     if (nof_tb == 1) {
-      if (dci->pinfo > 0 && dci->pinfo < 5) {
+      /* For 4-port cells, rank-1 pinfo spans 1-16 (3GPP TS 36.212 Table 5.3.3.1.5-4).
+       * For 2-port cells, rank-1 pinfo spans 1-4. Accept the broader range so that
+       * 4-port spatial-multiplexing DCIs are not silently dropped as PMI_WRONG. */
+      uint32_t pinfo_max = (cell->nof_ports == 4) ? 16 : 4;
+      if (dci->pinfo > 0 && dci->pinfo <= pinfo_max) {
         grant->pmi = dci->pinfo - 1;
       } else {
-        INFO("Not Implemented (nof_tb=%d, pinfo=%d)", nof_tb, dci->pinfo);
+        INFO("Not Implemented (nof_tb=%d, pinfo=%d, nof_ports=%d)", nof_tb, dci->pinfo, cell->nof_ports);
         return -1;
       }
     } else {
