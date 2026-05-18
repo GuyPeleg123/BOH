@@ -141,6 +141,16 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
                 args.harq_mode,
                 &ulsche);
   phy->getCommon().setShortcutDiscovery(args.enable_shortcut_discovery);
+
+  if (!args.keys_file.empty()) {
+    std::string key_base = (sniffer_mode == DL_MODE) ? "ltesniffer_dl_mode" : "ltesniffer_ul_mode";
+    if (key_store_.load(args.keys_file)) {
+      key_store_.open_output(key_base);
+      for (auto& w : phy->getWorkers()) {
+        w->set_key_store(&key_store_);
+      }
+    }
+  }
   std::shared_ptr<DCIConsumerList> cons(new DCIConsumerList());
   if(args.dci_file_name != "") {
     cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIToFile>(new DCIToFile(phy->getCommon().getDCIFile()))));
@@ -622,6 +632,7 @@ bool LTESniffer_Core::run(){
 
   /* Print statistic of harq retransmission*/
   //if (harq_mode){ harq.printHARQDatabase(); }
+  key_store_.close_output();
   return EXIT_SUCCESS;
 }
 

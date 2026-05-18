@@ -1,5 +1,6 @@
 #pragma once
 
+#include "KeyAttaching.h"
 #include "PhyCommon.h"
 #include "MetaFormats.h"
 #include "DL_Sniffer_PDSCH.h"
@@ -45,6 +46,7 @@ public:
   void                  run_dl_mode(SubframeInfo &subframeInfo);
   void                  run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti);
   void                  set_ul_harq(UL_HARQ *ul_harq_){ ul_harq = ul_harq_;}
+  void                  set_key_store(KeyStore* ks);
   void                  print_nof_DCI(SubframeInfo &subframeInfo, uint32_t tti);
   DCIBlindSearchStats&  getStats();
 

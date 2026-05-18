@@ -122,12 +122,13 @@ void ArgManager::usage(Args& args, const std::string& prog) {
   printf("\t-m Sniffer mode, 0 for downlink sniffing mode, 1 for uplink sniffing mode\n");
   printf("\t-z API mode, 0 for identity mapping, 1 for IMSI collecting, 2 for UECapability profiling, 3 for all\n");
   printf("\t-d Enable debug mode, print debug message to screen (Defautl disable)\n");
+  printf("\t-K Path to JSON key file for key-attaching (PDCP decryption) feature\n");
 }
 
 void ArgManager::parseArgs(Args& args, int argc, char **argv) {
   int opt;
   defaultArgs(args);
-  while ((opt = getopt(argc, argv, "aAcCDdEfghHilLnpPrRsStTvwWyYqFIuUmOoz")) != -1) {
+  while ((opt = getopt(argc, argv, "aAcCDdEfghHilLnpPrRsStTvwWyYqFIuUmOozK:")) != -1) {
     switch (opt) {
       case 'a':
         args.rf_args = argv[optind];
@@ -236,6 +237,9 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'z':
         args.api_mode = static_cast<uint32_t>(strtoul(argv[optind], nullptr, 0));
+        break;
+      case 'K':
+        args.keys_file = optarg;
         break;
       case 'h':
       default:

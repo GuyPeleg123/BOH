@@ -1,5 +1,6 @@
 #pragma once
 
+#include "KeyAttaching.h"
 #include "DCICollection.h"
 #include "PhyCommon.h"
 #include <vector>
@@ -46,6 +47,7 @@
 
 /*Include for decode MAC CE*/
 #include "srsran/mac/pdu.h"
+#include "srsran/asn1/rrc/security.h"
 
 
 using namespace asn1;
@@ -178,11 +180,17 @@ public:
     }
     void set_debug_mode(bool debug) { en_debug = debug;}
     void set_api_mode(int api_mode_) { api_mode = api_mode_;}
+    void set_key_store(KeyStore* ks) { key_store = ks; }
     void print_api_dl(uint32_t tti, uint16_t rnti, int ident, std::string value, int msg);
 
+    // Decode an unencrypted SRB1 SDU looking for SecurityModeCommand.
+    // When found, calls key_store->set_security_algo() + activate_security().
+    int  decode_security_mode_cmd(const uint8_t* sdu_ptr, int length, uint16_t rnti);
+
 private:
-    int         api_mode            = -1; 
+    int         api_mode            = -1;
     bool        en_debug            = false;
+    KeyStore*   key_store           = nullptr;
     uint16_t    target_rnti         = 0;
     bool        has_target_rnti     = false;
     int         nof_antenna         = 2;

@@ -399,6 +399,11 @@ void SubframeWorker::set_ue_dl_uecfg(srsran_ue_dl_cfg_t *ue_dl_cfg)
   ue_dl_cfg->cfg.dci.srs_request_enabled = false;
 }
 
+void SubframeWorker::set_key_store(KeyStore* ks)
+{
+  pdschdecoder->set_key_store(ks);
+}
+
 void SubframeWorker::print_nof_DCI(SubframeInfo &subframeInfo, uint32_t tti)
 {
   std::vector<DL_Sniffer_DCI_DL> dl_dci_test = subframeInfo.getDCICollection().getDLSnifferDCI_DL();

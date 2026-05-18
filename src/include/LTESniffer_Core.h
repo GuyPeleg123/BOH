@@ -23,6 +23,7 @@
 #include <map>
 
 #include "ArgManager.h"
+#include "KeyAttaching.h"
 #include "falcon/common/SignalManager.h"
 #include "include/SubframeWorker.h"
 #include "include/ThreadSafeQueue.h"
@@ -145,4 +146,5 @@ private:
   UL_HARQ                 ul_harq;          // uplink HARQ process tracker
   HARQ                    harq;             // downlink HARQ retransmission tracker
   int                     harq_mode;        // 0=HARQ disabled, 1=HARQ tracking enabled
+  KeyStore                key_store_;       // PDCP decryption engine (empty unless -K flag given)
 };

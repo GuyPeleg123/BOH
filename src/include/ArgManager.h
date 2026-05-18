@@ -171,6 +171,11 @@ struct Args {
    *          2 = UE capability profiling
    *          3 = all API functions enabled */
   int         api_mode    = -1; //api functions, 0: identity mapping, 1: UECapa, 2: IMSI
+
+  /* -K  : path to JSON key file for the key-attaching feature.
+   *        When set, LTESniffer will decrypt PDCP traffic for the listed RNTIs
+   *        and write plaintext IP packets to a companion pcap file. */
+  std::string keys_file   = "";
 };
 
 /*
