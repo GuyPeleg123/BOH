@@ -8,6 +8,10 @@ cmake_minimum_required (VERSION 2.8.11)
 #message("CIP = ${CMAKE_INSTALL_PREFIX} (should be /usr/local")
 project (DL_Sniffer)
 
+# C++17 required for UHD 4.x+ headers (e.g. std::optional in rfnoc)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 #set (CMAKE_INSTALL_PREFIX /usr/local)
 
 #message("CIP = ${CMAKE_INSTALL_PREFIX} (should be /usr/local")
