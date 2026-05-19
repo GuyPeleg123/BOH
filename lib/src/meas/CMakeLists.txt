@@ -1,8 +1,6 @@
  
 file(GLOB SOURCES "*.cc" "*.c")
 add_library(falcon_meas STATIC ${SOURCES})
-target_compile_options(falcon_meas PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
-
 target_link_libraries(falcon_meas
   falcon_common
   falcon_prof
