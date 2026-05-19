@@ -2,7 +2,7 @@ file(GLOB SOURCES "*.cc" "*.c")
 
 add_library(DL_Sniffer_lib STATIC ${SOURCES})
 
-target_compile_options(DL_Sniffer_lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-std=c++11>)
+target_compile_options(DL_Sniffer_lib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
 
 target_link_libraries(DL_Sniffer_lib
     pthread
