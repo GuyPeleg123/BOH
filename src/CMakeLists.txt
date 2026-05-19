@@ -5,7 +5,7 @@ set(INSTALL_BUNDLE)
 
 add_executable(LTESniffer LTESniffer.cc)
 target_link_libraries(LTESniffer DL_Sniffer_lib falcon_common falcon_phy falcon_util falcon_prof)
-target_compile_options(LTESniffer PUBLIC "-std=c++11")
+target_compile_options(LTESniffer PUBLIC "-std=c++17")
 list(APPEND INSTALL_BUNDLE LTESniffer)
 
 # nested install targets are not supported by old Cmake on Ubuntu 18
