@@ -416,7 +416,7 @@ bool KeyStore::do_decrypt(uint8_t* key16, uint8_t* int_key16,
 
 uint32_t KeyStore::decrypt_srb(UESecurityState& ue, uint8_t lcid,
                                 const uint8_t* sdu, uint32_t sdu_len,
-                                uint8_t* out)
+                                uint8_t direction, uint8_t* out)
 {
     // Minimum: 2 (RLC-AM) + 1 (PDCP-hdr) + 4 (MAC-I) = 7 bytes
     if (sdu_len < 7) return 0;
@@ -460,7 +460,7 @@ uint32_t KeyStore::decrypt_srb(UESecurityState& ue, uint8_t lcid,
     static uint8_t plain[8192];
     bool ok = do_decrypt(ue.k_rrc_enc + 16, ue.k_rrc_int + 16,
                          ue.cipher_algo, ue.integ_algo,
-                         bearer_param, SECURITY_DIRECTION_DOWNLINK,
+                         bearer_param, direction,
                          bs, ct, ct_len, mac_i, plain, ue.hfn_hint);
     if (!ok) return 0;
 
@@ -475,7 +475,7 @@ uint32_t KeyStore::decrypt_srb(UESecurityState& ue, uint8_t lcid,
 
 void KeyStore::decrypt_drb(UESecurityState& ue, uint8_t lcid,
                             const uint8_t* sdu, uint32_t sdu_len,
-                            uint32_t tti)
+                            uint8_t direction, uint32_t tti)
 {
     // Need at least 2 (RLC) + 2 (PDCP) + 20 (min IP) = 24 bytes
     if (sdu_len < 24) return;
@@ -516,7 +516,7 @@ void KeyStore::decrypt_drb(UESecurityState& ue, uint8_t lcid,
         static uint8_t plain[8192];
         bool ok = do_decrypt(ue.k_up_enc + 16, nullptr,
                              ue.cipher_algo, ue.integ_algo,
-                             bearer_param, SECURITY_DIRECTION_DOWNLINK,
+                             bearer_param, direction,
                              bs, ct, ct_len, nullptr, plain, ue.hfn_hint);
         if (ok) {
             write_ip_pkt(plain, ct_len, tti);
@@ -558,14 +558,60 @@ void KeyStore::process_dl_mac_pdu(uint16_t rnti, uint8_t* mac_pdu,
         if (lcid == 1 || lcid == 2) {
             // SRB — decrypt and log RRC message type
             if (ue.cipher_algo == CIPHERING_ALGORITHM_ID_EEA0) continue; // unencrypted
-            uint32_t plain_len = decrypt_srb(ue, lcid, sdu_ptr, sdu_len, plain);
+            uint32_t plain_len = decrypt_srb(ue, lcid, sdu_ptr, sdu_len,
+                                             SECURITY_DIRECTION_DOWNLINK, plain);
             if (plain_len > 0) {
-                printf("[KeyAttach] RNTI 0x%04x SRB%d: decrypted %u bytes\n",
+                printf("[KeyAttach] RNTI 0x%04x SRB%d DL: decrypted %u bytes\n",
                        rnti, lcid, plain_len);
             }
         } else if (lcid >= 3) {
             // DRB — decrypt and write IP to pcap
-            decrypt_drb(ue, lcid, sdu_ptr, sdu_len, tti);
+            decrypt_drb(ue, lcid, sdu_ptr, sdu_len, SECURITY_DIRECTION_DOWNLINK, tti);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Uplink entry point: process one decoded PUSCH MAC PDU
+// Same pipeline as process_dl_mac_pdu but uses SECURITY_DIRECTION_UPLINK
+// so the cipher/integrity COUNT uses direction=1 as per 3GPP TS 33.401.
+// ──────────────────────────────────────────────────────────────────────────────
+
+void KeyStore::process_ul_mac_pdu(uint16_t rnti, uint8_t* mac_pdu,
+                                   uint32_t mac_pdu_len, uint32_t tti)
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+
+    auto it = states_.find(rnti);
+    if (it == states_.end()) return;
+
+    UESecurityState& ue = it->second;
+    if (!ue.keys_derived || !ue.security_active) return;
+
+    srsran::sch_pdu pdu(20, srslog::fetch_basic_logger("MAC"));
+    pdu.init_rx(mac_pdu_len, false);
+    pdu.parse_packet(mac_pdu);
+
+    static uint8_t plain[8192];
+
+    while (pdu.next()) {
+        if (!pdu.get()->is_sdu()) continue;
+        uint8_t  lcid    = pdu.get()->get_sdu_lcid();
+        uint32_t sdu_len = pdu.get()->get_payload_size();
+        uint8_t* sdu_ptr = pdu.get()->get_sdu_ptr();
+
+        if (sdu_len == 0 || sdu_ptr == nullptr) continue;
+
+        if (lcid == 1 || lcid == 2) {
+            if (ue.cipher_algo == CIPHERING_ALGORITHM_ID_EEA0) continue;
+            uint32_t plain_len = decrypt_srb(ue, lcid, sdu_ptr, sdu_len,
+                                             SECURITY_DIRECTION_UPLINK, plain);
+            if (plain_len > 0) {
+                printf("[KeyAttach] RNTI 0x%04x SRB%d UL: decrypted %u bytes\n",
+                       rnti, lcid, plain_len);
+            }
+        } else if (lcid >= 3) {
+            decrypt_drb(ue, lcid, sdu_ptr, sdu_len, SECURITY_DIRECTION_UPLINK, tti);
         }
     }
 }

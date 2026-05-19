@@ -78,10 +78,13 @@ public:
     bool open_output(const std::string& base_path);
     void close_output();
 
-    // Process one decoded MAC PDU.  Parses the MAC sub-headers, identifies
-    // SRBs (LCID 1,2) and DRBs (LCID 3+), and attempts PDCP decryption for
-    // each when security is active.
+    // Process one decoded downlink MAC PDU (PDSCH).
     void process_dl_mac_pdu(uint16_t rnti, uint8_t* mac_pdu,
+                             uint32_t mac_pdu_len, uint32_t tti);
+
+    // Process one decoded uplink MAC PDU (PUSCH).  Identical pipeline to the
+    // DL path but uses SECURITY_DIRECTION_UPLINK for cipher/integrity ops.
+    void process_ul_mac_pdu(uint16_t rnti, uint8_t* mac_pdu,
                              uint32_t mac_pdu_len, uint32_t tti);
 
 private:
@@ -94,18 +97,16 @@ private:
     // Write one raw-IP packet record.
     void write_ip_pkt(const uint8_t* pkt, uint32_t len, uint32_t tti);
 
-    // Decrypt SRB PDU (LCID 1 or 2).  sdu/sdu_len is the full MAC SDU
-    // (= RLC AM PDU, 2-byte header + PDCP).
-    // Fills out[] with plaintext RRC bytes; returns length or 0 on failure.
+    // Decrypt SRB PDU (LCID 1 or 2).  direction = SECURITY_DIRECTION_DOWNLINK
+    // or SECURITY_DIRECTION_UPLINK.  Returns plaintext RRC length, 0 on fail.
     uint32_t decrypt_srb(UESecurityState& ue, uint8_t lcid,
                          const uint8_t* sdu, uint32_t sdu_len,
-                         uint8_t* out);
+                         uint8_t direction, uint8_t* out);
 
-    // Decrypt DRB PDU (LCID 3+).  sdu/sdu_len is the full MAC SDU.
-    // Writes decrypted IP packet to output pcap on success.
+    // Decrypt DRB PDU (LCID 3+).  Writes decrypted IP packet to output pcap.
     void decrypt_drb(UESecurityState& ue, uint8_t lcid,
                      const uint8_t* sdu, uint32_t sdu_len,
-                     uint32_t tti);
+                     uint8_t direction, uint32_t tti);
 
     // Inner decrypt helper: updates bearer HFN, handles mid-session sync.
     // For SRBs verifies integrity; for DRBs checks IP header.

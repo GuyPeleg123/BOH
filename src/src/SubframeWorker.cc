@@ -402,6 +402,7 @@ void SubframeWorker::set_ue_dl_uecfg(srsran_ue_dl_cfg_t *ue_dl_cfg)
 void SubframeWorker::set_key_store(KeyStore* ks)
 {
   pdschdecoder->set_key_store(ks);
+  if (puschdecoder) puschdecoder->set_key_store(ks);
 }
 
 void SubframeWorker::print_nof_DCI(SubframeInfo &subframeInfo, uint32_t tti)

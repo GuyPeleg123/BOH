@@ -1,4 +1,5 @@
 #pragma once
+#include "KeyAttaching.h"
 #include "DCICollection.h"
 #include "PcapWriter.h"
 #include "ULSchedule.h"
@@ -92,6 +93,7 @@ public:
 
     void work_prach(); 
 
+    void set_key_store(KeyStore* ks)      { key_store_ = ks; }
     void set_ul_harq (UL_HARQ *ul_harq_) { ul_harq = ul_harq_;  }
     void set_target_rnti(uint16_t rnti)  {
         if (rnti != 0){
@@ -132,6 +134,8 @@ private:
     cf_t                    samples[prach_buffer_sz] = {};
     UL_HARQ                 *ul_harq; //on developing
     MCSTracking             *mcstracking;
+
+    KeyStore*               key_store_          = nullptr;
 
     /*Backup*/
     int                     multi_ul_offset;

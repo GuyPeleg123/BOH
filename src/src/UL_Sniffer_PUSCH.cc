@@ -281,6 +281,13 @@ void PUSCH_Decoder::decode_run(std::string info, DCI_UL &decoding_mem, std::stri
         int length = ul_cfg.pusch.grant.tb.tbs / 8;
         pcapwriter->write_ul_crnti(pusch_res.data, length, ul_cfg.pusch.rnti, ul_sf.tti);
 
+        if (key_store_ &&
+            key_store_->has_ue(ul_cfg.pusch.rnti) &&
+            key_store_->is_security_active(ul_cfg.pusch.rnti)) {
+            key_store_->process_ul_mac_pdu(ul_cfg.pusch.rnti,
+                                           pusch_res.data, length, ul_sf.tti);
+        }
+
         /*Update max UL modulation scheme 16/64/256QAM when mcs index > 20*/
         if (mcs_idx > 20 && decoding_mem.mcs_mod == UL_SNIFFER_UNKNOWN_MOD)
         {
