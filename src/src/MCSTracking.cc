@@ -1461,7 +1461,7 @@ void MCSTracking::update_ue_config_rnti(uint16_t rnti, ltesniffer_ue_spec_config
             dl_iter->second.ue_spec_config = ue_spec_config;
         }
     }
-    else if (sniffer_mode == UL_MODE)
+    else if (sniffer_mode == UL_DL_MODE)
     {
         std::map<uint16_t, ul_sniffer_tracking_t>::iterator ul_iter;
         ul_iter = tracking_database_ul_mode.find(rnti);
@@ -1498,7 +1498,7 @@ ltesniffer_ue_spec_config_t MCSTracking::get_ue_config_rnti(uint16_t rnti)
             // nothing
         }
     }
-    else if (sniffer_mode == UL_MODE)
+    else if (sniffer_mode == UL_DL_MODE)
     {
         std::map<uint16_t, ul_sniffer_tracking_t>::iterator ul_iter;
         ul_iter = tracking_database_ul_mode.find(rnti);

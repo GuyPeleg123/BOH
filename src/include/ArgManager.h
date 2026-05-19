@@ -91,10 +91,10 @@ struct Args {
   /* -I  : physical cell ID to use when cell search (-C) is disabled */
   uint32_t    cell_id = 0;
 
-  /* -u  : uplink centre frequency in Hz; required when sniffer_mode = UL_MODE */
+  /* -u  : uplink centre frequency in Hz; required when sniffer_mode = UL_DL_MODE */
   double      ul_freq = 0;
 
-  /* -m  : operating mode — 0 = DL_MODE (downlink), 1 = UL_MODE (uplink) */
+  /* -m  : operating mode — 0 = DL_MODE (downlink only), 1 = UL_DL_MODE (uplink and downlink) */
   int         sniffer_mode = DL_MODE;
 
   /* -d  : when true, print verbose debug messages to stdout */

@@ -32,7 +32,7 @@
  *   5. Writes decoded MAC PDUs to a PCAP file so they can be opened directly
  *      in Wireshark:
  *        - Downlink mode : ltesniffer_dl_mode.pcap
- *        - Uplink mode   : ltesniffer_ul_mode.pcap
+ *        - Uplink mode   : ltesniffer_ul_dl_mode.pcap
  *
  *   6. Periodically updates the MCS-tracking database and, when HARQ mode is
  *      enabled, the HARQ retransmission database.  Prints a one-line per-second
@@ -46,7 +46,7 @@
  * Output files
  * ------------
  *   ltesniffer_dl_mode.pcap  — MAC-LTE PCAP (DL mode, DLT=147)
- *   ltesniffer_ul_mode.pcap  — MAC-LTE PCAP (UL mode, DLT=147)
+ *   ltesniffer_ul_dl_mode.pcap  — MAC-LTE PCAP (UL mode, DLT=147)
  *
  * Dependencies
  * ------------
@@ -119,7 +119,7 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   if (sniffer_mode == DL_MODE){
     pcap_file_name = "ltesniffer_dl_mode.pcap";
   } else {
-    pcap_file_name = "ltesniffer_ul_mode.pcap";
+    pcap_file_name = "ltesniffer_ul_dl_mode.pcap";
   }
   pcapwriter.open(pcap_file_name, pcap_file_name_api, 0);
   /*Init HARQ*/
@@ -143,7 +143,7 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   phy->getCommon().setShortcutDiscovery(args.enable_shortcut_discovery);
 
   if (!args.keys_file.empty()) {
-    std::string key_base = (sniffer_mode == DL_MODE) ? "ltesniffer_dl_mode" : "ltesniffer_ul_mode";
+    std::string key_base = (sniffer_mode == DL_MODE) ? "ltesniffer_dl_mode" : "ltesniffer_ul_dl_mode";
     if (key_store_.load(args.keys_file)) {
       key_store_.open_output(key_base);
       for (auto& w : phy->getWorkers()) {
@@ -237,7 +237,7 @@ bool LTESniffer_Core::run(){
     }
 
     /* set receiver frequency */
-    if (sniffer_mode == UL_MODE && args.ul_freq != 0){
+    if (sniffer_mode == UL_DL_MODE && args.ul_freq != 0){
       printf("Tunning DL receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
       if (srsran_rf_set_rx_freq(&rf, 0, args.rf_freq + args.file_offset_freq)) {
         ///ERROR("Tunning DL Freq failed\n");
@@ -247,7 +247,7 @@ bool LTESniffer_Core::run(){
       if (srsran_rf_set_rx_freq(&rf, 1, args.ul_freq )){
         //ERROR("Tunning UL Freq failed \n");
       }
-    } else if (sniffer_mode == UL_MODE && args.ul_freq == 0){
+    } else if (sniffer_mode == UL_DL_MODE && args.ul_freq == 0){
       ERROR("Uplink Frequency must be defined in the UL Sniffer Mode \n");
     } else if (sniffer_mode == DL_MODE && args.ul_freq == 0){
       printf("Tunning receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
@@ -542,7 +542,7 @@ bool LTESniffer_Core::run(){
         case DL_MODE:
           if (mcs_tracking_mode && args.target_rnti == 0){ mcs_tracking.update_database_dl(); }
           break;
-        case UL_MODE:
+        case UL_DL_MODE:
           if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
           break;
         default:
@@ -560,7 +560,7 @@ bool LTESniffer_Core::run(){
           if (harq_mode && args.target_rnti == 0){ harq.updateHARQDatabase(); }
           mcs_tracking_timer = 0;
           break;
-        case UL_MODE:
+        case UL_DL_MODE:
           if (api_mode == -1) {mcs_tracking.print_database_ul();}
           if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
           mcs_tracking_timer = 0;
@@ -601,7 +601,7 @@ bool LTESniffer_Core::run(){
       mcs_tracking.merge_all_database_dl();
       if (api_mode == -1) {mcs_tracking.print_all_database_dl(); }
       break;
-    case UL_MODE:
+    case UL_DL_MODE:
       mcs_tracking.merge_all_database_ul();
       if (api_mode == -1) {mcs_tracking.print_all_database_ul(); }
       break;

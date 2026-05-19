@@ -128,7 +128,7 @@ private:
 
   Args                    args;             // full copy of CLI arguments passed to the constructor
   int                     nof_workers;      // number of SubframeWorker threads (= args.nof_sniffer_thread)
-  int                     sniffer_mode;     // -m : DL_MODE=0 or UL_MODE=1
+  int                     sniffer_mode;     // -m : DL_MODE=0 or UL_DL_MODE=1
   int                     api_mode    ;     // -z : security API mode (-1=off, 0–3=various levels)
   bool                    go_exit = false;  // set to true by stop()/handleSignal() to break the main loop
   enum receiver_state     { DECODE_MIB, DECODE_PDSCH} state; // current subframe processing state

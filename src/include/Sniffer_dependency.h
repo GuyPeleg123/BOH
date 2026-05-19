@@ -37,7 +37,7 @@
 #define BOLDWHITE   "\033[1m\033[37m"      /* Bold White */
 
 #define DL_MODE     0
-#define UL_MODE     1
+#define UL_DL_MODE  1
 
 #define ID_RAN_VAL  0
 #define ID_TMSI     1

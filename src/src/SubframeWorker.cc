@@ -53,7 +53,7 @@ SubframeWorker::SubframeWorker(uint32_t idx,
     /* PDSCH decoder (Downlink)*/
     pdschdecoder = new PDSCH_Decoder(idx, pcapwriter, mcs_tracking, common.getRNTIManager(), harq, mcs_tracking_mode, harq_mode, common.nof_rx_antennas);
     break;
-  case UL_MODE:
+  case UL_DL_MODE:
     /* Config for Downlink Sniffing function*/
     srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer, max_prb, 1); // only 1 antenna for DL in the UL Sniffer Mode
     /* PDSCH decoder (Downlink)*/
@@ -181,7 +181,7 @@ void SubframeWorker::work()
       // printf("[SIGNAL] Bad signal quality... \n");
     }
     break;
-  case UL_MODE:
+  case UL_DL_MODE:
     dciSearch.prepareDCISearch(); // set single antenna for DL in the UL Sniffer mode
     snr_ret = dciSearch.search();
     if (snr_ret == SRSRAN_SUCCESS)
