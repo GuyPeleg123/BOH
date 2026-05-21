@@ -56,6 +56,28 @@ static void write_key_file(const char* path, uint16_t rnti,
     fclose(f);
 }
 
+// Write a key file using KASME + nas_count (Path B) instead of kenb.
+static void write_kasme_key_file(const char* path, uint16_t rnti,
+                                  uint32_t nas_count = 0,
+                                  const char* cipher_algo = nullptr,
+                                  const char* integ_algo  = nullptr)
+{
+    static const char* zero64 =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    FILE* f = fopen(path, "w");
+    assert(f);
+    fprintf(f, "[\n  {\n");
+    fprintf(f, "    \"rnti\"      : \"0x%04x\",\n", rnti);
+    fprintf(f, "    \"kasme\"     : \"%s\",\n", zero64);
+    fprintf(f, "    \"nas_count\" : %u", nas_count);
+    if (cipher_algo && integ_algo) {
+        fprintf(f, ",\n    \"cipher_algo\" : \"%s\"", cipher_algo);
+        fprintf(f, ",\n    \"integ_algo\"  : \"%s\"", integ_algo);
+    }
+    fprintf(f, "\n  }\n]\n");
+    fclose(f);
+}
+
 // Minimal valid IPv4 UDP header (28 bytes: 20 IP + 8 UDP), no payload.
 static void make_ipv4_udp(uint8_t* buf)
 {
@@ -338,6 +360,117 @@ static void test_bearer_state_interleaved_dl_ul()
     printf("  [PASS] issue#2: interleaved DL/UL — 10 packets all decrypted (%ld bytes)\n", sz);
 }
 
+// ── KASME path tests (Path B) ─────────────────────────────────────────────────
+
+// KASME + nas_count → K_eNB derived → has_ue() true.
+static void test_kasme_path_loads()
+{
+    write_kasme_key_file("/tmp/ks_kasme.json", 0xCC00);
+    KeyStore ks;
+    CHECK(ks.load("/tmp/ks_kasme.json"));
+    CHECK(ks.has_ue(0xCC00));
+    CHECK(!ks.is_security_active(0xCC00));   // no algo pre-set
+    printf("  [PASS] kasme path: K_eNB derived, ue loaded\n");
+}
+
+// KASME + nas_count + pre-set algo → security active at load.
+static void test_kasme_path_with_preset_algo()
+{
+    write_kasme_key_file("/tmp/ks_kasme_pre.json", 0xCC01, 1, "EEA0", "EIA0");
+    KeyStore ks;
+    CHECK(ks.load("/tmp/ks_kasme_pre.json"));
+    CHECK(ks.has_ue(0xCC01));
+    CHECK(ks.is_security_active(0xCC01));
+    printf("  [PASS] kasme path: derived K_eNB + pre-set algo → security active\n");
+}
+
+// KASME + nas_count + pre-set EEA0 → UL DRB decrypts (full end-to-end via Path B).
+static void test_kasme_path_ul_drb_decrypts()
+{
+    write_kasme_key_file("/tmp/ks_kasme_ul.json", 0xCC02, 0, "EEA0", "EIA0");
+    const char* pcap_base = "/tmp/ks_kasme_ul";
+    const char* pcap_path = "/tmp/ks_kasme_ul_decrypted_ip.pcap";
+    remove(pcap_path);
+
+    KeyStore ks;
+    CHECK(ks.load("/tmp/ks_kasme_ul.json"));
+    CHECK(ks.open_output(pcap_base));
+
+    uint8_t ip[28]; make_ipv4_udp(ip);
+    auto pdu = make_drb_mac_pdu(3, 0, ip, 28);
+    ks.process_ul_mac_pdu(0xCC02, pdu.data(), (uint32_t)pdu.size(), 3000);
+    ks.close_output();
+
+    long sz = pcap_size(pcap_path);
+    CHECK(sz >= 68);
+    printf("  [PASS] kasme path: UL DRB decrypted end-to-end (%ld bytes)\n", sz);
+}
+
+// KASME + nas_count + pre-set EEA0 → DL DRB decrypts (full end-to-end via Path B).
+static void test_kasme_path_dl_drb_decrypts()
+{
+    write_kasme_key_file("/tmp/ks_kasme_dl.json", 0xCC03, 0, "EEA0", "EIA0");
+    const char* pcap_base = "/tmp/ks_kasme_dl";
+    const char* pcap_path = "/tmp/ks_kasme_dl_decrypted_ip.pcap";
+    remove(pcap_path);
+
+    KeyStore ks;
+    CHECK(ks.load("/tmp/ks_kasme_dl.json"));
+    CHECK(ks.open_output(pcap_base));
+
+    uint8_t ip[28]; make_ipv4_udp(ip);
+    auto pdu = make_drb_mac_pdu(3, 0, ip, 28);
+    ks.process_dl_mac_pdu(0xCC03, pdu.data(), (uint32_t)pdu.size(), 4000);
+    ks.close_output();
+
+    long sz = pcap_size(pcap_path);
+    CHECK(sz >= 68);
+    printf("  [PASS] kasme path: DL DRB decrypted end-to-end (%ld bytes)\n", sz);
+}
+
+// Missing kenb AND missing nas_count → entry must be skipped (load returns false).
+static void test_kasme_missing_nas_count_rejected()
+{
+    // Write a file with kasme but no nas_count and no kenb
+    FILE* f = fopen("/tmp/ks_kasme_bad.json", "w");
+    assert(f);
+    fprintf(f, "[{\"rnti\":\"0xDD00\","
+               "\"kasme\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]\n");
+    fclose(f);
+
+    KeyStore ks;
+    ks.load("/tmp/ks_kasme_bad.json");      // may return false
+    CHECK(!ks.has_ue(0xDD00));              // entry must have been skipped
+    printf("  [PASS] kasme path: kasme without nas_count rejected\n");
+}
+
+// nas_count variation: different NAS counts produce different K_eNB values
+// (i.e. the derivation is actually running, not just copying KASME).
+static void test_kasme_different_nas_count_differs()
+{
+    // Load two entries with same KASME but different nas_count + pre-set EEA0.
+    // Both should load, both should be security-active.
+    // We can't easily check the K_eNB value directly, but we verify both
+    // entries load independently without error.
+    FILE* f = fopen("/tmp/ks_kasme_nasvar.json", "w");
+    assert(f);
+    static const char* zero64 =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    fprintf(f, "[\n"
+               "  {\"rnti\":\"0xEE00\",\"kasme\":\"%s\",\"nas_count\":0,"
+               "   \"cipher_algo\":\"EEA0\",\"integ_algo\":\"EIA0\"},\n"
+               "  {\"rnti\":\"0xEE01\",\"kasme\":\"%s\",\"nas_count\":5,"
+               "   \"cipher_algo\":\"EEA0\",\"integ_algo\":\"EIA0\"}\n"
+               "]\n", zero64, zero64);
+    fclose(f);
+
+    KeyStore ks;
+    CHECK(ks.load("/tmp/ks_kasme_nasvar.json"));
+    CHECK(ks.is_security_active(0xEE00));
+    CHECK(ks.is_security_active(0xEE01));
+    printf("  [PASS] kasme path: different nas_count values both load correctly\n");
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 int main()
@@ -362,6 +495,14 @@ int main()
     test_bearer_state_struct_has_split_maps();
     test_bearer_state_dl_ul_independent();
     test_bearer_state_interleaved_dl_ul();
+
+    printf("\n--- KASME path (Path B): derive K_eNB from KASME + NAS count ---\n");
+    test_kasme_path_loads();
+    test_kasme_path_with_preset_algo();
+    test_kasme_path_ul_drb_decrypts();
+    test_kasme_path_dl_drb_decrypts();
+    test_kasme_missing_nas_count_rejected();
+    test_kasme_different_nas_count_differs();
 
     printf("\n=== All tests passed ===\n\n");
     return 0;

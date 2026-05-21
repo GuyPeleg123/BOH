@@ -179,23 +179,43 @@ bool KeyStore::load(const std::string& json_path)
 
         UESecurityState ue = {};
 
-        // K_eNB
-        auto it_kenb = e.find("kenb");
+        // K_eNB — two accepted input paths:
+        //   Path A: "kenb" (32-byte hex)   — direct, use as-is.
+        //   Path B: "kasme" + "nas_count"  — derive K_eNB via
+        //           3GPP TS 33.401 Annex A.2 (HMAC-SHA256).
+        // Path A takes priority when both are present.
+        auto it_kenb  = e.find("kenb");
+        auto it_kasme = e.find("kasme");
+        auto it_nasct = e.find("nas_count");
+
         if (it_kenb != e.end()) {
+            // Path A — K_eNB supplied directly
             if (!parse_hex(it_kenb->second, ue.k_enb, 32)) {
                 fprintf(stderr, "[KeyAttach] RNTI 0x%04x: bad kenb (need 64 hex chars)\n", rnti);
                 continue;
             }
+            // Also store KASME if provided alongside (for informational purposes)
+            if (it_kasme != e.end())
+                parse_hex(it_kasme->second, ue.kasme, 32);
             ue.has_kenb = true;
+        } else if (it_kasme != e.end() && it_nasct != e.end()) {
+            // Path B — derive K_eNB from KASME + NAS uplink count
+            if (!parse_hex(it_kasme->second, ue.kasme, 32)) {
+                fprintf(stderr, "[KeyAttach] RNTI 0x%04x: bad kasme (need 64 hex chars)\n", rnti);
+                continue;
+            }
+            uint32_t nas_count = (uint32_t)strtoul(it_nasct->second.c_str(), nullptr, 0);
+            if (security_generate_k_enb(ue.kasme, nas_count, ue.k_enb) != SRSRAN_SUCCESS) {
+                fprintf(stderr, "[KeyAttach] RNTI 0x%04x: K_eNB derivation from KASME failed\n", rnti);
+                continue;
+            }
+            ue.has_kenb = true;
+            printf("[KeyAttach] RNTI 0x%04x: K_eNB derived from KASME (nas_count=%u)\n",
+                   rnti, nas_count);
         } else {
-            fprintf(stderr, "[KeyAttach] RNTI 0x%04x: missing 'kenb'\n", rnti);
+            fprintf(stderr, "[KeyAttach] RNTI 0x%04x: need 'kenb'  OR  'kasme'+'nas_count'\n", rnti);
             continue;
         }
-
-        // KASME (optional, stored for future re-keying)
-        auto it_kasme = e.find("kasme");
-        if (it_kasme != e.end())
-            parse_hex(it_kasme->second, ue.kasme, 32);
 
         // hfn_hint (optional)
         auto it_hfn = e.find("hfn_hint");

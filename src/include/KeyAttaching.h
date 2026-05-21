@@ -46,15 +46,24 @@ struct UESecurityState {
  * KeyStore – loads a JSON key file, drives per-RNTI security state, and
  * performs PDCP decryption.  Thread-safe (all public methods hold mtx_).
  *
- * JSON format (array of objects):
- *   [
- *     {
- *       "rnti"     : "0x1234",        // C-RNTI in hex
- *       "kenb"     : "<64 hex chars>", // 256-bit K_eNB
- *       "kasme"    : "<64 hex chars>", // 256-bit KASME (stored for future use)
- *       "hfn_hint" : 0                // optional starting HFN (default 0)
- *     }
- *   ]
+ * JSON format (array of objects). Two key-input paths are supported:
+ *
+ * Path A — K_eNB directly (e.g. extracted from MME debug log or test UE):
+ *   [{ "rnti": "0x1234",
+ *      "kenb": "<64 hex chars>",          // 256-bit K_eNB
+ *      "cipher_algo": "EEA2",             // optional — pre-set algo for mid-session
+ *      "integ_algo":  "EIA2",             // optional — activates security at load time
+ *      "hfn_hint": 0 }]                   // optional — starting HFN guess
+ *
+ * Path B — KASME + NAS uplink count (derive K_eNB internally via 3GPP TS 33.401 §A.2):
+ *   [{ "rnti": "0x1234",
+ *      "kasme": "<64 hex chars>",         // 256-bit KASME from HSS/MME
+ *      "nas_count": 1,                    // NAS uplink count at the attach that produced K_eNB
+ *      "cipher_algo": "EEA2",             // optional — same as Path A
+ *      "integ_algo":  "EIA2",             // optional
+ *      "hfn_hint": 0 }]                   // optional
+ *
+ * When both "kenb" and "kasme"+"nas_count" are present, "kenb" takes priority.
  */
 class KeyStore {
 public:
