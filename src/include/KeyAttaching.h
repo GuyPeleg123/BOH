@@ -33,9 +33,13 @@ struct UESecurityState {
 
     uint32_t hfn_hint    = 0;      // starting HFN guess for mid-session join
 
-    // Bearer states: SRBs indexed by LCID (1,2), DRBs indexed by LCID (3+)
-    std::map<uint8_t, PdcpBearerState> srb;
-    std::map<uint8_t, PdcpBearerState> drb;
+    // Bearer states per direction — DL and UL have independent COUNT spaces
+    // (3GPP TS 36.323 §7.1). Sharing a single map corrupts HFN tracking
+    // when both directions are active simultaneously (DUAL_MODE).
+    std::map<uint8_t, PdcpBearerState> srb_dl;   // SRBs, downlink (LCID 1,2)
+    std::map<uint8_t, PdcpBearerState> srb_ul;   // SRBs, uplink   (LCID 1,2)
+    std::map<uint8_t, PdcpBearerState> drb_dl;   // DRBs, downlink (LCID 3+)
+    std::map<uint8_t, PdcpBearerState> drb_ul;   // DRBs, uplink   (LCID 3+)
 };
 
 /*
@@ -133,4 +137,6 @@ private:
 
     static bool parse_hex(const std::string& hex, uint8_t* out, size_t n);
     static bool is_valid_ip(const uint8_t* pkt, uint32_t len);
+    static bool parse_cipher_algo(const std::string& s, CIPHERING_ALGORITHM_ID_ENUM& out);
+    static bool parse_integ_algo(const std::string& s, INTEGRITY_ALGORITHM_ID_ENUM& out);
 };

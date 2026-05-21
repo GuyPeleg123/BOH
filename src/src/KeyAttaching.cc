@@ -105,6 +105,24 @@ static std::vector<std::map<std::string,std::string>> parse_json_array(const std
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+bool KeyStore::parse_cipher_algo(const std::string& s, CIPHERING_ALGORITHM_ID_ENUM& out)
+{
+    if (s == "EEA0") { out = CIPHERING_ALGORITHM_ID_EEA0;     return true; }
+    if (s == "EEA1") { out = CIPHERING_ALGORITHM_ID_128_EEA1; return true; }
+    if (s == "EEA2") { out = CIPHERING_ALGORITHM_ID_128_EEA2; return true; }
+    if (s == "EEA3") { out = CIPHERING_ALGORITHM_ID_128_EEA3; return true; }
+    return false;
+}
+
+bool KeyStore::parse_integ_algo(const std::string& s, INTEGRITY_ALGORITHM_ID_ENUM& out)
+{
+    if (s == "EIA0") { out = INTEGRITY_ALGORITHM_ID_EIA0;     return true; }
+    if (s == "EIA1") { out = INTEGRITY_ALGORITHM_ID_128_EIA1; return true; }
+    if (s == "EIA2") { out = INTEGRITY_ALGORITHM_ID_128_EIA2; return true; }
+    if (s == "EIA3") { out = INTEGRITY_ALGORITHM_ID_128_EIA3; return true; }
+    return false;
+}
+
 bool KeyStore::parse_hex(const std::string& hex, uint8_t* out, size_t n)
 {
     std::string h = hex;
@@ -183,6 +201,37 @@ bool KeyStore::load(const std::string& json_path)
         auto it_hfn = e.find("hfn_hint");
         if (it_hfn != e.end())
             ue.hfn_hint = (uint32_t)strtoul(it_hfn->second.c_str(), nullptr, 0);
+
+        // cipher_algo + integ_algo (optional).
+        // When both are present the keys are derived immediately and security
+        // is activated at load time, enabling mid-session decryption without
+        // waiting to observe a live SecurityModeCommand on DL SRB1.
+        auto it_cipher = e.find("cipher_algo");
+        auto it_integ  = e.find("integ_algo");
+        if (it_cipher != e.end() && it_integ != e.end()) {
+            CIPHERING_ALGORITHM_ID_ENUM cipher;
+            INTEGRITY_ALGORITHM_ID_ENUM integ;
+            bool cipher_ok = parse_cipher_algo(it_cipher->second, cipher);
+            bool integ_ok  = parse_integ_algo(it_integ->second, integ);
+            if (!cipher_ok) {
+                fprintf(stderr, "[KeyAttach] RNTI 0x%04x: unknown cipher_algo '%s' "
+                        "(valid: EEA0 EEA1 EEA2 EEA3)\n", rnti, it_cipher->second.c_str());
+            } else if (!integ_ok) {
+                fprintf(stderr, "[KeyAttach] RNTI 0x%04x: unknown integ_algo '%s' "
+                        "(valid: EIA0 EIA1 EIA2 EIA3)\n", rnti, it_integ->second.c_str());
+            } else {
+                ue.cipher_algo = cipher;
+                ue.integ_algo  = integ;
+                security_generate_k_rrc(ue.k_enb, cipher, integ, ue.k_rrc_enc, ue.k_rrc_int);
+                uint8_t k_up_int_tmp[32];
+                security_generate_k_up(ue.k_enb, cipher, integ, ue.k_up_enc, k_up_int_tmp);
+                ue.keys_derived    = true;
+                ue.security_active = true;
+                printf("[KeyAttach] RNTI 0x%04x: pre-set algo cipher=%s integ=%s "
+                       "(security active, mid-session join enabled)\n",
+                       rnti, it_cipher->second.c_str(), it_integ->second.c_str());
+            }
+        }
 
         states_[rnti] = ue;
         printf("[KeyAttach] Loaded keys for RNTI 0x%04x (hfn_hint=%u)\n", rnti, ue.hfn_hint);
@@ -441,7 +490,8 @@ uint32_t KeyStore::decrypt_srb(UESecurityState& ue, uint8_t lcid,
 
     if (ct_len == 0) return 0;
 
-    PdcpBearerState& bs = ue.srb[lcid];
+    PdcpBearerState& bs = (direction == SECURITY_DIRECTION_DOWNLINK)
+                          ? ue.srb_dl[lcid] : ue.srb_ul[lcid];
     if (bs.sn_bits == 0) {
         bs.sn_bits = 5;
         bs.hfn     = ue.hfn_hint;
@@ -497,7 +547,8 @@ void KeyStore::decrypt_drb(UESecurityState& ue, uint8_t lcid,
 
         if (ct_len < 20) continue;
 
-        PdcpBearerState& bs = ue.drb[lcid];
+        PdcpBearerState& bs = (direction == SECURITY_DIRECTION_DOWNLINK)
+                              ? ue.drb_dl[lcid] : ue.drb_ul[lcid];
         if (bs.sn_bits == 0) {
             bs.sn_bits = 12;
             bs.hfn     = ue.hfn_hint;
