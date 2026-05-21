@@ -99,7 +99,7 @@ void ArgManager::usage(Args& args, const std::string& prog) {
   printf("\t-f Downlink Frequency\n");
   printf("\t-u Uplink Frequency  \n");
   printf("\t-A Number of RX antennas [Default %d]\n", args.rf_nof_rx_ant);
-  printf("\t-m Sniffer mode, 0 for downlink sniffing mode, 1 for uplink sniffing mode\n");
+  printf("\t-m Sniffer mode, 0 for downlink only, 1 for uplink only, 2 for dual UL+DL (2 USRPs)\n");
   printf("\t-z API mode, 0 for identity mapping, 1 for IMSI collecting, 2 for UECapability profiling, 3 for all\n");
   printf("\t-d Enable debug mode, print debug message to screen (Defautl disable)\n");
 }
@@ -162,6 +162,7 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'C':
         args.cell_search = true;
+        break;
       case 'm':
         args.sniffer_mode = static_cast<uint32_t>(strtoul(argv[optind], nullptr, 0));
         break;

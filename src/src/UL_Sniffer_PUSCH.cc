@@ -682,14 +682,17 @@ void PUSCH_Decoder::work_prach()
                original_buffer[0],
                sizeof(cf_t) * SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb));
         // Detect possible PRACHs
-        srsran_prach_detect_offset(&prach,
-                                   prach_cfg.freq_offset,
-                                   &samples[prach.N_cp],
-                                   SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb) - prach.N_cp,
-                                   prach_indices,
-                                   prach_offsets,
-                                   prach_p2avg,
-                                   &prach_nof_det);
+        uint32_t prach_sig_len = SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb) - prach.N_cp;
+        if (prach_sig_len >= prach.N_ifft_prach) {
+          srsran_prach_detect_offset(&prach,
+                                     prach_cfg.freq_offset,
+                                     &samples[prach.N_cp],
+                                     prach_sig_len,
+                                     prach_indices,
+                                     prach_offsets,
+                                     prach_p2avg,
+                                     &prach_nof_det);
+        }
 
         if (prach_nof_det)
         {

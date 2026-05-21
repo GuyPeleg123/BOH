@@ -82,6 +82,8 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   std::string pcap_file_name_api = "api_collector.pcap";
   if (sniffer_mode == DL_MODE){
     pcap_file_name = "ltesniffer_dl_mode.pcap";
+  } else if (sniffer_mode == DUAL_MODE) {
+    pcap_file_name = "ltesniffer_dual_mode.pcap";
   } else {
     pcap_file_name = "ltesniffer_ul_mode.pcap";
   }
@@ -89,7 +91,7 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   /*Init HARQ*/
   harq.init_HARQ(args.harq_mode);
   /*Set multi offset in ULSchedule*/
-  ulsche.set_multi_offset(args.sniffer_mode);
+  ulsche.set_multi_offset((args.sniffer_mode == DUAL_MODE) ? UL_MODE : args.sniffer_mode);
   /*Create PHY*/
   phy = new Phy(args.rf_nof_rx_ant,
                 args.nof_sniffer_thread,
@@ -176,8 +178,8 @@ bool LTESniffer_Core::run(){
     printf("Opening RF device with %d RX antennas...\n", args.rf_nof_rx_ant);
     char rfArgsCStr_a[1024];
     char rfArgsCStr_b[1024];
-    std::string rf_a_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=3113D1B"; 
-    std::string rf_b_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=3125CB5";
+    std::string rf_a_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=32FCD4C"; 
+    std::string rf_b_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=3367EF9";
 
     /*The following strings are for USRP X310 for specific application*/
     // std::string rf_a_string = "clock=gpsdo,type=x300,addr=192.168.40.2";
@@ -214,18 +216,17 @@ bool LTESniffer_Core::run(){
     }
 
     /* set receiver frequency */
-    if (sniffer_mode == UL_MODE && args.ul_freq != 0){
+    if ((sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) && args.ul_freq != 0){
       printf("Tunning DL receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
       if (srsran_rf_set_rx_freq(&rf_a, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq)) {
         ///ERROR("Tunning DL Freq failed\n");
       }
-      /*Uplink freg*/
       printf("Tunning UL receiver to %.3f MHz\n", (double) (args.ul_freq / 1000000));
       if (srsran_rf_set_rx_freq(&rf_b, args.rf_nof_rx_ant, args.ul_freq )){
         //ERROR("Tunning UL Freq failed \n");
       }
     } else {
-      ERROR("This LTESniffer branch only supports UL Sniffing with 2 USRPs \n");
+      ERROR("This LTESniffer branch only supports UL/Dual Sniffing with 2 USRPs\n");
     }
 
     if (args.cell_search){
@@ -563,6 +564,10 @@ bool LTESniffer_Core::run(){
         case UL_MODE:
           if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
           break;
+        case DUAL_MODE:
+          if (mcs_tracking_mode && args.target_rnti == 0){ mcs_tracking.update_database_dl(); }
+          if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
+          break;
         default:
           break;
         }
@@ -581,6 +586,13 @@ bool LTESniffer_Core::run(){
         case UL_MODE:
           if (api_mode == -1) {mcs_tracking.print_database_ul();}
           if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
+          mcs_tracking_timer = 0;
+          break;
+        case DUAL_MODE:
+          if (api_mode == -1) {mcs_tracking.print_database_dl(); mcs_tracking.print_database_ul();}
+          if (mcs_tracking_mode && args.target_rnti == 0){ mcs_tracking.update_database_dl(); }
+          if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
+          if (harq_mode && args.target_rnti == 0){ harq.updateHARQDatabase(); }
           mcs_tracking_timer = 0;
           break;
         default:
@@ -622,6 +634,11 @@ bool LTESniffer_Core::run(){
     case UL_MODE:
       mcs_tracking.merge_all_database_ul();
       if (api_mode == -1) {mcs_tracking.print_all_database_ul(); }
+      break;
+    case DUAL_MODE:
+      mcs_tracking.merge_all_database_dl();
+      mcs_tracking.merge_all_database_ul();
+      if (api_mode == -1) {mcs_tracking.print_all_database_dl(); mcs_tracking.print_all_database_ul();}
       break;
     default:
       break;

@@ -99,6 +99,46 @@ SubframeWorker::SubframeWorker(uint32_t idx,
       return;
     }
     break;
+  case DUAL_MODE:
+    /* Full multi-antenna DL + UL sniffing using both USRPs */
+    srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer_a, max_prb, common.nof_rx_antennas);
+    pdschdecoder = new PDSCH_Decoder(idx,
+                                     pcapwriter,
+                                     mcs_tracking,
+                                     common.getRNTIManager(),
+                                     harq,
+                                     mcs_tracking_mode,
+                                     harq_mode,
+                                     common.nof_rx_antennas);
+    puschdecoder = new PUSCH_Decoder(enb_ul,
+                                     ul_sf,
+                                     ulsche,
+                                     sfb.sf_buffer_b,
+                                     sfb.sf_buffer_offset,
+                                     ul_cfg,
+                                     pcapwriter,
+                                     mcs_tracking,
+                                     mcs_tracking->get_debug_mode());
+    puschdecoder->set_decoder("a");
+    if (srsran_enb_ul_init(&enb_ul, sfb.sf_buffer_b[0], 110)) {
+      ERROR("Error initiating ENB UL");
+      return;
+    }
+    puschdecoder_b = new PUSCH_Decoder(enb_ul_b,
+                                       ul_sf,
+                                       ulsche,
+                                       sfb.sf_buffer_b,
+                                       sfb.sf_buffer_offset,
+                                       ul_cfg,
+                                       pcapwriter,
+                                       mcs_tracking,
+                                       mcs_tracking->get_debug_mode());
+    puschdecoder_b->set_decoder("b");
+    if (srsran_enb_ul_init(&enb_ul_b, sfb.sf_buffer_b[1], 110)) {
+      ERROR("Error initiating ENB UL");
+      return;
+    }
+    break;
   default:
     break;
   }
@@ -211,6 +251,17 @@ void SubframeWorker::work()
     else
     {
       // printf("[SIGNAL] Bad signal quality... \n");
+    }
+    break;
+  case DUAL_MODE:
+    // Full multi-antenna DCI search (no prepareDCISearch) + both DL and UL decode
+    snr_ret = dciSearch.search();
+    if (snr_ret == SRSRAN_SUCCESS)
+    {
+      stats += dciSearch.getStats();
+      common.addStats(dciSearch.getStats());
+      subframeInfo.getSubframePower().computePower(enb_ul.sf_symbols);
+      run_ul_mode(subframeInfo, tti);
     }
     break;
   default:
