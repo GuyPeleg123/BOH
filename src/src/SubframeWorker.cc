@@ -289,6 +289,13 @@ cf_t *SubframeWorker::getBuffer(uint32_t antenna_idx)
   return sfb.sf_buffer_a[antenna_idx];
 }
 
+void SubframeWorker::set_key_store(KeyStore* ks)
+{
+  if (pdschdecoder) pdschdecoder->set_key_store(ks);
+  if (puschdecoder)   puschdecoder->set_key_store(ks);
+  if (puschdecoder_b) puschdecoder_b->set_key_store(ks);
+}
+
 void SubframeWorker::run_dl_mode(SubframeInfo &subframeInfo)
 {
   pdschdecoder->init_pdsch_decoder(&falcon_ue_dl,

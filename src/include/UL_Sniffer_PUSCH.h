@@ -1,4 +1,5 @@
 #pragma once
+#include "KeyAttaching.h"
 #include "DCICollection.h"
 #include "PcapWriter.h"
 #include "ULSchedule.h"
@@ -96,6 +97,7 @@ public:
     void set_target_rnti(uint16_t rnti)  { target_rnti = rnti;  }
     void set_debug_mode(bool en_debug_)  { en_debug = en_debug_;}
     void set_api_mode(int api_mode_)     { api_mode = api_mode_;}
+    void set_key_store(KeyStore* ks)     { key_store_ = ks;     }
     void set_decoder(std::string a_b){
         if (a_b == "a"){
             decoder_a = true;
@@ -138,6 +140,7 @@ private:
     cf_t                    samples[prach_buffer_sz] = {};
     UL_HARQ                 *ul_harq; //on developing
     MCSTracking             *mcstracking;
+    KeyStore*               key_store_          = nullptr;
 
     /*Backup*/
     int                     multi_ul_offset;

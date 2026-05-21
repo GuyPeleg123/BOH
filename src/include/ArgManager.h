@@ -52,6 +52,7 @@ struct Args {
   bool        cell_search = false;
   uint16_t    target_rnti = 0;
   int         api_mode    = -1; //api functions, 0: identity mapping, 1: UECapa, 2: IMSI
+  std::string keys_file   = "";  // path to JSON key file for PDCP decryption (-K)
 };
 
 class ArgManager {

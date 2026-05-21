@@ -1,5 +1,6 @@
 #pragma once
 
+#include "KeyAttaching.h"
 #include "DCICollection.h"
 #include "PhyCommon.h"
 #include <vector>
@@ -10,7 +11,7 @@
 #include "srsue/hdr/stack/mac/proc_ra.h"
 #include "srsran/asn1/rrc/dl_ccch_msg.h"
 #include "srsran/asn1/rrc/paging.h"
-// #include "srsran/asn1/rrc/dl_dcch_msg.h"
+#include "srsran/asn1/rrc/dl_dcch_msg.h"
 
 // include C-only headers
 #ifdef __cplusplus
@@ -149,12 +150,15 @@ public:
     void set_target_rnti(uint16_t rnti) {target_rnti = rnti;}
     void set_debug_mode(bool debug) { en_debug = debug;}
     void set_api_mode(int api_mode_) { api_mode = api_mode_;}
+    void set_key_store(KeyStore* ks) { key_store = ks; }
     void print_api_dl(uint32_t tti, uint16_t rnti, int ident, std::string value, int msg);
 
 private:
-    int         api_mode            = -1; 
+    int         api_mode            = -1;
     bool        en_debug            = false;
     uint16_t    target_rnti         = 0;
+    KeyStore*   key_store           = nullptr;
+    int decode_security_mode_cmd(const uint8_t* sdu_ptr, int length, uint16_t rnti);
     int         nof_antenna         = 2;
     /*RRC Con Set*/
     bool                               found_con_ret = false;

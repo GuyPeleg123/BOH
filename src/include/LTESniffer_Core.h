@@ -23,6 +23,7 @@
 #include <map>
 
 #include "ArgManager.h"
+#include "KeyAttaching.h"
 #include "falcon/common/SignalManager.h"
 #include "include/SubframeWorker.h"
 #include "include/ThreadSafeQueue.h"
@@ -167,5 +168,6 @@ private:
   UL_HARQ                 ul_harq; // test UL_HARQ
   HARQ                    harq; // test HARQ function
   int                     harq_mode;
-  srsran_filesink_t file_sink = {};
+  srsran_filesink_t       file_sink = {};
+  KeyStore                key_store_;       // PDCP decryption engine (empty unless -K flag given)
 };
