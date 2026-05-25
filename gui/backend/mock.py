@@ -22,7 +22,7 @@ class MockRunner:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._subscribers: set[asyncio.Queue] = set()
-        self._last_events: deque[dict[str, Any]] = deque(maxlen=2000)
+        self._last_events: deque[dict[str, Any]] = deque(maxlen=500)
         self._sticky: dict[str, dict[str, Any]] = {}
         self._state: dict[str, Any] = {
             "running": False,
@@ -36,7 +36,7 @@ class MockRunner:
         self._cfg: Optional[SnifferConfig] = None
 
     def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=4000)
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._subscribers.add(q)
         return q
 

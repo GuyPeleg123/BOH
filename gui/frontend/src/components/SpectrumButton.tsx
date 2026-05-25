@@ -56,12 +56,15 @@ export function SpectrumButton() {
       .then((j) => setUsrps(j.devices ?? []))
       .catch(() => {});
 
+  // Poll fast when the popover is open or spectrum is already running (need timely updates).
+  // Poll slowly otherwise — no point hammering the backend when nothing is happening.
   useEffect(() => {
     refresh();
     refreshUsrps();
-    const i = setInterval(refresh, 3000);
+    const interval = (open || status?.running) ? 3000 : 10000;
+    const i = setInterval(refresh, interval);
     return () => clearInterval(i);
-  }, []);
+  }, [open, status?.running]);
 
   // Re-poll USRPs when the popover opens (cheap; ~5s timeout in backend)
   useEffect(() => {

@@ -17,10 +17,10 @@ const SECTIONS: Section[] = [
       { key: "rf_gain",       label: "RX gain (dB, -1 = AGC)", flag: "-g" },
       { key: "rf_nof_rx_ant", label: "RX antennas", flag: "-A" },
       { key: "rf_args",       label: "rfargs (single-USRP)", flag: "-a", widget: "text" },
-      { key: "usrp_a_args",   label: "USRP A rfargs (dual)", flag: "-X", widget: "text",
-        hint: "e.g. clock=gpsdo,serial=32FCD4C" },
-      { key: "usrp_b_args",   label: "USRP B rfargs (dual)", flag: "-Z", widget: "text",
-        hint: "e.g. clock=gpsdo,serial=3367EF9" },
+      { key: "usrp_a_args",   label: "USRP A rfargs (dual — DL device)", flag: "-X", widget: "text",
+        hint: "Dual-USRP mode: e.g. clock=gpsdo,serial=<A_serial>  — use Auto-detect to fill" },
+      { key: "usrp_b_args",   label: "USRP B rfargs (dual — UL device)", flag: "-Z", widget: "text",
+        hint: "Dual-USRP mode: e.g. clock=gpsdo,serial=<B_serial>  — use Auto-detect to fill" },
       { key: "decimate",      label: "Decimate", flag: "-Y" },
       { key: "cpu_affinity",  label: "CPU affinity mask (-1 disable)", flag: "-y" },
     ],
@@ -87,6 +87,7 @@ export function ConfigPage() {
   const [cfg, setCfg] = useState<SnifferConfig | null>(null);
   const [usrps, setUsrps] = useState<USRPDevice[]>([]);
   const [busy, setBusy] = useState(false);
+  const [autoMsg, setAutoMsg] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -94,6 +95,25 @@ export function ConfigPage() {
     api.getConfig().then(setCfg).catch((e) => setErr(e.message));
     api.usrps().then((r) => setUsrps(r.devices)).catch(() => {});
   }, []);
+
+  async function autoDetect() {
+    setBusy(true);
+    setErr(null);
+    setAutoMsg(null);
+    try {
+      const patch = await api.get<Record<string, any>>("/api/usrps/autoconfig");
+      // Apply non-metadata fields to the config
+      const validKeys = Object.keys(patch).filter((k) => !k.startsWith("_"));
+      if (validKeys.length > 0) {
+        setCfg((c) => c ? { ...c, ...Object.fromEntries(validKeys.map((k) => [k, patch[k]])) } : c);
+      }
+      setAutoMsg(patch._message ?? "Auto-detect complete.");
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (!cfg) return <div className="p-6 text-muted">Loading config…</div>;
 
@@ -200,11 +220,15 @@ export function ConfigPage() {
 
   return (
     <div className="p-4 max-w-6xl mx-auto h-full overflow-auto">
-      <div className="flex items-center mb-4 gap-3">
+      <div className="flex items-center mb-4 gap-3 flex-wrap">
         <h1 className="text-lg font-semibold">Sniffer Configuration</h1>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-2 flex-wrap">
+          {autoMsg && <span className="text-ok text-xs max-w-xs truncate" title={autoMsg}>{autoMsg}</span>}
           {saved && <span className="text-ok text-sm">{saved}</span>}
           {err && <span className="text-bad text-sm font-mono">{err}</span>}
+          <button className="btn" disabled={busy} onClick={autoDetect} title="Detect connected USRPs and fill serial/rfargs automatically">
+            🔍 Auto-detect USRPs
+          </button>
           <button className="btn" disabled={busy} onClick={save}>Save</button>
           <button className="btn btn-primary" disabled={busy} onClick={saveAndRestart}>
             Save & Restart

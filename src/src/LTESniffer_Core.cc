@@ -196,51 +196,85 @@ bool LTESniffer_Core::run(){
     printf("Opening RF device with %d RX antennas...\n", args.rf_nof_rx_ant);
     char rfArgsCStr_a[1024];
     char rfArgsCStr_b[1024];
-    std::string rf_a_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=32FCD4C";
-    std::string rf_b_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=3367EF9";
+
+    /* ---------- Build rf_a args ----------
+     * Priority for DL/UL/DUAL:
+     *   1. -X flag (usrp_a_args)  — explicit dual-USRP override
+     *   2. -a flag (rf_args)      — single-USRP / generic rfargs
+     *   3. Auto: no serial specified, UHD picks the first available device.
+     *      num_recv_frames / recv_frame_size kept for throughput.
+     * The old hardcoded serials (32FCD4C / 3367EF9) are gone; pass -X/-Z
+     * if you need to pin specific serials for dual-USRP operation.        */
+    std::string rf_a_string;
     if (!args.usrp_a_args.empty()) {
       rf_a_string = args.usrp_a_args;
+    } else if (!args.rf_args.empty()) {
+      rf_a_string = args.rf_args + ",num_recv_frames=512,recv_frame_size=8000";
+    } else {
+      // Auto-detect: blank args → UHD opens the first enumerated device
+      rf_a_string = "num_recv_frames=512,recv_frame_size=8000";
     }
+
+    /* ---------- Build rf_b args (UL/DUAL only) ---------- */
+    std::string rf_b_string;
     if (!args.usrp_b_args.empty()) {
       rf_b_string = args.usrp_b_args;
+    } else {
+      // Auto-detect second USRP; caller must pass -Z if two identical models
+      rf_b_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000";
     }
 
     /*The following strings are for USRP X310 for specific application*/
-    // std::string rf_a_string = "clock=gpsdo,type=x300,addr=192.168.40.2";
-    // std::string rf_b_string = "clock=gpsdo,type=x300,addr=192.168.30.2";
+    // rf_a_string = "clock=gpsdo,type=x300,addr=192.168.40.2";
+    // rf_b_string = "clock=gpsdo,type=x300,addr=192.168.30.2";
 
     strncpy(rfArgsCStr_a, rf_a_string.c_str(), 1024);
     strncpy(rfArgsCStr_b, rf_b_string.c_str(), 1024);
 
-    if (srsran_rf_open_multi(&rf_a, rfArgsCStr_a, args.rf_nof_rx_ant)) {  //args.rf_nof_rx_ant
+    // Always open rf_a (needed by all modes)
+    if (srsran_rf_open_multi(&rf_a, rfArgsCStr_a, args.rf_nof_rx_ant)) {
       fprintf(stderr, "Error opening rf_a\n");
       exit(-1);
     }
-    if (srsran_rf_open_multi(&rf_b, rfArgsCStr_b, args.rf_nof_rx_ant)) {
-      fprintf(stderr, "Error opening rf_b\n");
-      exit(-1);
+
+    // rf_b is only needed for UL/DUAL mode
+    if (sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) {
+      if (srsran_rf_open_multi(&rf_b, rfArgsCStr_b, args.rf_nof_rx_ant)) {
+        fprintf(stderr, "Error opening rf_b — UL/DUAL mode requires a second USRP\n");
+        exit(-1);
+      }
+      rf_b_open = true;  // class member
     }
+
     /* Set receiver gain */
     if (args.rf_gain > 0) {
       srsran_rf_set_rx_gain(&rf_a, args.rf_gain);
-      srsran_rf_set_rx_gain(&rf_b, args.rf_gain);
+      if (rf_b_open) srsran_rf_set_rx_gain(&rf_b, args.rf_gain);
     } else {
       printf("Starting AGC thread...\n");
       if (srsran_rf_start_gain_thread(&rf_a, false)) {
         ERROR("Error opening rf_a");
         exit(-1);
       }
-      if (srsran_rf_start_gain_thread(&rf_b, false)) {
-        ERROR("Error opening rf_b");
-        exit(-1);
+      if (rf_b_open) {
+        if (srsran_rf_start_gain_thread(&rf_b, false)) {
+          ERROR("Error opening rf_b");
+          exit(-1);
+        }
+        srsran_rf_set_rx_gain(&rf_b, srsran_rf_get_rx_gain(&rf_b));
       }
       srsran_rf_set_rx_gain(&rf_a, srsran_rf_get_rx_gain(&rf_a));
-      srsran_rf_set_rx_gain(&rf_b, srsran_rf_get_rx_gain(&rf_b));
       cell_detect_config.init_agc = srsran_rf_get_rx_gain(&rf_a);
     }
 
     /* set receiver frequency */
-    if ((sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) && args.ul_freq != 0){
+    if (sniffer_mode == DL_MODE) {
+      // DL-only: tune rf_a to downlink frequency
+      printf("Tunning DL receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
+      if (srsran_rf_set_rx_freq(&rf_a, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq)) {
+        ERROR("Tunning DL Freq failed\n");
+      }
+    } else if ((sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) && args.ul_freq != 0){
       printf("Tunning DL receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
       if (srsran_rf_set_rx_freq(&rf_a, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq)) {
         ///ERROR("Tunning DL Freq failed\n");
@@ -250,7 +284,7 @@ bool LTESniffer_Core::run(){
         //ERROR("Tunning UL Freq failed \n");
       }
     } else {
-      ERROR("This LTESniffer branch only supports UL/Dual Sniffing with 2 USRPs\n");
+      ERROR("UL/Dual mode requires a UL frequency (-u). This branch needs 2 USRPs for UL/Dual sniffing.\n");
     }
 
     if (args.cell_search){

@@ -10,14 +10,30 @@ const levelClass: Record<string, string> = {
 
 export function LogPanel({ embedded = false }: { embedded?: boolean }) {
   const { state } = useStore();
-  const endRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
 
+  // Track whether the user is near the bottom so we know whether to auto-scroll.
+  function onScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    // "at bottom" = within 60 px of the bottom edge
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  }
+
+  // Auto-scroll only when already pinned to the bottom.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    if (!atBottomRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [state.logs.length]);
 
   const body = (
-    <div className="flex-1 overflow-auto bg-bg border border-border rounded p-2 font-mono text-xs leading-5">
+    <div
+      ref={scrollRef}
+      onScroll={onScroll}
+      className="flex-1 overflow-auto bg-bg border border-border rounded p-2 font-mono text-xs leading-5"
+    >
       {state.logs.length === 0 && (
         <div className="text-muted text-center py-4">No log lines yet.</div>
       )}
@@ -29,7 +45,6 @@ export function LogPanel({ embedded = false }: { embedded?: boolean }) {
           <span className="text-slate-200">{l.msg}</span>
         </div>
       ))}
-      <div ref={endRef} />
     </div>
   );
 

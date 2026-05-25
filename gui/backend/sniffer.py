@@ -29,8 +29,9 @@ class SnifferRunner:
         self._fifo_path: Optional[Path] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._wait_task: Optional[asyncio.Task] = None  # tracked so we can cancel on restart
         self._subscribers: set[asyncio.Queue] = set()
-        self._last_events: deque[dict[str, Any]] = deque(maxlen=2000)
+        self._last_events: deque[dict[str, Any]] = deque(maxlen=500)
         # Sticky events kept outside the rolling buffer so that a refresh
         # after the buffer has rolled past still shows cell / lifecycle state.
         self._sticky: dict[str, dict[str, Any]] = {}
@@ -46,7 +47,7 @@ class SnifferRunner:
     # ------------------------------------------------------------------ pubsub
 
     def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=4000)
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._subscribers.add(q)
         return q
 
@@ -138,23 +139,61 @@ class SnifferRunner:
         self._broadcast({"t": "lifecycle", "event": "started", "pid": self._proc.pid, "argv": argv})
 
         self._stderr_task = asyncio.create_task(self._drain_stderr())
-        asyncio.create_task(self._wait_exit())
+        self._wait_task = asyncio.create_task(self._wait_exit())
 
     async def stop(self, timeout: float = 5.0) -> None:
         if not self.running or self._proc is None:
             return
+
+        # Determine whether we launched through sudo so we can kill the real
+        # process (LTESniffer, running as root) before killing the sudo wrapper.
+        # If we only SIGKILL sudo and leave LTESniffer running, it gets
+        # re-parented to init and becomes an OOM-causing orphan.
+        uses_sudo = bool(self._state.get("argv") and self._state["argv"][0] == "sudo")
+        sudo_pid = self._proc.pid
+
+        # Step 1: polite SIGINT (sudo forwards to LTESniffer automatically).
         try:
             self._proc.send_signal(signal.SIGINT)
         except ProcessLookupError:
             pass
+
         try:
             await asyncio.wait_for(self._proc.wait(), timeout)
+            return  # clean exit — nothing else to do
         except asyncio.TimeoutError:
+            pass
+
+        # Step 2: escalate.  When running under sudo, kill LTESniffer children
+        # *first* so they don't become orphans when sudo is subsequently killed.
+        # We use a dedicated kill-wrapper script that is whitelisted in
+        # sudoers (NOPASSWD) so the non-root backend can reach root processes.
+        if uses_sudo:
+            kill_script = (
+                Path(__file__).resolve().parent.parent.parent
+                / "scripts" / "kill-ltesniffer.sh"
+            )
             try:
-                self._proc.kill()
-            except ProcessLookupError:
+                kill_proc = await asyncio.create_subprocess_exec(
+                    "sudo", "-n", str(kill_script),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(kill_proc.wait(), 3.0)
+            except Exception:
                 pass
-            await self._proc.wait()
+
+        # Step 3: kill the sudo wrapper (or the binary itself if no sudo).
+        try:
+            self._proc.kill()
+        except ProcessLookupError:
+            pass
+        await self._proc.wait()
+
+        # Cancel background tasks in case _wait_exit hasn't fired yet.
+        for task in (self._wait_task, self._reader_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
 
     async def restart(self, cfg: SnifferConfig) -> None:
         await self.stop()
@@ -183,13 +222,27 @@ class SnifferRunner:
         self._fifo_dir = None
         self._fifo_path = None
 
+    @staticmethod
+    def _stderr_level(line: str) -> str:
+        """Detect srsRAN/UHD log level from the line prefix so the GUI can
+        colour INFO messages differently from real errors."""
+        ul = line.upper()
+        if "[ERROR]" in ul or "ERROR:" in ul:
+            return "error"
+        if "[WARNING]" in ul or "[WARN]" in ul or "WARNING:" in ul:
+            return "warn"
+        if "[INFO]" in ul or "[DEBUG]" in ul or "[TRACE]" in ul:
+            return "info"
+        return "info"   # default: treat unknown lines as info, not red
+
     async def _drain_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
         try:
             async for line in self._proc.stderr:
                 msg = line.decode(errors="replace").rstrip()
                 if msg:
-                    self._broadcast({"t": "log", "level": "error", "source": "stderr", "msg": msg})
+                    level = self._stderr_level(msg)
+                    self._broadcast({"t": "log", "level": level, "source": "stderr", "msg": msg})
         except asyncio.CancelledError:
             pass
 
@@ -201,11 +254,16 @@ class SnifferRunner:
         """
         loop = asyncio.get_running_loop()
 
-        def _open_blocking() -> int:
-            return os.open(fifo, os.O_RDONLY)
+        def _open_nonblocking() -> int:
+            # O_RDWR never blocks on a FIFO (no need to wait for a writer),
+            # so the executor thread returns immediately instead of hanging
+            # forever if the sniffer crashes before opening its write end.
+            # We hold the write end ourselves; reads still deliver whatever
+            # the sniffer writes, and the task is cancelled cleanly on exit.
+            return os.open(fifo, os.O_RDWR)
 
         try:
-            fd = await loop.run_in_executor(None, _open_blocking)
+            fd = await loop.run_in_executor(None, _open_nonblocking)
         except FileNotFoundError:
             return
 

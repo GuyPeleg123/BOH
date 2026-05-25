@@ -16,7 +16,7 @@ export function Dashboard() {
   const [bottomTab, setBottomTab] = useState<"logs" | "captures" | "identities">("logs");
 
   return (
-    <div className="p-3 flex flex-col gap-3 h-full overflow-hidden">
+    <div className="p-3 flex flex-col gap-3 h-full overflow-y-auto">
       {/* row 1: capture + spectrum on left, cell card stretches right */}
       <div className="flex items-stretch gap-3">
         <div className="panel p-3 flex items-center gap-2 shrink-0">

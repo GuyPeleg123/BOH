@@ -33,6 +33,7 @@ TOOLS: list[tuple[str, str, callable]] = [
 # a "started" state to the UI.
 EARLY_EXIT_WINDOW_S = 2.5
 STDERR_TAIL_BYTES = 4096
+STDERR_CAP_BYTES = 65536   # max total stderr buffered per launch (~64 KB)
 
 
 class SpectrumLauncher:
@@ -44,7 +45,9 @@ class SpectrumLauncher:
         self._last_error: Optional[str] = None
         self._last_exit_code: Optional[int] = None
         self._stderr_chunks: list[bytes] = []
+        self._stderr_total_bytes: int = 0       # tracks total buffered to enforce cap
         self._stderr_task: Optional[asyncio.Task] = None
+        self._watch_task: Optional[asyncio.Task] = None
 
     def available(self) -> list[dict[str, str]]:
         return [
@@ -153,6 +156,7 @@ class SpectrumLauncher:
         self._last_error = None
         self._last_exit_code = None
         self._stderr_chunks = []
+        self._stderr_total_bytes = 0
         self._argv = argv
         self._tool = chosen_cmd
 
@@ -167,7 +171,8 @@ class SpectrumLauncher:
         # errors after an early crash.
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         # Watch for an early exit (within EARLY_EXIT_WINDOW_S) to flip last_error.
-        asyncio.create_task(self._watch_exit())
+        # Stored so it can be cancelled when stop() is called.
+        self._watch_task = asyncio.create_task(self._watch_exit())
 
         # Block briefly so the synchronous launch result reflects an early crash.
         try:
@@ -187,6 +192,11 @@ class SpectrumLauncher:
             }
 
     async def stop(self) -> dict:
+        # Cancel background tasks regardless of whether the process is still up.
+        for task in (self._watch_task, self._stderr_task):
+            if task and not task.done():
+                task.cancel()
+
         if not self.running() or self._proc is None:
             return {"ok": True, "running": False}
         try:
@@ -225,6 +235,12 @@ class SpectrumLauncher:
                 if not chunk:
                     break
                 self._stderr_chunks.append(chunk)
+                self._stderr_total_bytes += len(chunk)
+                # Evict oldest chunks once we exceed the cap so this list
+                # never grows without bound during a long-running capture.
+                while self._stderr_total_bytes > STDERR_CAP_BYTES and self._stderr_chunks:
+                    dropped = self._stderr_chunks.pop(0)
+                    self._stderr_total_bytes -= len(dropped)
         except asyncio.CancelledError:
             pass
 

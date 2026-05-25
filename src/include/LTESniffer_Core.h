@@ -156,6 +156,7 @@ private:
   int                     sniffer_mode;     //-m
   int                     api_mode    ;     // -z
   bool                    go_exit = false;
+  bool                    rf_b_open = false;  // true only when rf_b was successfully opened (UL/DUAL mode)
   enum receiver_state     { DECODE_MIB, DECODE_PDSCH} state;
   std::mutex              harq_map_mutex;
   Phy                     *phy;

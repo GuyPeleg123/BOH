@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -17,18 +20,78 @@ import config as config_mod
 from config import SnifferConfig
 from sniffer import SnifferRunner
 from mock import MockRunner
-from usrp import find_devices
+from usrp import find_devices, auto_config_patch
 from spectrum import SpectrumLauncher
 import captures as captures_mod
 import keys as keys_mod
 from keys import KeysFile, KEYS_PATH
 
+log = logging.getLogger(__name__)
 
 MOCK = os.environ.get("LTESNIFFER_GUI_MOCK", "").lower() in {"1", "true", "yes"}
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
-app = FastAPI(title="LTESniffer GUI Backend")
+_KILL_SCRIPT = (
+    Path(__file__).resolve().parent.parent.parent / "scripts" / "kill-ltesniffer.sh"
+)
+
+
+def _kill_stale_ltesniffers() -> None:
+    """Kill any LTESniffer processes left over from a previous session.
+
+    This handles the case where the backend was killed without a clean shutdown
+    (SIGKILL, OOM-killer, power loss) and the LTESniffer subprocess (which runs
+    under sudo) was orphaned and left consuming memory.
+
+    Uses the dedicated kill-wrapper script (whitelisted in sudoers NOPASSWD)
+    so root-owned processes can be reached from the non-root backend.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "LTESniffer"],
+            capture_output=True, text=True, timeout=3
+        )
+        pids = result.stdout.strip().split()
+        if not pids:
+            return
+        log.warning(
+            "Startup: found %d stale LTESniffer process(es) (PIDs: %s) — killing.",
+            len(pids), " ".join(pids)
+        )
+        # First try unprivileged SIGKILL (works if process runs as same user).
+        subprocess.run(["pkill", "-KILL", "-x", "LTESniffer"], capture_output=True, timeout=3)
+        # Then use the sudoers-whitelisted script to reach root-owned processes.
+        if _KILL_SCRIPT.exists():
+            subprocess.run(["sudo", "-n", str(_KILL_SCRIPT)], capture_output=True, timeout=5)
+    except Exception as exc:
+        log.debug("_kill_stale_ltesniffers: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- startup ----
+    _kill_stale_ltesniffers()
+    yield
+    # ---- shutdown ----
+    # Stop all subprocesses so nothing is orphaned when the server exits.
+    # This runs when uvicorn receives SIGINT / SIGTERM or is programmatically stopped.
+    log.info("Shutdown: stopping sniffer and spectrum processes…")
+    try:
+        await runner.stop()
+    except Exception as exc:
+        log.warning("Error stopping runner on shutdown: %s", exc)
+    try:
+        await spectrum.stop()
+    except Exception as exc:
+        log.warning("Error stopping spectrum on shutdown: %s", exc)
+    log.info("Shutdown: all subprocesses stopped.")
+
+
+runner = MockRunner() if MOCK else SnifferRunner()
+spectrum = SpectrumLauncher()
+
+app = FastAPI(title="LTESniffer GUI Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,6 +165,17 @@ async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
 @app.get("/api/usrps")
 async def list_usrps() -> dict[str, Any]:
     return {"devices": await find_devices()}
+
+
+@app.get("/api/usrps/autoconfig")
+async def usrps_autoconfig() -> dict[str, Any]:
+    """Detect connected USRPs and return a suggested config patch.
+
+    The frontend can apply this patch to pre-fill serial numbers without the
+    user having to type them manually.  Keys starting with '_' are metadata
+    (not SnifferConfig fields) and should not be written to the config.
+    """
+    return await auto_config_patch()
 
 
 @app.get("/api/keys")

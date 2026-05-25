@@ -17,6 +17,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  get: <T>(path: string) => req<T>(path),
   health: () => req<{ ok: boolean; mock: boolean }>("/api/health"),
   getConfig: () => req<SnifferConfig>("/api/config"),
   putConfig: (cfg: SnifferConfig) =>
