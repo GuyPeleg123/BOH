@@ -103,12 +103,15 @@ void ArgManager::usage(Args& args, const std::string& prog) {
   printf("\t-z API mode, 0 for identity mapping, 1 for IMSI collecting, 2 for UECapability profiling, 3 for all\n");
   printf("\t-d Enable debug mode, print debug message to screen (Defautl disable)\n");
   printf("\t-K Path to JSON key file for PDCP decryption (key-attaching feature)\n");
+  printf("\t-J Path/FIFO for newline-delimited JSON events (used by the gui/ backend)\n");
+  printf("\t-X USRP A rfargs override (e.g. \"clock=gpsdo,serial=32FCD4C\")\n");
+  printf("\t-Z USRP B rfargs override (e.g. \"clock=gpsdo,serial=3367EF9\")\n");
 }
 
 void ArgManager::parseArgs(Args& args, int argc, char **argv) {
   int opt;
   defaultArgs(args);
-  while ((opt = getopt(argc, argv, "aAcCDdEfghHilLnpPrRsStTvwWyYqFIuUmOozK:")) != -1) {
+  while ((opt = getopt(argc, argv, "aAcCDdEfghHilLnpPrRsStTvwWyYqFIuUmOozK:J:X:Z:")) != -1) {
     switch (opt) {
       case 'a':
         args.rf_args = argv[optind];
@@ -221,6 +224,15 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'K':
         args.keys_file = optarg;
+        break;
+      case 'J':
+        args.json_output = optarg;
+        break;
+      case 'X':
+        args.usrp_a_args = optarg;
+        break;
+      case 'Z':
+        args.usrp_b_args = optarg;
         break;
       case 'h':
       default:

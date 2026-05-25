@@ -1,0 +1,236 @@
+"""LTESniffer subprocess + event-stream lifecycle.
+
+The backend creates a FIFO, launches `LTESniffer ... -J <fifo>`, and reads
+newline-delimited JSON events from the FIFO. Events are pushed into the
+broadcast queue and fanned out to every connected WebSocket.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import tempfile
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any, AsyncIterator, Optional
+
+from config import SnifferConfig
+
+
+class SnifferRunner:
+    """Owns a single LTESniffer subprocess + its event stream."""
+
+    def __init__(self) -> None:
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._fifo_dir: Optional[tempfile.TemporaryDirectory] = None
+        self._fifo_path: Optional[Path] = None
+        self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._subscribers: set[asyncio.Queue] = set()
+        self._last_events: deque[dict[str, Any]] = deque(maxlen=2000)
+        # Sticky events kept outside the rolling buffer so that a refresh
+        # after the buffer has rolled past still shows cell / lifecycle state.
+        self._sticky: dict[str, dict[str, Any]] = {}
+        self._state: dict[str, Any] = {
+            "running": False,
+            "pid": None,
+            "started_at": None,
+            "exit_code": None,
+            "last_error": None,
+            "argv": [],
+        }
+
+    # ------------------------------------------------------------------ pubsub
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=4000)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    def replay(self) -> list[dict[str, Any]]:
+        """Return events for a freshly-connected client.
+
+        Order: sticky events (hello/cell/mib/lifecycle/stats), then the
+        rolling buffer. Sticky events that are still in the rolling buffer
+        are NOT deduplicated — emitting them twice is harmless (the reducer
+        is idempotent for these types) and dedup would cost more than it saves.
+        """
+        # lifecycle must be first: the frontend reducer treats lifecycle:started
+        # as a hard reset for the rest of the state, so it has to be applied
+        # before the cell/hello/mib events from the same capture.
+        sticky_keys = ("lifecycle", "hello", "cell", "mib", "stats")
+        return [self._sticky[k] for k in sticky_keys if k in self._sticky] + list(self._last_events)
+
+    def state(self) -> dict[str, Any]:
+        return dict(self._state)
+
+    def _broadcast(self, event: dict[str, Any]) -> None:
+        t = event.get("t")
+        if t in ("hello", "cell", "mib", "lifecycle", "stats"):
+            self._sticky[t] = event
+        self._last_events.append(event)
+        dead: list[asyncio.Queue] = []
+        for q in self._subscribers:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            self._subscribers.discard(q)
+
+    # --------------------------------------------------------------- lifecycle
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self, cfg: SnifferConfig) -> None:
+        if self.running:
+            raise RuntimeError("sniffer already running")
+
+        # New run — drop stale sticky state from the previous capture.
+        self._sticky.clear()
+        self._last_events.clear()
+
+        self._fifo_dir = tempfile.TemporaryDirectory(prefix="ltesniffer-gui-")
+        self._fifo_path = Path(self._fifo_dir.name) / "events.jsonl"
+        os.mkfifo(self._fifo_path)
+
+        binary = Path(cfg.binary_path).expanduser()
+        if not binary.is_absolute():
+            binary = (Path(__file__).resolve().parent / binary).resolve()
+        if not binary.exists():
+            self._cleanup_fifo()
+            raise FileNotFoundError(f"LTESniffer binary not found at {binary}")
+
+        argv = cfg.to_argv(str(self._fifo_path))
+        argv[argv.index(cfg.binary_path)] = str(binary)
+
+        captures_dir = Path(cfg.captures_dir).expanduser()
+        captures_dir.mkdir(parents=True, exist_ok=True)
+
+        self._state.update(
+            running=True,
+            pid=None,
+            started_at=time.time(),
+            exit_code=None,
+            last_error=None,
+            argv=list(argv),
+        )
+
+        # Reader task must be running before child opens FIFO for write
+        # (fopen blocks until both ends are connected).
+        self._reader_task = asyncio.create_task(self._read_events(self._fifo_path))
+
+        self._proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(captures_dir),
+        )
+        self._state["pid"] = self._proc.pid
+        self._broadcast({"t": "lifecycle", "event": "started", "pid": self._proc.pid, "argv": argv})
+
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        asyncio.create_task(self._wait_exit())
+
+    async def stop(self, timeout: float = 5.0) -> None:
+        if not self.running or self._proc is None:
+            return
+        try:
+            self._proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout)
+        except asyncio.TimeoutError:
+            try:
+                self._proc.kill()
+            except ProcessLookupError:
+                pass
+            await self._proc.wait()
+
+    async def restart(self, cfg: SnifferConfig) -> None:
+        await self.stop()
+        await self.start(cfg)
+
+    # ----------------------------------------------------------------- private
+
+    async def _wait_exit(self) -> None:
+        assert self._proc is not None
+        rc = await self._proc.wait()
+        self._state["running"] = False
+        self._state["exit_code"] = rc
+        self._broadcast({"t": "lifecycle", "event": "exited", "exit_code": rc})
+        if self._reader_task:
+            self._reader_task.cancel()
+        if self._stderr_task:
+            self._stderr_task.cancel()
+        self._cleanup_fifo()
+
+    def _cleanup_fifo(self) -> None:
+        if self._fifo_dir:
+            try:
+                self._fifo_dir.cleanup()
+            except Exception:
+                pass
+        self._fifo_dir = None
+        self._fifo_path = None
+
+    async def _drain_stderr(self) -> None:
+        assert self._proc is not None and self._proc.stderr is not None
+        try:
+            async for line in self._proc.stderr:
+                msg = line.decode(errors="replace").rstrip()
+                if msg:
+                    self._broadcast({"t": "log", "level": "error", "source": "stderr", "msg": msg})
+        except asyncio.CancelledError:
+            pass
+
+    async def _read_events(self, fifo: Path) -> None:
+        """Open the FIFO and stream events.
+
+        Opening for read is non-blocking; the loop tolerates the writer
+        connecting later (returns empty reads until then).
+        """
+        loop = asyncio.get_running_loop()
+
+        def _open_blocking() -> int:
+            return os.open(fifo, os.O_RDONLY)
+
+        try:
+            fd = await loop.run_in_executor(None, _open_blocking)
+        except FileNotFoundError:
+            return
+
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport, _ = await loop.connect_read_pipe(lambda: protocol, os.fdopen(fd, "rb", buffering=0))
+
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    await asyncio.sleep(0.05)
+                    if not self.running:
+                        break
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    self._broadcast({"t": "log", "level": "warn", "source": "parser", "msg": f"bad json line: {line[:120]!r}"})
+                    continue
+                self._broadcast(event)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                transport.close()
+            except Exception:
+                pass

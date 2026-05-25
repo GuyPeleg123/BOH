@@ -60,8 +60,10 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   harq_mode(args.harq_mode),
   sniffer_mode(args.sniffer_mode),
   ulsche(args.target_rnti, &ul_harq, args.en_debug),
-  api_mode(args.api_mode)
+  api_mode(args.api_mode),
+  json_emitter(args.json_output)
 {
+  json_emitter.emitHello(args);
   srsran_filesink_init(&file_sink, "iq_sample_dl.bin", SRSRAN_COMPLEX_FLOAT_BIN);
   /*create pcap writer and name of output file*/    
   auto now = std::chrono::system_clock::now();
@@ -123,7 +125,10 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   std::shared_ptr<DCIConsumerList> cons(new DCIConsumerList());
   if(args.dci_file_name != "") {
     cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIToFile>(new DCIToFile(phy->getCommon().getDCIFile()))));
-  } 
+  }
+  if(json_emitter.isOpen()) {
+    cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIToJSON>(new DCIToJSON(json_emitter))));
+  }
   // if(args.enable_ASCII_PRB_plot) {
   //   cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIDrawASCII>(new DCIDrawASCII())));
   // }
@@ -191,8 +196,14 @@ bool LTESniffer_Core::run(){
     printf("Opening RF device with %d RX antennas...\n", args.rf_nof_rx_ant);
     char rfArgsCStr_a[1024];
     char rfArgsCStr_b[1024];
-    std::string rf_a_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=32FCD4C"; 
+    std::string rf_a_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=32FCD4C";
     std::string rf_b_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000,serial=3367EF9";
+    if (!args.usrp_a_args.empty()) {
+      rf_a_string = args.usrp_a_args;
+    }
+    if (!args.usrp_b_args.empty()) {
+      rf_b_string = args.usrp_b_args;
+    }
 
     /*The following strings are for USRP X310 for specific application*/
     // std::string rf_a_string = "clock=gpsdo,type=x300,addr=192.168.40.2";
@@ -283,6 +294,7 @@ bool LTESniffer_Core::run(){
 
     /* set sampling frequency */
     int srate = srsran_sampling_freq_hz(cell.nof_prb);
+    json_emitter.emitCell(cell, args.rf_freq, args.ul_freq, srate > 0 ? srate : 0.0);
     if (srate != -1) {
       printf("Setting sampling rate %.2f MHz\n", (float)srate / 1000000);
       float srate_rf_a = srsran_rf_set_rx_srate(&rf_a, (double)srate);
@@ -488,6 +500,7 @@ bool LTESniffer_Core::run(){
               srsran_pbch_mib_unpack(bch_payload, &cell, &sfn);
               srsran_cell_fprint(stdout, &cell, sfn);
               printf("Decoded MIB. SFN: %d, offset: %d\n", sfn, sfn_offset);
+              json_emitter.emitMIB(sfn, sfn_offset);
               sfn   = (sfn + sfn_offset) % 1024;
               state = DECODE_PDSCH;
 
@@ -691,6 +704,7 @@ bool LTESniffer_Core::run(){
 void LTESniffer_Core::stop() {
   uhd_stop = true;
   cout << "LTESniffer_Core: Exiting..." << endl;
+  json_emitter.emitBye("stop");
   go_exit = true;
 }
 

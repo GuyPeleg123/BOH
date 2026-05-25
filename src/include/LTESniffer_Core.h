@@ -24,6 +24,7 @@
 
 #include "ArgManager.h"
 #include "KeyAttaching.h"
+#include "include/JSONEmitter.h"
 #include "falcon/common/SignalManager.h"
 #include "include/SubframeWorker.h"
 #include "include/ThreadSafeQueue.h"
@@ -170,4 +171,5 @@ private:
   int                     harq_mode;
   srsran_filesink_t       file_sink = {};
   KeyStore                key_store_;       // PDCP decryption engine (empty unless -K flag given)
+  JSONEmitter             json_emitter;     // newline-delimited JSON events for the gui/ backend (empty unless -J given)
 };
