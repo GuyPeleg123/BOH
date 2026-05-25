@@ -137,6 +137,7 @@ private:
     float                   prach_offsets[165]  = {};
     float                   prach_p2avg[165]    = {};
     uint32_t                nof_sf = 0;
+    bool                    prach_detection_enabled = true;
     cf_t                    samples[prach_buffer_sz] = {};
     UL_HARQ                 *ul_harq; //on developing
     MCSTracking             *mcstracking;

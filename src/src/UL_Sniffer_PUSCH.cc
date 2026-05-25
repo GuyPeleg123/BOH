@@ -678,28 +678,36 @@ void PUSCH_Decoder::set_rach_config(srsran_prach_cfg_t prach_cfg_)
     }
     srsran_prach_set_detect_factor(&prach, 60);
     nof_sf = (uint32_t)ceilf(prach.T_tot * 1000);
+
+    uint32_t sig_len_per_sf = SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb) - prach.N_cp;
+    prach_detection_enabled = (sig_len_per_sf >= prach.N_ifft_prach);
+    if (!prach_detection_enabled) {
+        printf("[PRACH] Detection disabled: cell uses PRACH format %u "
+               "(needs %u samples, only %u available within one subframe; "
+               "multi-subframe buffering not implemented). "
+               "User-plane decoding is unaffected.\n",
+               prach.f, prach.N_ifft_prach, sig_len_per_sf);
+    }
 }
 
 void PUSCH_Decoder::work_prach()
 {
+    if (!prach_detection_enabled) return;
+
     uint32_t prach_nof_det = 0;
     if (srsran_prach_tti_opportunity(&prach, ul_sf.tti, -1))
     {
         memcpy(&samples[0],
                original_buffer[0],
                sizeof(cf_t) * SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb));
-        // Detect possible PRACHs
-        uint32_t prach_sig_len = SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb) - prach.N_cp;
-        if (prach_sig_len >= prach.N_ifft_prach) {
-          srsran_prach_detect_offset(&prach,
-                                     prach_cfg.freq_offset,
-                                     &samples[prach.N_cp],
-                                     prach_sig_len,
-                                     prach_indices,
-                                     prach_offsets,
-                                     prach_p2avg,
-                                     &prach_nof_det);
-        }
+        srsran_prach_detect_offset(&prach,
+                                   prach_cfg.freq_offset,
+                                   &samples[prach.N_cp],
+                                   SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb) - prach.N_cp,
+                                   prach_indices,
+                                   prach_offsets,
+                                   prach_p2avg,
+                                   &prach_nof_det);
 
         if (prach_nof_det)
         {
