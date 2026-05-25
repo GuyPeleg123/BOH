@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse } from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -37,6 +37,12 @@ export const api = {
       body: cfg ? JSON.stringify(cfg) : "null",
     }),
   usrps: () => req<{ devices: USRPDevice[] }>("/api/usrps"),
+  getKeys: () => req<KeysResponse>("/api/keys"),
+  putKeys: (entries: KeyEntry[]) =>
+    req<{ ok: boolean; path: string; wired_into_config: boolean; n_entries: number }>(
+      "/api/keys",
+      { method: "PUT", body: JSON.stringify({ entries }) }
+    ),
   captures: () => req<CapturesResponse>("/api/captures"),
   downloadCaptureUrl: (path: string) =>
     `/api/captures/download?path=${encodeURIComponent(path)}`,

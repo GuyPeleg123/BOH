@@ -68,6 +68,60 @@ class SpectrumLauncher:
             "last_error": self._last_error,
             "last_exit_code": self._last_exit_code,
             "last_tool": self._tool,
+            "preflight": self.preflight(),
+        }
+
+    def preflight(self) -> dict:
+        """Best-effort upfront checks so the GUI can tell the operator what
+        will fail before they click launch.
+
+        Each check returns: {ok: bool, detail: str, fix: str|None}.
+        """
+        # Display
+        disp = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        display_check = {
+            "ok": bool(disp),
+            "detail": f"DISPLAY={disp}" if disp else "no $DISPLAY / $WAYLAND_DISPLAY in backend env",
+            "fix": "Start the backend from a graphical login (or `ssh -X`)." if not disp else None,
+        }
+
+        # UHD firmware images
+        images_dirs = [
+            "/usr/share/uhd/images",
+            "/usr/local/share/uhd/images",
+            os.path.expanduser("~/.uhd/images"),
+        ]
+        images_present = None
+        for d in images_dirs:
+            try:
+                if os.path.isdir(d) and any(name.endswith(".hex") or name.endswith(".bit")
+                                            for name in os.listdir(d)):
+                    images_present = d
+                    break
+            except OSError:
+                continue
+        images_check = {
+            "ok": images_present is not None,
+            "detail": f"images dir: {images_present}" if images_present else "no UHD firmware images found",
+            "fix": (
+                "Run once:  sudo /lib/x86_64-linux-gnu/uhd/utils/uhd_images_downloader.py"
+                if not images_present else None
+            ),
+        }
+
+        # Tool available
+        tool_check = {
+            "ok": len(self.available()) > 0,
+            "detail": ("available: " + ", ".join(t["cmd"] for t in self.available()))
+                      if self.available() else "no uhd_fft / gqrx on PATH",
+            "fix": "sudo apt install gnuradio-uhd  # for uhd_fft" if not self.available() else None,
+        }
+
+        return {
+            "display": display_check,
+            "uhd_images": images_check,
+            "tool": tool_check,
+            "all_ok": all(c["ok"] for c in (display_check, images_check, tool_check)),
         }
 
     async def launch(self, freq_hz: float, sample_rate_hz: float,

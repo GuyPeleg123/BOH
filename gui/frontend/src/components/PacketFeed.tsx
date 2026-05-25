@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { rntiColor } from "../lib/color";
 
@@ -17,7 +17,24 @@ export function PacketFeed() {
   const [rntiFilter, setRntiFilter] = useState("");
   const [frozen, setFrozen] = useState<typeof state.recentDci | null>(null);
 
-  const list = paused ? (frozen ?? state.recentDci) : state.recentDci;
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Auto-pause while the mouse is hovering, so the operator can read.
+  const [hovering, setHovering] = useState(false);
+  const effectivelyPaused = paused || hovering;
+
+  const list = effectivelyPaused ? (frozen ?? state.recentDci) : state.recentDci;
+
+  // Freeze the list when paused/hovered, unfreeze when released.
+  useEffect(() => {
+    if (effectivelyPaused) {
+      if (!frozen) setFrozen(state.recentDci);
+    } else {
+      setFrozen(null);
+    }
+    // Intentionally not listing state.recentDci so we don't re-freeze every batch
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectivelyPaused]);
 
   const filtered = useMemo(() => {
     const rntiNum = rntiFilter.trim() === "" ? null : Number(rntiFilter.trim());
@@ -28,15 +45,8 @@ export function PacketFeed() {
     );
   }, [list, filter, rntiFilter]);
 
-  function togglePause() {
-    if (paused) {
-      setPaused(false);
-      setFrozen(null);
-    } else {
-      setFrozen(state.recentDci);
-      setPaused(true);
-    }
-  }
+  // Count of new items that arrived while paused (delta vs frozen length).
+  const newWhilePaused = effectivelyPaused && frozen ? state.recentDci.length - frozen.length : 0;
 
   const FilterBtn = ({ v, label }: { v: Filter; label: string }) => (
     <button
@@ -56,10 +66,13 @@ export function PacketFeed() {
         <span className="text-xs text-muted font-mono">
           {filtered.length}/{state.recentDci.length}
         </span>
+        {effectivelyPaused && newWhilePaused > 0 && (
+          <span className="text-xs font-mono text-warn">+{newWhilePaused} while paused</span>
+        )}
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           <FilterBtn v="all" label="ALL" />
-          <FilterBtn v="dl" label="DL" />
-          <FilterBtn v="ul" label="UL" />
+          <FilterBtn v="dl"  label="DL" />
+          <FilterBtn v="ul"  label="UL" />
           <input
             className="input !py-0.5 !text-xs !w-28"
             placeholder="filter RNTI"
@@ -68,14 +81,21 @@ export function PacketFeed() {
           />
           <button
             className={`btn !px-2 !py-0.5 !text-xs ${paused ? "btn-danger" : ""}`}
-            onClick={togglePause}
+            onClick={() => setPaused((p) => !p)}
+            title="Pause / resume. Hovering also pauses automatically."
           >
             {paused ? "▶ resume" : "❚❚ pause"}
           </button>
         </div>
       </div>
 
-      <div className="overflow-auto flex-1 bg-bg border border-border rounded">
+      <div
+        ref={scrollRef}
+        onMouseEnter={() => setHovering(true)}
+        onMouseLeave={() => setHovering(false)}
+        className="overflow-auto flex-1 bg-bg border border-border rounded"
+        title="Hovering pauses the feed so you can read."
+      >
         <table className="w-full text-xs font-mono">
           <thead className="sticky top-0 bg-bg z-10 text-[10px] uppercase text-muted">
             <tr className="border-b border-border">
@@ -102,7 +122,7 @@ export function PacketFeed() {
                   </span>
                 </td>
                 <td className="px-2 py-1 text-right text-muted">{d.sfn}.{d.sf}</td>
-                <td className="px-2 py-1 text-right text-muted">{d.ts.toFixed(2)}s</td>
+                <td className="px-2 py-1 text-right text-muted">{d.ts.toFixed(1)}s</td>
                 <td className="px-2 py-1"><span className="inline-block w-2 h-2 rounded-sm" style={{ background: rntiColor(d.rnti) }} /></td>
                 <td className="px-2 py-1 text-right text-slate-100">{d.rnti}</td>
                 <td className="px-2 py-1 text-muted">{d.fmt}</td>
@@ -123,6 +143,9 @@ export function PacketFeed() {
             )}
           </tbody>
         </table>
+      </div>
+      <div className="mt-2 text-[10px] text-muted text-right">
+        hover to pause · newest first
       </div>
     </div>
   );

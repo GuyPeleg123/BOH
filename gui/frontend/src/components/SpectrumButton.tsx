@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import type { USRPDevice } from "../lib/types";
 
+interface PreflightCheck { ok: boolean; detail: string; fix: string | null; }
+
 interface SpectrumStatus {
   available: { cmd: string; label: string }[];
   running: boolean;
@@ -13,6 +15,12 @@ interface SpectrumStatus {
   last_error: string | null;
   last_exit_code: number | null;
   last_tool: string | null;
+  preflight: {
+    display: PreflightCheck;
+    uhd_images: PreflightCheck;
+    tool: PreflightCheck;
+    all_ok: boolean;
+  };
 }
 
 function buildDeviceArgs(serial: string): string {
@@ -169,12 +177,35 @@ export function SpectrumButton() {
 
       {open && !isRunning && (
         <div className="absolute right-0 mt-2 w-[28rem] panel p-3 z-30 shadow-xl border-accent/30">
+          {/* Pre-flight panel: tells the operator which preconditions are already met */}
+          {status?.preflight && (
+            <div className="mb-3 bg-bg border border-border rounded p-2 space-y-1.5">
+              <div className="text-[10px] uppercase tracking-wide text-muted mb-1">Pre-flight</div>
+              {([
+                ["display",    status.preflight.display],
+                ["uhd images", status.preflight.uhd_images],
+                ["tool",       status.preflight.tool],
+              ] as const).map(([label, c]) => (
+                <div key={label} className="text-xs">
+                  <div className="flex items-baseline gap-2">
+                    <span className={c.ok ? "text-ok" : "text-bad"}>{c.ok ? "✓" : "✗"}</span>
+                    <span className="text-slate-200 uppercase tracking-wide text-[10px] w-20">{label}</span>
+                    <span className="text-muted font-mono truncate" title={c.detail}>{c.detail}</span>
+                  </div>
+                  {!c.ok && c.fix && (
+                    <div className="ml-6 mt-0.5 text-[11px] text-warn font-mono bg-warn/5 border-l-2 border-warn/40 pl-2 py-0.5">
+                      {c.fix}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
           <div className="text-xs text-muted mb-2">
-            Opens on the backend's display
-            {status?.display_env ? <> (<span className="font-mono">{status.display_env}</span>)</> : <span className="text-bad"> — no $DISPLAY detected</span>}.
             {freq > 0 ? (
               <>
-                {" "}Tuning <span className="font-mono text-slate-200">{(freq / 1e6).toFixed(3)} MHz</span>
+                Tuning <span className="font-mono text-slate-200">{(freq / 1e6).toFixed(3)} MHz</span>
                 {sr > 0 && <> @ <span className="font-mono text-slate-200">{(sr / 1e6).toFixed(2)} MHz</span> sample rate</>}.
               </>
             ) : (

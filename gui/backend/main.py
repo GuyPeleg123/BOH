@@ -20,6 +20,8 @@ from mock import MockRunner
 from usrp import find_devices
 from spectrum import SpectrumLauncher
 import captures as captures_mod
+import keys as keys_mod
+from keys import KeysFile, KEYS_PATH
 
 
 MOCK = os.environ.get("LTESNIFFER_GUI_MOCK", "").lower() in {"1", "true", "yes"}
@@ -100,6 +102,33 @@ async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
 @app.get("/api/usrps")
 async def list_usrps() -> dict[str, Any]:
     return {"devices": await find_devices()}
+
+
+@app.get("/api/keys")
+async def get_keys() -> dict[str, Any]:
+    kf = keys_mod.load()
+    return {
+        "entries": [e.model_dump() for e in kf.entries],
+        "path": str(KEYS_PATH),
+        "exists": KEYS_PATH.exists(),
+    }
+
+
+@app.put("/api/keys")
+async def put_keys(body: KeysFile) -> dict[str, Any]:
+    path = keys_mod.save(body)
+    # Auto-point the saved sniffer config at our keys file so the next
+    # capture launch will use it (only if the user hasn't set their own path).
+    cfg = config_mod.load()
+    if not cfg.keys_file or cfg.keys_file == str(KEYS_PATH):
+        cfg.keys_file = str(path)
+        config_mod.save(cfg)
+    return {
+        "ok": True,
+        "path": str(path),
+        "wired_into_config": cfg.keys_file == str(path),
+        "n_entries": len(body.entries),
+    }
 
 
 @app.get("/api/spectrum")

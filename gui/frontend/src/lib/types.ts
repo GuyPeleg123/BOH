@@ -117,6 +117,26 @@ export interface CapturesResponse {
   captures_dir: string;
 }
 
+export type CipherAlgo = "EEA0" | "EEA1" | "EEA2" | "EEA3";
+export type IntegAlgo = "EIA0" | "EIA1" | "EIA2" | "EIA3";
+
+export interface KeyEntry {
+  rnti: number;                  // 0..0xFFFF, displayed in hex in UI
+  kenb?: string | null;          // 64 hex chars
+  kasme?: string | null;         // 64 hex chars
+  nas_count?: number | null;     // required iff kasme set, no kenb
+  cipher_algo?: CipherAlgo | null;
+  integ_algo?: IntegAlgo | null;
+  hfn_hint?: number;             // 0 default
+  label?: string | null;
+}
+
+export interface KeysResponse {
+  entries: KeyEntry[];
+  path: string;
+  exists: boolean;
+}
+
 export interface USRPDevice {
   type?: string;
   serial?: string;

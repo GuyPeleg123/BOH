@@ -7,28 +7,47 @@ interface Props {
   direction: "dl" | "ul";
 }
 
+const REDRAW_INTERVAL_MS = 200; // 5 Hz max; the underlying data updates faster
+
 export function RBWaterfall({ mode, direction }: Props) {
   const { state } = useStore();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sizeRef = useRef({ w: 0, h: 0 });
+  const lastDrawRef = useRef(0);
+  const pendingRafRef = useRef<number | null>(null);
 
-  // Observe container size so the canvas resizes when the layout reflows.
   useEffect(() => {
     if (!wrapRef.current) return;
     const ro = new ResizeObserver((entries) => {
       for (const e of entries) {
         const cr = e.contentRect;
         sizeRef.current = { w: Math.floor(cr.width), h: Math.floor(cr.height) };
-        draw();
+        scheduleDraw(true);
       }
     });
     ro.observe(wrapRef.current);
     return () => ro.disconnect();
   }, []);
 
-  // Redraw on every state tick (the store batches at FLUSH_HZ so this is bounded).
-  useEffect(() => { draw(); }, [state.sfHistory, state.cell, mode, direction]);
+  useEffect(() => { scheduleDraw(false); }, [state.sfHistory, state.cell, mode, direction]);
+
+  function scheduleDraw(force: boolean) {
+    const now = performance.now();
+    const since = now - lastDrawRef.current;
+    if (force || since >= REDRAW_INTERVAL_MS) {
+      lastDrawRef.current = now;
+      draw();
+      return;
+    }
+    if (pendingRafRef.current != null) return;
+    const delay = REDRAW_INTERVAL_MS - since;
+    pendingRafRef.current = window.setTimeout(() => {
+      pendingRafRef.current = null;
+      lastDrawRef.current = performance.now();
+      draw();
+    }, delay);
+  }
 
   function draw() {
     const canvas = canvasRef.current;

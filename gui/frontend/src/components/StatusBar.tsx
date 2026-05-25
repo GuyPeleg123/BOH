@@ -25,6 +25,7 @@ export function StatusBar() {
       </div>
       <nav className="flex gap-1">
         {tab("/", "Dashboard")}
+        {tab("/keys", "Keys")}
         {tab("/config", "Config")}
       </nav>
       <div className="ml-auto flex items-center gap-4 text-xs">
