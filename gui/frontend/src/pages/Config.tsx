@@ -99,6 +99,13 @@ export function ConfigPage() {
     api.getKnownCells().then((r) => { setKnownCells(r.cells); setKnownCellsPath(r.path); }).catch(() => {});
   }, []);
 
+  async function refreshKnownCells() {
+    try {
+      const r = await api.getKnownCells();
+      setKnownCells(r.cells); setKnownCellsPath(r.path);
+    } catch (e: any) { setErr(e?.message ?? String(e)); }
+  }
+
   async function loadKnownCell(idx: number) {
     setBusy(true); setErr(null);
     try {
@@ -106,6 +113,38 @@ export function ConfigPage() {
       setCfg(r.config);
       setSaved(`Loaded "${r.loaded}"`);
       setTimeout(() => setSaved(null), 2500);
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteKnownCell(idx: number) {
+    if (!confirm(`Delete known cell #${idx} "${knownCells[idx]?.label}" ?`)) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await api.deleteKnownCell(idx);
+      setSaved(`Removed "${r.removed_label}"`);
+      setTimeout(() => setSaved(null), 2500);
+      await refreshKnownCells();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveCurrentAsKnownCell() {
+    const label = window.prompt("Label for this known cell (operator name, location, etc.):", "");
+    if (!label || !label.trim()) return;
+    const notes = window.prompt("Notes (optional — what makes it noteworthy):", "") ?? "";
+    setBusy(true); setErr(null);
+    try {
+      await api.saveCurrentAsKnownCell({ label: label.trim(), notes: notes.trim() });
+      setSaved(`Saved "${label.trim()}" as known cell`);
+      setTimeout(() => setSaved(null), 2500);
+      await refreshKnownCells();
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     } finally {
@@ -253,12 +292,25 @@ export function ConfigPage() {
         </div>
       </div>
 
-      {knownCells.length > 0 && (
-        <div className="panel p-4 mb-4">
-          <div className="flex items-baseline justify-between mb-2">
-            <span className="label">Known cells — one-click load</span>
-            <span className="text-[10px] text-muted font-mono">{knownCellsPath}</span>
+      <div className="panel p-4 mb-4">
+        <div className="flex items-baseline justify-between mb-2 gap-3">
+          <span className="label">Known cells — one-click load</span>
+          <button
+            className="btn btn-ok !px-3 !py-1 !text-xs"
+            disabled={busy || !cfg}
+            onClick={saveCurrentAsKnownCell}
+            title="Snapshot the current config (freq, mode, USRP, gain) as a new known cell"
+          >
+            + Save current as known cell
+          </button>
+          <span className="text-[10px] text-muted font-mono ml-auto">{knownCellsPath}</span>
+        </div>
+        {knownCells.length === 0 ? (
+          <div className="text-xs text-muted py-3">
+            No cells saved yet. Tune to a working cell in the form below, then click
+            "Save current as known cell" so you can recall it later in one click.
           </div>
+        ) : (
           <div className="flex flex-col gap-2">
             {knownCells.map((c, i) => (
               <div key={i} className="flex items-center gap-3 p-2 rounded border border-border bg-bg">
@@ -279,16 +331,24 @@ export function ConfigPage() {
                     {c.nof_prb} PRB · mode {c.sniffer_mode}
                     {c.pci != null && <> · PCI {c.pci}</>}
                   </div>
-                  {c.notes && <div className="text-[11px] text-muted mt-0.5 truncate">{c.notes}</div>}
+                  {c.notes && <div className="text-[11px] text-muted mt-0.5 truncate" title={c.notes}>{c.notes}</div>}
                 </div>
                 {c.last_success_iso && (
-                  <span className="text-[10px] text-muted font-mono">{c.last_success_iso}</span>
+                  <span className="text-[10px] text-muted font-mono whitespace-nowrap">{c.last_success_iso}</span>
                 )}
+                <button
+                  className="btn btn-danger !px-2 !py-0.5 !text-[10px]"
+                  disabled={busy}
+                  onClick={() => deleteKnownCell(i)}
+                  title="Remove this cell from the registry"
+                >
+                  ✕
+                </button>
               </div>
             ))}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {usrps.length > 0 && (
         <div className="panel p-4 mb-4">

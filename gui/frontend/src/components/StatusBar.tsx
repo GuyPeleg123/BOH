@@ -33,6 +33,7 @@ export function StatusBar() {
         {tab("/", "Dashboard")}
         {tab("/keys", "Keys")}
         {tab("/config", "Config")}
+        {tab("/help", "Help")}
       </nav>
       <div className="ml-auto flex items-center gap-4 text-xs">
         <span className={state.connected ? "text-ok" : "text-bad"}>

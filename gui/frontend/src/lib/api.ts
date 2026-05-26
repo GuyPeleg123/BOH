@@ -102,6 +102,12 @@ export const api = {
   loadKnownCell: (idx: number) =>
     req<{ ok: boolean; loaded: string; config: SnifferConfig }>(
       `/api/known-cells/${idx}/load`, { method: "POST" }),
+  saveCurrentAsKnownCell: (body: { label: string; notes?: string; pci?: number | null; bandwidth_mhz?: number | null }) =>
+    req<{ ok: boolean; idx: number }>(
+      "/api/known-cells/save-current", { method: "POST", body: JSON.stringify(body) }),
+  deleteKnownCell: (idx: number) =>
+    req<{ ok: boolean; removed_label: string; n_remaining: number }>(
+      `/api/known-cells/${idx}`, { method: "DELETE" }),
   getKeys: () => req<KeysResponse>("/api/keys"),
   putKeys: (entries: KeyEntry[]) =>
     req<{ ok: boolean; path: string; wired_into_config: boolean; n_entries: number }>(

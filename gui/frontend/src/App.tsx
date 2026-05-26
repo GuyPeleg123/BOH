@@ -4,6 +4,7 @@ import { StatusBar } from "./components/StatusBar";
 import { Dashboard } from "./pages/Dashboard";
 import { ConfigPage } from "./pages/Config";
 import { KeysPage } from "./pages/Keys";
+import { HelpPage } from "./pages/Help";
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
             <Route path="/"       element={<Dashboard />} />
             <Route path="/config" element={<ConfigPage />} />
             <Route path="/keys"   element={<KeysPage />} />
+            <Route path="/help"   element={<HelpPage />} />
           </Routes>
         </main>
       </div>

@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 import config as config_mod
 from config import SnifferConfig
@@ -203,7 +203,7 @@ app.add_middleware(
 
 # Routes that don't require a token. /api/health stays open so a misconfigured
 # client can tell "wrong token" (401) apart from "server down" (no response).
-_AUTH_FREE_PREFIXES = ("/api/health", "/assets/", "/metrics")
+_AUTH_FREE_PREFIXES = ("/api/health", "/api/help", "/assets/", "/metrics")
 _AUTH_FREE_EXACT = {"/"}  # SPA index — token check happens via the WS instead
 
 
@@ -421,6 +421,58 @@ async def load_known_cell_into_config(idx: int) -> dict[str, Any]:
     return {"ok": True, "loaded": cell.label, "config": cfg.model_dump()}
 
 
+@app.post("/api/known-cells/save-current")
+async def save_current_as_known_cell(body: dict[str, Any]) -> dict[str, Any]:
+    """Snapshot the active SnifferConfig + a label/notes into a new KnownCell.
+
+    The label is required; notes/PCI are optional. Other fields are copied from
+    the live SnifferConfig (freq, mode, USRP rfargs, gain, PRB).
+    """
+    import time as _t
+    label = (body.get("label") or "").strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+    cfg = config_mod.load()
+    kcf = known_cells_mod.load()
+    cell = KnownCell(
+        label=label,
+        dl_freq_mhz=cfg.rf_freq / 1e6,
+        ul_freq_mhz=cfg.ul_freq / 1e6,
+        bandwidth_mhz=body.get("bandwidth_mhz"),
+        nof_prb=cfg.nof_prb,
+        pci=body.get("pci"),
+        sniffer_mode=cfg.sniffer_mode,
+        usrp_a_args=cfg.usrp_a_args,
+        usrp_b_args=cfg.usrp_b_args,
+        rf_gain=cfg.rf_gain,
+        last_success_iso=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+        notes=(body.get("notes") or "").strip(),
+    )
+    kcf.cells.append(cell)
+    path = known_cells_mod.save(kcf)
+    return {"ok": True, "path": str(path), "idx": len(kcf.cells) - 1, "cell": cell.model_dump()}
+
+
+@app.put("/api/known-cells/{idx}")
+async def update_known_cell(idx: int, cell: KnownCell) -> dict[str, Any]:
+    kcf = known_cells_mod.load()
+    if idx < 0 or idx >= len(kcf.cells):
+        raise HTTPException(404, f"known cell idx {idx} out of range")
+    kcf.cells[idx] = cell
+    known_cells_mod.save(kcf)
+    return {"ok": True, "cell": cell.model_dump()}
+
+
+@app.delete("/api/known-cells/{idx}")
+async def delete_known_cell(idx: int) -> dict[str, Any]:
+    kcf = known_cells_mod.load()
+    if idx < 0 or idx >= len(kcf.cells):
+        raise HTTPException(404, f"known cell idx {idx} out of range")
+    removed = kcf.cells.pop(idx)
+    known_cells_mod.save(kcf)
+    return {"ok": True, "removed_label": removed.label, "n_remaining": len(kcf.cells)}
+
+
 @app.get("/api/analytics/rnti-churn")
 async def analytics_rnti_churn(path: str) -> dict[str, Any]:
     """Run the RNTI churn analyzer against a recorded session.
@@ -490,6 +542,17 @@ async def events_ws(ws: WebSocket) -> None:
         pass
     finally:
         runner.unsubscribe(q)
+
+
+# --- User guide (auth-free; it's the same content as on disk in the repo) ----
+
+_USER_GUIDE = Path(__file__).resolve().parent.parent / "USER_GUIDE.txt"
+
+@app.get("/api/help", response_class=PlainTextResponse)
+async def help_text() -> PlainTextResponse:
+    if not _USER_GUIDE.exists():
+        raise HTTPException(404, f"USER_GUIDE.txt not found at {_USER_GUIDE}")
+    return PlainTextResponse(_USER_GUIDE.read_text(encoding="utf-8"))
 
 
 # --- Static frontend (served only if `npm run build` has been run) ----------
