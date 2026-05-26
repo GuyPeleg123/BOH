@@ -61,7 +61,11 @@ void append_pwr_map(std::ostringstream& os, const std::vector<float>& map) {
 
 JSONEmitter::JSONEmitter(const std::string& path)
     : start_time(std::chrono::steady_clock::now()),
-      last_rich_sf(std::chrono::steady_clock::time_point::min())  // first sf always emits rich
+      // Default-constructed = clock epoch (zero duration since reference).
+      // Earlier version used time_point::min() which made `now - last_rich_sf`
+      // overflow nanoseconds → the >=20ms check returned false forever, so
+      // the rich `sf` event NEVER fired (we only ever got `sf_tick`).
+      last_rich_sf{}
 {
     if (path.empty()) {
         return;

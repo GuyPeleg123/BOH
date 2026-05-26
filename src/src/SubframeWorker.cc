@@ -270,7 +270,11 @@ void SubframeWorker::work()
   /*Update CFO for ue_sync in sync thread*/
   est_cfo = falcon_ue_dl.q->chest_res.cfo;
   falcon_ue_dl.q->chest_res.cfo = 0;
-  // common.consumeDCICollection(subframeInfo); //save DCI to file
+  // Invoke the consumer chain — this fans out the per-subframe SubframeInfo
+  // to every registered SubframeInfoConsumer (DCIToFile if -D was set,
+  // DCIToJSON whenever -J was set). Without this call the GUI's sf / sf_tick
+  // events never fire even though subframes are being processed at 1000 sf/s.
+  common.consumeDCICollection(subframeInfo);
   // print_nof_DCI(subframeInfo, tti);
 }
 
