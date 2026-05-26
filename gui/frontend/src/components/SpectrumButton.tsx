@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useStore } from "../lib/store";
 import type { USRPDevice } from "../lib/types";
 
@@ -43,6 +44,39 @@ export function SpectrumButton() {
   const [busy, setBusy] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  // Position the portal-rendered popover beneath the button using fixed coords
+  // so it can't be clipped by ancestor `overflow-hidden`.
+  const [popPos, setPopPos] = useState<{ top: number; left: number } | null>(null);
+
+  function computePopPos() {
+    const btn = wrapRef.current?.querySelector("button");
+    if (!btn) return;
+    const r = btn.getBoundingClientRect();
+    const popW = 448; // matches w-[28rem]
+    const margin = 8;
+    // Prefer right-aligned with button right edge so it grows toward the left,
+    // but clamp so it doesn't escape the viewport on either side.
+    let left = r.right - popW;
+    if (left < margin) left = margin;
+    if (left + popW > window.innerWidth - margin) {
+      left = window.innerWidth - popW - margin;
+    }
+    const top = r.bottom + 6;
+    setPopPos({ top, left });
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    computePopPos();
+    const onResize = () => computePopPos();
+    window.addEventListener("resize", onResize);
+    window.addEventListener("scroll", onResize, true);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("scroll", onResize, true);
+    };
+  }, [open]);
 
   const refresh = () =>
     fetch("/api/spectrum")
@@ -71,13 +105,16 @@ export function SpectrumButton() {
     if (open) refreshUsrps();
   }, [open]);
 
-  // Outside-click close
+  // Outside-click close. The popover is now portaled to <body>, so checking
+  // wrapRef.contains(target) alone wouldn't recognise clicks inside the
+  // popover. Check both the wrap (button) and the popover refs.
   useEffect(() => {
     if (!open) return;
     function onDown(e: MouseEvent) {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+      const t = e.target as Node;
+      const inWrap = wrapRef.current && wrapRef.current.contains(t);
+      const inPop = popoverRef.current && popoverRef.current.contains(t);
+      if (!inWrap && !inPop) setOpen(false);
     }
     window.addEventListener("mousedown", onDown);
     return () => window.removeEventListener("mousedown", onDown);
@@ -139,25 +176,38 @@ export function SpectrumButton() {
     }
   }
 
-  const outerDisabled = busy;
+  // Mock mode has no real USRP, so launching a spectrum analyzer would just
+  // fail with "No devices found". Block the action and tell the operator why.
+  const mock = state.mock;
+
+  const outerDisabled = busy || mock;
   const isRunning = !!status?.running;
   const hasError = !!status?.last_error && !isRunning;
 
-  const buttonClass = isRunning ? "btn btn-ok" : hasError ? "btn btn-danger" : "btn";
-  const buttonLabel = isRunning
-    ? `■ Spectrum (${status?.tool})`
-    : busy
-      ? "… launching"
-      : hasError
-        ? `⚠ Spectrum failed`
-        : "📡 Spectrum";
-  const buttonTitle = !freq
-    ? "Set DL freq first (capture must be running, or set it in Config)"
+  const buttonClass =
+    mock      ? "btn opacity-60" :
+    isRunning ? "btn btn-ok" :
+    hasError  ? "btn btn-danger" :
+                "btn";
+  const buttonLabel = mock
+    ? "📡 Spectrum (mock mode)"
     : isRunning
-      ? "Click to stop the spectrum analyzer"
-      : hasError
-        ? `Last error: ${status?.last_error}\nClick to retry`
-        : "Open spectrum analyzer (uhd_fft / gqrx) on the backend's display";
+      ? `■ Spectrum (${status?.tool})`
+      : busy
+        ? "… launching"
+        : hasError
+          ? `⚠ Spectrum failed`
+          : "📡 Spectrum";
+  const buttonTitle = mock
+    ? "The spectrum analyzer needs a real USRP — it reads live RF samples and FFTs them. " +
+      "Restart the backend without LTESNIFFER_GUI_MOCK=1 (and plug in a USRP) to enable it."
+    : !freq
+      ? "Set DL freq first (capture must be running, or set it in Config)"
+      : isRunning
+        ? "Click to stop the spectrum analyzer"
+        : hasError
+          ? `Last error: ${status?.last_error}\nClick to retry`
+          : "Open spectrum analyzer (uhd_fft / gqrx) on the backend's display";
 
   const sniffRunning = state.lifecycle === "running";
   const chosenIsHeld = chosenSerial && heldSerials.has(chosenSerial);
@@ -178,8 +228,12 @@ export function SpectrumButton() {
         {buttonLabel}
       </button>
 
-      {open && !isRunning && (
-        <div className="absolute right-0 mt-2 w-[28rem] panel p-3 z-30 shadow-xl border-accent/30">
+      {open && !isRunning && popPos && createPortal(
+        <div
+          ref={popoverRef}
+          className="w-[28rem] panel p-3 z-50 shadow-xl border-accent/30"
+          style={{ position: "fixed", top: popPos.top, left: popPos.left }}
+        >
           {/* Pre-flight panel: tells the operator which preconditions are already met */}
           {status?.preflight && (
             <div className="mb-3 bg-bg border border-border rounded p-2 space-y-1.5">
@@ -322,7 +376,8 @@ export function SpectrumButton() {
               {status.last_error}
             </div>
           )}
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

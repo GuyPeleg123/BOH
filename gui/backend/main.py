@@ -101,10 +101,6 @@ app.add_middleware(
 )
 
 
-runner = MockRunner() if MOCK else SnifferRunner()
-spectrum = SpectrumLauncher()
-
-
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"ok": True, "mock": MOCK}

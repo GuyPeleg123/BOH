@@ -18,13 +18,16 @@ from typing import Optional
 
 
 # Ordered by preference: (command, label, argv_builder(freq_hz, sample_rate_hz, device_args) -> list[str])
+#
+# These are all *receiver* tools — they open a USRP, draw a live FFT of the
+# RF spectrum, and stay running until closed. Do NOT add `uhd_siggen_gui`
+# here: it's a *transmitter* (signal generator), not a spectrum analyzer,
+# and clicking it would start beaming a signal instead of viewing one.
 TOOLS: list[tuple[str, str, callable]] = [
     ("uhd_fft",         "uhd_fft (UHD spectrum)",
      lambda f, sr, args: (["-a", args] if args else []) + ["-f", str(int(f))] + (["-s", str(int(sr))] if sr else [])),
     ("usrp_fft",        "usrp_fft (legacy)",
      lambda f, sr, args: (["-a", args] if args else []) + ["-f", str(int(f))] + (["-s", str(int(sr))] if sr else [])),
-    ("uhd_siggen_gui",  "uhd_siggen_gui",
-     lambda f, _sr, args: (["-a", args] if args else []) + ["-f", str(int(f))]),
     ("gqrx",            "gqrx",
      lambda _f, _sr, _args: []),  # gqrx config file controls freq + device
 ]

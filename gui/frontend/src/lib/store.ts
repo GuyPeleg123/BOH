@@ -58,6 +58,7 @@ export interface AppState {
   lifecycle: "stopped" | "running";
   pid: number | null;
   argv: string[];
+  mock: boolean;
   cell: Extract<Event, { t: "cell" }> | null;
   hello: Extract<Event, { t: "hello" }> | null;
   mib: Extract<Event, { t: "mib" }> | null;
@@ -78,6 +79,7 @@ const initial: AppState = {
   lifecycle: "stopped",
   pid: null,
   argv: [],
+  mock: false,
   cell: null,
   hello: null,
   mib: null,
@@ -97,14 +99,17 @@ type Action =
   | { type: "connected"; value: boolean }
   | { type: "events"; evs: Event[] }
   | { type: "runtime"; state: RuntimeState }
+  | { type: "mock"; value: boolean }
   | { type: "reset" };
 
 function reduce(s: AppState, a: Action): AppState {
   switch (a.type) {
     case "connected":
       return { ...s, connected: a.value };
+    case "mock":
+      return { ...s, mock: a.value };
     case "reset":
-      return { ...initial, connected: s.connected };
+      return { ...initial, connected: s.connected, mock: s.mock };
     case "runtime":
       return {
         ...s,
@@ -328,7 +333,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // including the `lifecycle:started` event.
     fetch("/api/status")
       .then((r) => r.json())
-      .then((j) => dispatch({ type: "runtime", state: j.state }))
+      .then((j) => {
+        dispatch({ type: "runtime", state: j.state });
+        if (typeof j.mock === "boolean") dispatch({ type: "mock", value: j.mock });
+      })
+      .catch(() => {});
+    fetch("/api/health")
+      .then((r) => r.json())
+      .then((j) => {
+        if (typeof j.mock === "boolean") dispatch({ type: "mock", value: j.mock });
+      })
       .catch(() => {});
   }, []);
 
