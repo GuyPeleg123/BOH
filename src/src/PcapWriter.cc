@@ -1,5 +1,16 @@
 #include "include/PcapWriter.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <signal.h>
+#include <cstring>
+#include <cerrno>
+
 PcapWriter::PcapWriter(/* args */)
 {
 
@@ -74,16 +85,116 @@ void LTESniffer_pcap_writer::enable(bool en)
 }
 void LTESniffer_pcap_writer::open(const std::string filename, const std::string api_filename, uint32_t ue_id)
 {
-  pcap_file       = DLT_PCAP_Open(MAC_LTE_DLT, filename.c_str());
+  // Pick up rotation knobs from env so the GUI / operator can enable without
+  // a CLI flag rebuild. Default disabled → identical behaviour to before.
+  if (const char* mb = std::getenv("LTESNIFFER_PCAP_ROTATE_MB")) {
+    long v = std::strtol(mb, nullptr, 10);
+    if (v > 0) rotate_bytes_ = static_cast<size_t>(v) * 1024 * 1024;
+  }
+  if (const char* mn = std::getenv("LTESNIFFER_PCAP_ROTATE_MIN")) {
+    long v = std::strtol(mn, nullptr, 10);
+    if (v > 0) rotate_minutes_ = static_cast<int>(v);
+  }
+  base_filename_  = filename;
+  api_filename_   = api_filename;
+
+  std::string first_name = (rotate_bytes_ || rotate_minutes_)
+                             ? make_rotated_name(filename)
+                             : filename;
+
+  pcap_file       = DLT_PCAP_Open(MAC_LTE_DLT, first_name.c_str());
   pcap_file_api   = DLT_PCAP_Open(MAC_LTE_DLT, api_filename.c_str());
   this->ue_id     = ue_id;
   enable_write    = true;
+  bytes_written_  = 0;
+  file_opened_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (rotate_bytes_ || rotate_minutes_) {
+    fprintf(stderr, "[PcapWriter] rotation: %zu MB / %d min, first file: %s\n",
+            rotate_bytes_ / (1024*1024), rotate_minutes_, first_name.c_str());
+  }
+
+  // Live-stream FIFO for Wireshark (opt-in via env). Open non-blocking so a
+  // missing/unread FIFO doesn't wedge the capture; ignore SIGPIPE in case
+  // Wireshark goes away mid-capture.
+  if (const char* stream_path = std::getenv("LTESNIFFER_PCAP_STREAM")) {
+    ::signal(SIGPIPE, SIG_IGN);
+    int sfd = ::open(stream_path, O_WRONLY | O_NONBLOCK);
+    if (sfd >= 0) {
+      pcap_stream_file_ = ::fdopen(sfd, "wb");
+      if (pcap_stream_file_) {
+        // libpcap global header for MAC-LTE DLT (147).
+        struct {
+          uint32_t magic; uint16_t v_major, v_minor;
+          int32_t  thiszone; uint32_t sigfigs;
+          uint32_t snaplen; uint32_t linktype;
+        } hdr = { 0xa1b2c3d4, 2, 4, 0, 0, 65535, 147 };
+        std::fwrite(&hdr, sizeof(hdr), 1, pcap_stream_file_);
+        std::fflush(pcap_stream_file_);
+        fprintf(stderr, "[PcapWriter] live stream → %s (open in Wireshark with -k -i %s)\n",
+                stream_path, stream_path);
+      } else {
+        ::close(sfd);
+      }
+    } else {
+      fprintf(stderr, "[PcapWriter] stream FIFO open '%s' failed: %s "
+                       "(create it first with: mkfifo %s)\n",
+              stream_path, std::strerror(errno), stream_path);
+    }
+  }
+}
+
+void LTESniffer_pcap_writer::configure_rotation(size_t bytes, int minutes)
+{
+  rotate_bytes_   = bytes;
+  rotate_minutes_ = minutes;
+}
+
+std::string LTESniffer_pcap_writer::make_rotated_name(const std::string& base)
+{
+  // Insert "_<iso8601>_<seq>" before the extension.
+  rotation_seq_++;
+  std::time_t now = std::time(nullptr);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y%m%dT%H%M%S", std::gmtime(&now));
+  std::string out = base;
+  auto dot = out.find_last_of('.');
+  std::string stem = (dot == std::string::npos) ? out : out.substr(0, dot);
+  std::string ext  = (dot == std::string::npos) ? ".pcap" : out.substr(dot);
+  char seq[8]; std::snprintf(seq, sizeof(seq), "%03d", rotation_seq_);
+  return stem + "_" + buf + "_" + seq + ext;
+}
+
+void LTESniffer_pcap_writer::rotate_if_needed_locked()
+{
+  if (!(rotate_bytes_ || rotate_minutes_)) return;
+  bool by_bytes = rotate_bytes_ && bytes_written_ >= rotate_bytes_;
+  bool by_time  = false;
+  long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (rotate_minutes_) {
+    long long limit_ms = static_cast<long long>(rotate_minutes_) * 60 * 1000;
+    by_time = (now_ms - file_opened_ms_) >= limit_ms;
+  }
+  if (!by_bytes && !by_time) return;
+
+  DLT_PCAP_Close(pcap_file);
+  std::string next = make_rotated_name(base_filename_);
+  pcap_file = DLT_PCAP_Open(MAC_LTE_DLT, next.c_str());
+  bytes_written_ = 0;
+  file_opened_ms_ = now_ms;
+  fprintf(stderr, "[PcapWriter] rotated -> %s (reason=%s)\n",
+          next.c_str(), by_bytes ? "size" : "time");
 }
 
 void LTESniffer_pcap_writer::close()
 {
   fprintf(stdout, "Saving MAC PCAP file\n");
   DLT_PCAP_Close(pcap_file);
+  if (pcap_stream_file_) {
+    std::fclose(pcap_stream_file_);
+    pcap_stream_file_ = nullptr;
+  }
 }
 
 void LTESniffer_pcap_writer::set_ue_id(uint16_t ue_id) {
@@ -111,13 +222,24 @@ void LTESniffer_pcap_writer::pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes
     context.cc_idx          = 0;
 
     if (pdu) {
+      rotate_if_needed_locked();
       LTE_PCAP_MAC_WritePDU(pcap_file, &context, pdu, pdu_len_bytes);
+      bytes_written_ += pdu_len_bytes + 64;  // ~header overhead estimate
+      // Mirror to live-stream FIFO if open. Same writer, different FILE*.
+      // If the reader's gone away we'll get EPIPE/EBADF — close + null out
+      // so subsequent writes are no-ops.
+      if (pcap_stream_file_) {
+        if (LTE_PCAP_MAC_WritePDU(pcap_stream_file_, &context, pdu, pdu_len_bytes) < 0) {
+          std::fclose(pcap_stream_file_);
+          pcap_stream_file_ = nullptr;
+        }
+      }
     }
   }
   lock.unlock();
 }
 
-void LTESniffer_pcap_writer::pack_and_write_api(uint8_t* pdu, uint32_t pdu_len_bytes, uint32_t reTX, bool crc_ok, uint32_t tti, 
+void LTESniffer_pcap_writer::pack_and_write_api(uint8_t* pdu, uint32_t pdu_len_bytes, uint32_t reTX, bool crc_ok, uint32_t tti,
                               uint16_t crnti, uint8_t direction, uint8_t rnti_type)
 {
 

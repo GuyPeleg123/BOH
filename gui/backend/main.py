@@ -26,10 +26,14 @@ import captures as captures_mod
 import keys as keys_mod
 from keys import KeysFile, KEYS_PATH
 from auth import BIND, TOKEN, TOKEN_PATH, REQUIRE_LOCAL_TOKEN, require_token, require_token_ws
+import zmq_pub
+from metrics import MetricsBus
+from recorder import SessionRecorder, ReplayRunner
 
 log = logging.getLogger(__name__)
 
 MOCK = os.environ.get("LTESNIFFER_GUI_MOCK", "").lower() in {"1", "true", "yes"}
+REPLAY = os.environ.get("LTESNIFFER_GUI_REPLAY", "").strip()
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
@@ -96,11 +100,24 @@ def _check_rmem_max() -> None:
         )
 
 
+_zmq = zmq_pub.maybe_create()
+_metrics = MetricsBus()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ---- startup ----
     _kill_stale_ltesniffers()
     _check_rmem_max()
+    await _metrics.start(runner)
+    if _zmq is not None:
+        await _zmq.start(runner)
+    if not REPLAY:
+        # Don't record a replay session — we'd double-write history with no value.
+        await _recorder.start(runner)
+    # If REPLAY is set, kick the replay off immediately so the dashboard sees data.
+    if REPLAY:
+        await runner.start(None)
     # Auth banner so the operator can't miss the security posture they're in.
     if BIND in ("0.0.0.0", "::"):
         log.warning(
@@ -131,11 +148,30 @@ async def lifespan(app: FastAPI):
         await spectrum.stop()
     except Exception as exc:
         log.warning("Error stopping spectrum on shutdown: %s", exc)
+    if _zmq is not None:
+        try:
+            await _zmq.stop()
+        except Exception as exc:
+            log.warning("Error stopping zmq on shutdown: %s", exc)
+    try:
+        await _metrics.stop()
+    except Exception as exc:
+        log.warning("Error stopping metrics on shutdown: %s", exc)
+    try:
+        await _recorder.stop()
+    except Exception as exc:
+        log.warning("Error stopping recorder on shutdown: %s", exc)
     log.info("Shutdown: all subprocesses stopped.")
 
 
-runner = MockRunner() if MOCK else SnifferRunner()
+if REPLAY:
+    runner = ReplayRunner(Path(REPLAY).expanduser())
+elif MOCK:
+    runner = MockRunner()
+else:
+    runner = SnifferRunner()
 spectrum = SpectrumLauncher()
+_recorder = SessionRecorder()
 
 app = FastAPI(title="LTESniffer GUI Backend", lifespan=lifespan)
 # Tightened CORS: spec-compliant, only allows the bind host + dev server.
@@ -157,7 +193,7 @@ app.add_middleware(
 
 # Routes that don't require a token. /api/health stays open so a misconfigured
 # client can tell "wrong token" (401) apart from "server down" (no response).
-_AUTH_FREE_PREFIXES = ("/api/health", "/assets/")
+_AUTH_FREE_PREFIXES = ("/api/health", "/assets/", "/metrics")
 _AUTH_FREE_EXACT = {"/"}  # SPA index — token check happens via the WS instead
 
 
@@ -182,6 +218,13 @@ async def _auth_gate(request, call_next):
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"ok": True, "mock": MOCK, "auth_required": BIND in ("0.0.0.0", "::") or REQUIRE_LOCAL_TOKEN}
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    from fastapi.responses import Response
+    body, content_type = _metrics.render()
+    return Response(content=body, media_type=content_type)
 
 
 @app.get("/api/config", response_model=SnifferConfig)
