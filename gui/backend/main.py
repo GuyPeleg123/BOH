@@ -29,6 +29,8 @@ from auth import BIND, TOKEN, TOKEN_PATH, REQUIRE_LOCAL_TOKEN, require_token, re
 import zmq_pub
 from metrics import MetricsBus
 from recorder import SessionRecorder, ReplayRunner
+from state_tracker import StateTracker
+import analytics
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +104,7 @@ def _check_rmem_max() -> None:
 
 _zmq = zmq_pub.maybe_create()
 _metrics = MetricsBus()
+_state_tracker = StateTracker(cell_id=0)
 
 
 @asynccontextmanager
@@ -110,6 +113,7 @@ async def lifespan(app: FastAPI):
     _kill_stale_ltesniffers()
     _check_rmem_max()
     await _metrics.start(runner)
+    await _state_tracker.start(runner)
     if _zmq is not None:
         await _zmq.start(runner)
     if not REPLAY:
@@ -161,6 +165,10 @@ async def lifespan(app: FastAPI):
         await _recorder.stop()
     except Exception as exc:
         log.warning("Error stopping recorder on shutdown: %s", exc)
+    try:
+        await _state_tracker.stop()
+    except Exception as exc:
+        log.warning("Error stopping state_tracker on shutdown: %s", exc)
     log.info("Shutdown: all subprocesses stopped.")
 
 
@@ -374,6 +382,26 @@ async def spectrum_launch(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/spectrum/stop")
 async def spectrum_stop() -> dict[str, Any]:
     return await spectrum.stop()
+
+
+@app.get("/api/analytics/rnti-churn")
+async def analytics_rnti_churn(path: str) -> dict[str, Any]:
+    """Run the RNTI churn analyzer against a recorded session.
+
+    `path` must point to a .jsonl.zst file under the session dir or the
+    pcap-allowed roots — same allowlist used by /api/captures/download.
+    """
+    p = Path(path).expanduser().resolve()
+    sessions_dir = (Path.home() / ".local" / "share" / "ltesniffer-gui" / "sessions").resolve()
+    cfg = config_mod.load()
+    allowed_roots = captures_mod.allowed_roots(cfg) + [sessions_dir]
+    if not any(str(p).startswith(str(r)) for r in allowed_roots):
+        raise HTTPException(403, f"path '{p}' outside allowed roots")
+    if not p.exists():
+        raise HTTPException(404, str(p))
+    if not str(p).endswith(".jsonl.zst"):
+        raise HTTPException(415, "expected .jsonl.zst session file")
+    return analytics.analyze_rnti_churn(p)
 
 
 @app.get("/api/captures")
