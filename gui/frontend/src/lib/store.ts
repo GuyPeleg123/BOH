@@ -364,7 +364,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     function connect() {
       if (cancelled) return;
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const url = `${proto}//${window.location.host}/api/events`;
+      // Inject bearer token via ?token= for the WS handshake (headers can't be
+      // set on the browser-side WebSocket constructor).
+      // Lazy import to avoid a circular dep: api.ts imports types only.
+      const tok = (() => {
+        try {
+          return (window as any).localStorage?.getItem?.("ltesniffer_gui_token") || null;
+        } catch { return null; }
+      })();
+      const qs = tok ? `?token=${encodeURIComponent(tok)}` : "";
+      const url = `${proto}//${window.location.host}/api/events${qs}`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
 
@@ -382,8 +391,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       };
       ws.onmessage = (m) => {
         try {
-          const ev = JSON.parse(m.data) as Event;
-          pendingRef.current.push(ev);
+          const ev = JSON.parse(m.data) as Event | { t: "replay"; events: Event[] };
+          // Server may batch the replay-on-connect into one envelope; unwrap it
+          // so the reducer sees the inner events in order.
+          if (ev && (ev as any).t === "replay" && Array.isArray((ev as any).events)) {
+            for (const inner of (ev as any).events as Event[]) pendingRef.current.push(inner);
+          } else {
+            pendingRef.current.push(ev as Event);
+          }
           if (flushTimerRef.current == null) {
             flushTimerRef.current = window.setTimeout(flush, 1000 / FLUSH_HZ);
           }

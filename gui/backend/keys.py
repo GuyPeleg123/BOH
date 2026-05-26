@@ -21,6 +21,7 @@ src/include/KeyAttaching.h for the parser contract):
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Literal, Optional
@@ -28,7 +29,31 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-KEYS_PATH = Path.home() / ".config" / "ltesniffer-gui" / "keys.json"
+_KEYS_DIR = (Path.home() / ".config" / "ltesniffer-gui").resolve()
+KEYS_PATH = _KEYS_DIR / "keys.json"
+
+
+def _validate_keys_path(p: Path) -> Path:
+    """Refuse paths outside the canonical keys directory and refuse symlinks.
+
+    Without these checks the attacker who can edit the saved keys_file path
+    in SnifferConfig can point LTESniffer (running as root via sudo) at
+    /etc/shadow or any other root-readable file.
+    """
+    p = Path(p).expanduser()
+    # Resolve via the parent so a non-existent leaf file is OK, but any symlink
+    # along the way (including parent components) is collapsed and checked.
+    resolved = (p.parent.resolve() / p.name)
+    try:
+        resolved.relative_to(_KEYS_DIR)
+    except ValueError:
+        raise PermissionError(
+            f"keys_file '{p}' is outside the allowed directory {_KEYS_DIR}"
+        )
+    # If the file already exists and is a symlink, refuse.
+    if resolved.is_symlink():
+        raise PermissionError(f"keys_file '{p}' is a symlink; refusing")
+    return resolved
 
 
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -138,9 +163,23 @@ def load(path: Path = KEYS_PATH) -> KeysFile:
 def save(keys: KeysFile, path: Path = KEYS_PATH) -> Path:
     """Write the file in the C++-compatible flat-string array format.
     Returns the absolute path actually written.
+
+    Raises PermissionError if the path escapes the canonical keys directory
+    or is a symlink.
     """
-    path = Path(path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _validate_keys_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = _to_c_format(keys.entries)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
-    return path.resolve()
+    # O_NOFOLLOW on the open so a TOCTOU symlink swap can't redirect the write.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload, indent=2) + "\n")
+    finally:
+        # If we already wrote, chmod is redundant; this catches umask anomalies.
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return path

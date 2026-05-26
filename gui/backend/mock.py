@@ -55,11 +55,16 @@ class MockRunner:
         if t in ("hello", "cell", "mib", "lifecycle", "stats"):
             self._sticky[t] = event
         self._last_events.append(event)
+        # Drop-oldest semantics — mirror SnifferRunner._broadcast so a slow
+        # consumer doesn't wedge the WS coroutine.
         for q in list(self._subscribers):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                self._subscribers.discard(q)
+                try: q.get_nowait()
+                except asyncio.QueueEmpty: pass
+                try: q.put_nowait(event)
+                except asyncio.QueueFull: pass
 
     def replay(self) -> list[dict[str, Any]]:
         # See sniffer.py: lifecycle must precede the others so its reset doesn't clobber them.

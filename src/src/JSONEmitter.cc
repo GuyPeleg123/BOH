@@ -6,6 +6,9 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 extern "C" {
 #include "srsran/phy/phch/dci.h"
@@ -66,10 +69,21 @@ JSONEmitter::JSONEmitter(const std::string& path)
     // Prevent the sniffer from dying if the GUI backend disconnects.
     ::signal(SIGPIPE, SIG_IGN);
 
-    fp = std::fopen(path.c_str(), "w");
+    // Open the FIFO write-end with O_NONBLOCK so a stalled reader can never
+    // wedge the sniffer. The reader (backend) opens the FIFO with O_RDONLY
+    // before launching us, so the open(2) shouldn't block here either — but
+    // O_NONBLOCK guarantees it.
+    fd = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        std::fprintf(stderr, "[JSONEmitter] open('%s') failed: %s\n",
+                     path.c_str(), std::strerror(errno));
+        return;
+    }
+    fp = ::fdopen(fd, "w");
     if (!fp) {
-        std::fprintf(stderr, "[JSONEmitter] Failed to open '%s'; JSON output disabled.\n",
-                     path.c_str());
+        std::fprintf(stderr, "[JSONEmitter] fdopen failed: %s\n", std::strerror(errno));
+        ::close(fd);
+        fd = -1;
         return;
     }
     // Line-buffered so each event is visible to the reader immediately.
@@ -78,8 +92,9 @@ JSONEmitter::JSONEmitter(const std::string& path)
 
 JSONEmitter::~JSONEmitter() {
     if (fp) {
-        std::fclose(fp);
+        std::fclose(fp);   // closes fd too
         fp = nullptr;
+        fd = -1;
     }
 }
 
@@ -114,14 +129,40 @@ std::string JSONEmitter::escapeString(const std::string& s) {
 }
 
 void JSONEmitter::writeLine(const std::string& line) {
-    if (!fp) return;
+    if (!fp || fd < 0) return;
     std::lock_guard<std::mutex> lock(mtx);
-    if (std::fputs(line.c_str(), fp) == EOF) {
+
+    // Single write+newline so we never split an event across two write(2)s.
+    // Use write(2) directly to get clean EAGAIN semantics on a non-blocking
+    // FIFO — stdio's buffering would mask backpressure.
+    std::string payload = line;
+    payload.push_back('\n');
+
+    const char* buf = payload.data();
+    size_t left = payload.size();
+    while (left > 0) {
+        ssize_t w = ::write(fd, buf, left);
+        if (w > 0) {
+            buf  += w;
+            left -= static_cast<size_t>(w);
+            continue;
+        }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Reader is slow / disconnected. Drop this event rather than
+            // block. Operator sees the count in the next stats event.
+            ++dropped_events;
+            return;
+        }
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
+        // EPIPE (reader gone), EBADF, ENOSPC, etc. — disable the emitter so
+        // we don't keep error-spinning. The reader can come back next run.
         std::fclose(fp);
         fp = nullptr;
+        fd = -1;
         return;
     }
-    std::fputc('\n', fp);
 }
 
 void JSONEmitter::emitHello(const Args& args) {
@@ -271,6 +312,7 @@ void JSONEmitter::emitStats(uint32_t sfn, uint32_t sf_processed, uint32_t sf_ski
        << ",\"rb_dl_total\":"  << rb_dl_total
        << ",\"rb_ul_total\":"  << rb_ul_total
        << ",\"cfo_hz\":"       << std::setprecision(1) << cfo_hz
+       << ",\"dropped_events\":" << dropped_events
        << "}";
     writeLine(os.str());
 }

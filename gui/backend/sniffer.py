@@ -17,7 +17,56 @@ from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
+import re
+
 from config import SnifferConfig
+
+
+# Redact KASME / K_eNB (256-bit, 64 hex) and intermediate keys (128-bit, 32 hex)
+# from anything LTESniffer prints to stderr before it lands in the rolling
+# event buffer / WebSocket fan-out. Matches loose word boundaries so things
+# like "kenb=ABCD..." get caught.
+_HEX_KEY_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+_HEX_KEY_RE_128 = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
+
+
+def _redact_keys(msg: str) -> str:
+    msg = _HEX_KEY_RE.sub("<redacted-256>", msg)
+    msg = _HEX_KEY_RE_128.sub("<redacted-128>", msg)
+    return msg
+
+
+# Hard allowlist of LTESniffer binaries the backend will spawn. Anything else
+# is rejected with a 403 before we touch sudo. This is the second line of
+# defence behind a properly-scoped sudoers entry — without it, an attacker
+# who can edit the saved config can run /usr/bin/id (or worse) as root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_ALLOWED_BINARIES: set[Path] = {
+    (_REPO_ROOT / "build" / "src" / "LTESniffer").resolve(),
+    Path("/usr/local/bin/LTESniffer"),
+    Path("/usr/bin/LTESniffer"),
+}
+
+
+def _resolve_and_validate_binary(cfg_path: str) -> Path:
+    """Resolve `cfg.binary_path` and confirm it's in the allowlist.
+
+    Raises PermissionError with a clear message otherwise.
+    """
+    p = Path(cfg_path).expanduser()
+    if not p.is_absolute():
+        p = (Path(__file__).resolve().parent / p).resolve()
+    else:
+        p = p.resolve()
+    if p not in _ALLOWED_BINARIES:
+        allowed = ", ".join(sorted(str(x) for x in _ALLOWED_BINARIES))
+        raise PermissionError(
+            f"binary_path '{cfg_path}' (resolved to {p}) is not in the allowlist. "
+            f"Allowed: {allowed}"
+        )
+    if not p.exists():
+        raise FileNotFoundError(f"LTESniffer binary not found at {p}")
+    return p
 
 
 class SnifferRunner:
@@ -32,6 +81,8 @@ class SnifferRunner:
         self._wait_task: Optional[asyncio.Task] = None  # tracked so we can cancel on restart
         self._subscribers: set[asyncio.Queue] = set()
         self._last_events: deque[dict[str, Any]] = deque(maxlen=500)
+        self._dropped_for_slow_consumer = 0
+        self._last_drop_log = 0
         # Sticky events kept outside the rolling buffer so that a refresh
         # after the buffer has rolled past still shows cell / lifecycle state.
         self._sticky: dict[str, dict[str, Any]] = {}
@@ -76,14 +127,33 @@ class SnifferRunner:
         if t in ("hello", "cell", "mib", "lifecycle", "stats"):
             self._sticky[t] = event
         self._last_events.append(event)
-        dead: list[asyncio.Queue] = []
-        for q in self._subscribers:
+
+        # Drop-oldest semantics: when a slow consumer's queue is full, evict
+        # the oldest event instead of dropping the new one (and instead of
+        # killing the subscription, which leaves the WS task awaiting a dead
+        # queue forever).
+        for q in list(self._subscribers):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                dead.append(q)
-        for q in dead:
-            self._subscribers.discard(q)
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
+                self._dropped_for_slow_consumer += 1
+                if self._dropped_for_slow_consumer - self._last_drop_log >= 500:
+                    self._last_drop_log = self._dropped_for_slow_consumer
+                    # Don't recurse via _broadcast (could amplify under sustained drop) —
+                    # append to the buffer directly so the log shows up but doesn't burn the queues.
+                    drop_msg = {
+                        "t": "log", "level": "warn", "source": "broadcast",
+                        "msg": f"slow consumer: {self._dropped_for_slow_consumer} events dropped cumulatively",
+                    }
+                    self._last_events.append(drop_msg)
 
     # --------------------------------------------------------------- lifecycle
 
@@ -103,12 +173,11 @@ class SnifferRunner:
         self._fifo_path = Path(self._fifo_dir.name) / "events.jsonl"
         os.mkfifo(self._fifo_path)
 
-        binary = Path(cfg.binary_path).expanduser()
-        if not binary.is_absolute():
-            binary = (Path(__file__).resolve().parent / binary).resolve()
-        if not binary.exists():
+        try:
+            binary = _resolve_and_validate_binary(cfg.binary_path)
+        except (PermissionError, FileNotFoundError):
             self._cleanup_fifo()
-            raise FileNotFoundError(f"LTESniffer binary not found at {binary}")
+            raise
 
         argv = cfg.to_argv(str(self._fifo_path))
         argv[argv.index(cfg.binary_path)] = str(binary)
@@ -131,7 +200,7 @@ class SnifferRunner:
 
         self._proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,   # we don't read it, and PIPE would fill at ~64KB and wedge LTESniffer
             stderr=asyncio.subprocess.PIPE,
             cwd=str(captures_dir),
         )
@@ -241,6 +310,7 @@ class SnifferRunner:
             async for line in self._proc.stderr:
                 msg = line.decode(errors="replace").rstrip()
                 if msg:
+                    msg = _redact_keys(msg)
                     level = self._stderr_level(msg)
                     self._broadcast({"t": "log", "level": level, "source": "stderr", "msg": msg})
         except asyncio.CancelledError:

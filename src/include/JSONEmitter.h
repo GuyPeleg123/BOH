@@ -31,6 +31,12 @@ public:
 
     bool isOpen() const { return fp != nullptr; }
 
+    // Lines dropped because the FIFO writer would have blocked (EAGAIN).
+    // Surfaced in the next stats event so the operator knows the rate at
+    // which events are being lost on backpressure.
+    uint64_t droppedEvents() const { return dropped_events; }
+    void     resetDroppedEvents()  { dropped_events = 0; }
+
     void emitHello(const Args& args);
     void emitCell(const srsran_cell_t& cell, double dl_freq, double ul_freq, double sample_rate);
     void emitMIB(uint32_t sfn, int sfn_offset);
@@ -50,6 +56,8 @@ private:
 
     std::mutex mtx;
     FILE*      fp = nullptr;
+    int        fd = -1;          // raw fd; kept so we can fcntl O_NONBLOCK and write(2) without stdio backpressure
+    uint64_t   dropped_events = 0;
     std::chrono::steady_clock::time_point start_time;
 };
 

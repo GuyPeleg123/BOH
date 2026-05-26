@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -25,6 +25,7 @@ from spectrum import SpectrumLauncher
 import captures as captures_mod
 import keys as keys_mod
 from keys import KeysFile, KEYS_PATH
+from auth import BIND, TOKEN, TOKEN_PATH, REQUIRE_LOCAL_TOKEN, require_token, require_token_ws
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,23 @@ def _kill_stale_ltesniffers() -> None:
 async def lifespan(app: FastAPI):
     # ---- startup ----
     _kill_stale_ltesniffers()
+    # Auth banner so the operator can't miss the security posture they're in.
+    if BIND in ("0.0.0.0", "::"):
+        log.warning(
+            "==================================================================\n"
+            "  GUI exposed on %s (LTESNIFFER_GUI_BIND=%s).\n"
+            "  Every REST + WebSocket request must carry a bearer token from\n"
+            "    %s\n"
+            "  (Loopback requests still work without it unless\n"
+            "   LTESNIFFER_GUI_REQUIRE_TOKEN_LOCAL=1 is set.)\n"
+            "==================================================================",
+            BIND, BIND, TOKEN_PATH,
+        )
+    else:
+        log.info(
+            "GUI bound to %s (loopback only). Set LTESNIFFER_GUI_BIND=0.0.0.0 "
+            "to expose to LAN. Token at %s.", BIND, TOKEN_PATH,
+        )
     yield
     # ---- shutdown ----
     # Stop all subprocesses so nothing is orphaned when the server exits.
@@ -92,18 +110,50 @@ runner = MockRunner() if MOCK else SnifferRunner()
 spectrum = SpectrumLauncher()
 
 app = FastAPI(title="LTESniffer GUI Backend", lifespan=lifespan)
+# Tightened CORS: spec-compliant, only allows the bind host + dev server.
+_allowed_origins = [
+    f"http://{BIND}:8000" if BIND not in ("0.0.0.0", "::") else "http://127.0.0.1:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://localhost:5173",  # vite dev server
+    "http://127.0.0.1:5173",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(dict.fromkeys(_allowed_origins)),  # dedupe, preserve order
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# Routes that don't require a token. /api/health stays open so a misconfigured
+# client can tell "wrong token" (401) apart from "server down" (no response).
+_AUTH_FREE_PREFIXES = ("/api/health", "/assets/")
+_AUTH_FREE_EXACT = {"/"}  # SPA index — token check happens via the WS instead
+
+
+@app.middleware("http")
+async def _auth_gate(request, call_next):
+    """Block /api/* without a bearer token unless we're on loopback (and
+    REQUIRE_LOCAL_TOKEN isn't set). Static + index are always served so the
+    SPA can prompt the user for the token."""
+    path = request.url.path
+    if path in _AUTH_FREE_EXACT or any(path.startswith(p) for p in _AUTH_FREE_PREFIXES) or not path.startswith("/api/"):
+        return await call_next(request)
+    try:
+        await require_token(request)
+    except HTTPException as exc:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return await call_next(request)
+
+
+# /api/health is intentionally token-free: lets a misconfigured client tell
+# the difference between "wrong token" (401) and "server down" (no response).
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "mock": MOCK}
+    return {"ok": True, "mock": MOCK, "auth_required": BIND in ("0.0.0.0", "::") or REQUIRE_LOCAL_TOKEN}
 
 
 @app.get("/api/config", response_model=SnifferConfig)
@@ -113,6 +163,24 @@ async def get_config() -> SnifferConfig:
 
 @app.put("/api/config", response_model=SnifferConfig)
 async def put_config(cfg: SnifferConfig) -> SnifferConfig:
+    # Security gate: anything that becomes argv to a root-owned process must
+    # be validated server-side, not just sanitized client-side.
+    if cfg.keys_file:
+        try:
+            # validate_keys_path tolerates non-existing files (only blocks
+            # symlinks / escapes), so a not-yet-created keys.json is OK.
+            cfg.keys_file = str(keys_mod._validate_keys_path(Path(cfg.keys_file)))
+        except PermissionError as e:
+            raise HTTPException(403, f"keys_file rejected: {e}")
+    if cfg.binary_path:
+        try:
+            from sniffer import _resolve_and_validate_binary
+            _resolve_and_validate_binary(cfg.binary_path)
+        except PermissionError as e:
+            raise HTTPException(403, f"binary_path rejected: {e}")
+        except FileNotFoundError:
+            # Tolerate not-yet-built binary at save time; start will reject later.
+            pass
     config_mod.save(cfg)
     return cfg
 
@@ -132,6 +200,8 @@ async def capture_start(cfg: SnifferConfig | None = None) -> dict[str, Any]:
         raise HTTPException(409, "sniffer already running")
     try:
         await runner.start(cfg)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
@@ -153,6 +223,10 @@ async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
         config_mod.save(cfg)
     try:
         await runner.restart(cfg)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
     except Exception as e:
         raise HTTPException(500, f"failed to restart: {e}")
     return {"ok": True, "state": runner.state()}
@@ -186,7 +260,10 @@ async def get_keys() -> dict[str, Any]:
 
 @app.put("/api/keys")
 async def put_keys(body: KeysFile) -> dict[str, Any]:
-    path = keys_mod.save(body)
+    try:
+        path = keys_mod.save(body)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     # Auto-point the saved sniffer config at our keys file so the next
     # capture launch will use it (only if the user hasn't set their own path).
     cfg = config_mod.load()
@@ -253,12 +330,21 @@ async def download_capture(path: str) -> FileResponse:
 
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
+    # Token check BEFORE accept(): we don't want to give an unauthed peer a
+    # 101 upgrade response with our subprotocol/server info.
+    if not await require_token_ws(ws):
+        return
     await ws.accept()
+    # Subscribe *after* capturing the replay snapshot so events that arrive
+    # during the replay send (which could be hundreds of frames at real-LTE
+    # rates) don't fill the new subscriber's queue before it starts draining.
+    replay_events = runner.replay()
     q = runner.subscribe()
     try:
-        # Send buffered history first so a refreshed client doesn't see a blank screen.
-        for ev in runner.replay():
-            await ws.send_text(json.dumps(ev))
+        # Single envelope instead of N send_text calls — one frame, one parse
+        # on the frontend, one reducer dispatch.
+        if replay_events:
+            await ws.send_text(json.dumps({"t": "replay", "events": replay_events}))
         while True:
             ev = await q.get()
             await ws.send_text(json.dumps(ev))

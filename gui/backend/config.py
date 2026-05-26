@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -56,8 +57,8 @@ class SnifferConfig(BaseModel):
 
     # --- GUI-only ---
     binary_path: str = Field(
-        "../build/src/LTESniffer",
-        description="Path to the LTESniffer executable (resolved relative to backend cwd).",
+        "../../build/src/LTESniffer",
+        description="Path to the LTESniffer executable. Relative paths resolve from gui/backend/ — the default points at the repo's own build.",
     )
     captures_dir: str = Field(
         "~/ltesniffer-captures",
@@ -140,5 +141,16 @@ def load() -> SnifferConfig:
 
 
 def save(cfg: SnifferConfig) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(cfg.model_dump_json(indent=2))
+    """Persist config with 0600 perms (it points at the keys file)."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = cfg.model_dump_json(indent=2)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(CONFIG_PATH, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+    finally:
+        try:
+            os.chmod(CONFIG_PATH, 0o600)
+        except OSError:
+            pass
