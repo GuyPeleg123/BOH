@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 import type { USRPDevice } from "../lib/types";
 
 interface PreflightCheck { ok: boolean; detail: string; fix: string | null; }
@@ -36,7 +36,9 @@ function serialFromRfArgs(s: string): string | null {
 }
 
 export function SpectrumButton() {
-  const { state } = useStore();
+  const state = useStore((s) => ({
+    cell: s.cell, hello: s.hello, argv: s.argv, lifecycle: s.lifecycle, mock: s.mock,
+  }), shallow);
   const [status, setStatus] = useState<SpectrumStatus | null>(null);
   const [usrps, setUsrps] = useState<USRPDevice[]>([]);
   const [chosenSerial, setChosenSerial] = useState<string>("");

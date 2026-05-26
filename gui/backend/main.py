@@ -69,10 +69,38 @@ def _kill_stale_ltesniffers() -> None:
         log.debug("_kill_stale_ltesniffers: %s", exc)
 
 
+# UHD on Linux drops samples ("O"/"D" in stderr) when the kernel socket buffer
+# is smaller than what the streamer needs at the configured sample rate. The
+# Ettus knowledge base recommends 24MB for 20-MHz LTE captures.
+_RMEM_MIN = 24 * 1024 * 1024
+
+
+def _check_rmem_max() -> None:
+    """Read /proc/sys/net/core/rmem_max and warn (with fix command) if low.
+
+    Only relevant for Ethernet-attached USRPs (X310/N310) — B210 is USB so
+    this knob doesn't affect it — but it's a one-liner to surface either way.
+    """
+    try:
+        with open("/proc/sys/net/core/rmem_max") as f:
+            current = int(f.read().strip())
+    except OSError as exc:
+        log.debug("rmem_max probe failed: %s", exc)
+        return
+    if current < _RMEM_MIN:
+        log.warning(
+            "net.core.rmem_max=%d (need >=%d for clean UHD streaming at >=20MHz). "
+            "Fix:  sudo sysctl -w net.core.rmem_max=%d "
+            "(persist by adding the line to /etc/sysctl.d/99-uhd.conf)",
+            current, _RMEM_MIN, _RMEM_MIN,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ---- startup ----
     _kill_stale_ltesniffers()
+    _check_rmem_max()
     # Auth banner so the operator can't miss the security posture they're in.
     if BIND in ("0.0.0.0", "::"):
         log.warning(
@@ -346,8 +374,10 @@ async def events_ws(ws: WebSocket) -> None:
         if replay_events:
             await ws.send_text(json.dumps({"t": "replay", "events": replay_events}))
         while True:
-            ev = await q.get()
-            await ws.send_text(json.dumps(ev))
+            # Each queue item is (event_dict, encoded_str). Use the cached
+            # encoding so we don't re-json.dumps per subscriber.
+            _ev, encoded = await q.get()
+            await ws.send_text(encoded)
     except WebSocketDisconnect:
         pass
     finally:

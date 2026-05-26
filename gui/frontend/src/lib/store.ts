@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useReducer, useRef } from "react";
+import React, { useEffect, useRef, useSyncExternalStore } from "react";
 import type { Event, RuntimeState } from "./types";
 
 const SF_HISTORY = 300;          // ring buffer for waterfall
@@ -220,6 +220,24 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
         }
         break;
       }
+      case "sf_tick": {
+        // Lightweight per-subframe heartbeat — no RB heatmap, no per-DCI
+        // payload. Just keep subframe-count, rate-window, and DCI tallies
+        // moving so the metrics tiles don't appear to freeze between rich
+        // `sf` events. We can't increment per-RNTI maps here (no rnti id),
+        // so those keep ticking only on rich `sf`.
+        totals = totals === s.totals ? { ...totals } : totals;
+        totals.sf += 1;
+        totals.dci   += ev.dl_n + ev.ul_n;
+        totals.dci_dl += ev.dl_n;
+        totals.dci_ul += ev.ul_n;
+        if (ev.dl_n || ev.ul_n) {
+          rateSamples = rateSamples === s.rateSamples ? rateSamples.slice() : rateSamples;
+          rateSamples.push({ ts: ev.ts, dci: ev.dl_n + ev.ul_n, tbs: 0, rb: 0 });
+        }
+        sfAppended++;
+        break;
+      }
       case "identity":
         identities = identities === s.identities ? identities.slice() : identities;
         identities.unshift({ ts: ev.ts, sfn: ev.sfn, kind: ev.kind, rnti: ev.rnti, value: ev.value, from: ev.from });
@@ -315,15 +333,79 @@ function newRntiStats(rnti: number, ts: number): RNTIStats {
   };
 }
 
-interface StoreCtx {
-  state: AppState;
-  dispatch: React.Dispatch<Action>;
+// ---------------------------------------------------------------------------
+// External store: useSyncExternalStore + selectors.
+//
+// Why not React context: a single Ctx.Provider re-renders every consumer on
+// every reducer dispatch (15 Hz here). Components that only care about one
+// slice (e.g. CellCard reads `state.cell`, which changes ~once per capture)
+// were paying the cost of every `sf` event arriving.
+//
+// With useSyncExternalStore + selectors each component subscribes to only
+// the slice it reads. React's bail-out via Object.is on the selector result
+// means a CellCard re-renders only when the cell reference changes — not 15
+// times a second. The reducer's no-op short-circuit at the bottom of
+// applyEvents keeps refs stable when nothing relevant changed.
+// ---------------------------------------------------------------------------
+
+let _state: AppState = initial;
+const _listeners = new Set<() => void>();
+
+function _subscribe(cb: () => void): () => void {
+  _listeners.add(cb);
+  return () => { _listeners.delete(cb); };
 }
 
-const Ctx = createContext<StoreCtx | null>(null);
+function _getSnapshot(): AppState {
+  return _state;
+}
+
+export function dispatch(action: Action): void {
+  const next = reduce(_state, action);
+  if (next !== _state) {
+    _state = next;
+    // Notify in a flat loop — synchronous, single batch per dispatch.
+    _listeners.forEach((cb) => cb());
+  }
+}
+
+/** Subscribe to a slice. Component re-renders only when the selected value
+ *  changes per the supplied equality (default Object.is). */
+export function useStore<T>(selector: (s: AppState) => T, equal: (a: T, b: T) => boolean = Object.is): T {
+  // useSyncExternalStore doesn't accept a custom equality; we lift it manually
+  // via a ref so a re-render is forced only when `selector` returns a new value.
+  const lastRef = useRef<{ has: boolean; v: T }>({ has: false, v: undefined as unknown as T });
+  const getSnapshot = () => {
+    const next = selector(_state);
+    if (!lastRef.current.has || !equal(lastRef.current.v, next)) {
+      lastRef.current = { has: true, v: next };
+    }
+    return lastRef.current.v;
+  };
+  return useSyncExternalStore(_subscribe, getSnapshot, getSnapshot);
+}
+
+/** Shallow-equality helper for selectors that return small objects. */
+export function shallow<T extends Record<string, any>>(a: T, b: T): boolean {
+  if (Object.is(a, b)) return true;
+  if (!a || !b) return false;
+  const ak = Object.keys(a), bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.is(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/** Escape hatch for components that genuinely need the whole AppState
+ *  (avoid; prefer slice selectors). Re-renders on every dispatch. */
+export function useFullState(): AppState {
+  return useSyncExternalStore(_subscribe, _getSnapshot, _getSnapshot);
+}
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(reduce, initial);
+  // No context anymore — this component just owns the WS lifecycle and
+  // dispatches events into the external store. Children render normally.
   const wsRef = useRef<WebSocket | null>(null);
   const pendingRef = useRef<Event[]>([]);
   const flushTimerRef = useRef<number | null>(null);
@@ -414,13 +496,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  return React.createElement(Ctx.Provider, { value: { state, dispatch } }, children);
-}
-
-export function useStore(): StoreCtx {
-  const v = useContext(Ctx);
-  if (!v) throw new Error("useStore outside provider");
-  return v;
+  return React.createElement(React.Fragment, null, children);
 }
 
 // Derived selectors

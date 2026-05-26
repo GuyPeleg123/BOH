@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../lib/store";
 
+
+
 const levelClass: Record<string, string> = {
   debug: "text-muted",
   info: "text-slate-300",
@@ -9,7 +11,8 @@ const levelClass: Record<string, string> = {
 };
 
 export function LogPanel({ embedded = false }: { embedded?: boolean }) {
-  const { state } = useStore();
+  const logs = useStore((s) => s.logs);
+  const state = { logs };  // keep the existing references through the rest of the component
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
 

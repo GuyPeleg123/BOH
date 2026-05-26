@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../lib/store";
+
+
 import { rntiColor } from "../lib/color";
 
 type Filter = "all" | "dl" | "ul";
@@ -11,7 +13,8 @@ function fmtBytes(n: number): string {
 }
 
 export function PacketFeed() {
-  const { state } = useStore();
+  const recentDci = useStore((s) => s.recentDci);
+  const state = { recentDci };
   const [filter, setFilter] = useState<Filter>("all");
   const [paused, setPaused] = useState(false);
   const [rntiFilter, setRntiFilter] = useState("");

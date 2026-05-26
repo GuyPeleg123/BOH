@@ -31,6 +31,7 @@ export type Event =
       sample_rate: number;
     }
   | { t: "mib"; ts: number; sfn: number; sfn_offset: number }
+  | { t: "sf_tick"; ts: number; sfn: number; sf: number; cfi: number; dl_n: number; ul_n: number }
   | {
       t: "sf";
       ts: number;

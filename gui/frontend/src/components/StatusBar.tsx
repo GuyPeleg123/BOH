@@ -1,8 +1,14 @@
 import { Link, useLocation } from "react-router-dom";
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 
 export function StatusBar() {
-  const { state } = useStore();
+  // Only re-render when the connection / lifecycle status or cell identity changes.
+  const state = useStore((s) => ({
+    connected: s.connected,
+    lifecycle: s.lifecycle,
+    pid: s.pid,
+    cell: s.cell,
+  }), shallow);
   const loc = useLocation();
   const tab = (path: string, label: string) => (
     <Link

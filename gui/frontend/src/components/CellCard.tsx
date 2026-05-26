@@ -1,4 +1,4 @@
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 
 function Kv({ k, v, mono = true }: { k: string; v: React.ReactNode; mono?: boolean }) {
   return (
@@ -10,7 +10,9 @@ function Kv({ k, v, mono = true }: { k: string; v: React.ReactNode; mono?: boole
 }
 
 export function CellCard() {
-  const { state } = useStore();
+  const state = useStore((s) => ({
+    cell: s.cell, mib: s.mib, stats: s.stats, hello: s.hello,
+  }), shallow);
   const c = state.cell;
   const m = state.mib;
   const s = state.stats;

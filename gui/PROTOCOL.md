@@ -36,8 +36,20 @@ MIB decoded. May fire multiple times during initial sync.
 {"t":"mib","ts":1.500,"sfn":123,"sfn_offset":2,"phich_length":"normal","phich_resources":"1/6"}
 ```
 
-### `sf` — the main live event
-One per processed subframe (1ms). High volume; backend may downsample for UI.
+### `sf_tick` — lightweight per-subframe heartbeat
+Emitted every subframe (up to 1000/s at real LTE rates). Cheap to parse and
+cheap to render — frontend uses it to keep totals and rate-per-second tiles
+moving even when `sf` is throttled. ~80 bytes wire size.
+```json
+{"t":"sf_tick","ts":12.345,"sfn":123,"sf":4,"cfi":2,"dl_n":1,"ul_n":0}
+```
+`dl_n` / `ul_n` = number of DCIs in this subframe; no per-DCI detail. Use the
+upcoming `sf` event for the rich payload.
+
+### `sf` — the main live event (rich)
+Emitted at most every 20 ms (≤50 Hz wall-clock). Drops in frequency when the
+C++ emitter is busy or the FIFO is backpressuring, but `sf_tick` continues
+at full rate so the dashboard never goes blind.
 ```json
 {
   "t":"sf",

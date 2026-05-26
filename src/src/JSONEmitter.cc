@@ -60,7 +60,8 @@ void append_pwr_map(std::ostringstream& os, const std::vector<float>& map) {
 } // namespace
 
 JSONEmitter::JSONEmitter(const std::string& path)
-    : start_time(std::chrono::steady_clock::now())
+    : start_time(std::chrono::steady_clock::now()),
+      last_rich_sf(std::chrono::steady_clock::time_point::min())  // first sf always emits rich
 {
     if (path.empty()) {
         return;
@@ -215,11 +216,42 @@ void JSONEmitter::emitMIB(uint32_t sfn, int sfn_offset) {
     writeLine(os.str());
 }
 
+// Rich `sf` event capped at this rate (50 Hz). At real-LTE rates the cheap
+// `sf_tick` still fires every subframe (1 kHz), so the operator never loses
+// throughput counts — they just don't get the per-PRB heatmap at 1000 Hz.
+static constexpr int RICH_SF_INTERVAL_MS = 20;
+
 void JSONEmitter::emitSubframe(const SubframeInfo& info) {
     if (!fp) return;
     const DCICollection& coll = info.getDCICollection();
     const auto& dl = coll.getDCI_DL();
     const auto& ul = coll.getDCI_UL();
+
+    // Decide cheap vs. rich. Rich path runs at most RICH_SF_INTERVAL_MS apart;
+    // anything more frequent gets the lightweight `sf_tick`.
+    using clock = std::chrono::steady_clock;
+    auto now = clock::now();
+    bool emit_rich;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        emit_rich = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rich_sf).count()
+                    >= RICH_SF_INTERVAL_MS;
+        if (emit_rich) last_rich_sf = now;
+    }
+
+    if (!emit_rich) {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(6);
+        os << "{\"t\":\"sf_tick\",\"ts\":" << elapsed()
+           << ",\"sfn\":" << coll.get_sfn()
+           << ",\"sf\":"  << coll.get_sf_idx()
+           << ",\"cfi\":" << coll.get_cfi()
+           << ",\"dl_n\":" << dl.size()
+           << ",\"ul_n\":" << ul.size()
+           << "}";
+        writeLine(os.str());
+        return;
+    }
 
     std::ostringstream os;
     os << std::fixed << std::setprecision(6);

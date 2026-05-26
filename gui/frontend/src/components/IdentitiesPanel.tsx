@@ -1,5 +1,7 @@
 import { useStore } from "../lib/store";
 
+
+
 const kindBadge: Record<string, string> = {
   imsi: "bg-bad/20 text-bad border-bad/40",
   tmsi: "bg-warn/20 text-warn border-warn/40",
@@ -9,7 +11,8 @@ const kindBadge: Record<string, string> = {
 };
 
 export function IdentitiesPanel({ embedded = false }: { embedded?: boolean }) {
-  const { state } = useStore();
+  const identities = useStore((s) => s.identities);
+  const state = { identities };
 
   const body = (
     <div className="flex-1 overflow-auto">

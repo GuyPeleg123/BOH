@@ -1,4 +1,4 @@
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 
 function KV({ k, v }: { k: string; v: React.ReactNode }) {
   return (
@@ -10,7 +10,7 @@ function KV({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 export function CellPanel() {
-  const { state } = useStore();
+  const state = useStore((s) => ({ cell: s.cell, mib: s.mib, stats: s.stats }), shallow);
   const c = state.cell;
   const m = state.mib;
   const s = state.stats;

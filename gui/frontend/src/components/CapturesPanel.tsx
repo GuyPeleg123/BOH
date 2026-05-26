@@ -3,6 +3,8 @@ import { api } from "../lib/api";
 import type { CapturesResponse } from "../lib/types";
 import { useStore } from "../lib/store";
 
+
+
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -19,7 +21,8 @@ function fmtAge(epochSec: number): string {
 }
 
 export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
-  const { state } = useStore();
+  const lifecycle = useStore((s) => s.lifecycle);
+  const state = { lifecycle };
   const [resp, setResp] = useState<CapturesResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
 

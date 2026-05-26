@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { AppState } from "../lib/store";
-import { useStore } from "../lib/store";
+import { useFullState as useStore } from "../lib/store";
 import { useStableTick } from "../lib/useStableTick";
 
 // Same logic as useRates() but callable from inside another memo without
@@ -63,7 +63,9 @@ function Tile({
 }
 
 export function MetricsTiles() {
-  const { state } = useStore();
+  // MetricsTiles reads many slices and already paces via useStableTick; the
+  // useFullState read is fine because the useMemo([tick]) below gates churn.
+  const state = useStore();
   // Sample the underlying state once per second. The hook's tick is a
   // dependency for the useMemo below — even if the store re-renders us at
   // 15 Hz, the snapshot only recomputes when `tick` changes, so the

@@ -128,20 +128,27 @@ class SnifferRunner:
             self._sticky[t] = event
         self._last_events.append(event)
 
+        # Pre-encode the JSON once instead of per-subscriber. At 1000 sf/s with
+        # rb_dl/rb_ul/pwr_dl arrays of ~100 floats, json.dumps was the
+        # dominant CPU cost in the WS hot path (one encode per client per
+        # event). Now each subscriber gets the same shared str.
+        encoded = json.dumps(event)
+        item = (event, encoded)
+
         # Drop-oldest semantics: when a slow consumer's queue is full, evict
         # the oldest event instead of dropping the new one (and instead of
         # killing the subscription, which leaves the WS task awaiting a dead
         # queue forever).
         for q in list(self._subscribers):
             try:
-                q.put_nowait(event)
+                q.put_nowait(item)
             except asyncio.QueueFull:
                 try:
                     q.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
                 try:
-                    q.put_nowait(event)
+                    q.put_nowait(item)
                 except asyncio.QueueFull:
                     pass
                 self._dropped_for_slow_consumer += 1

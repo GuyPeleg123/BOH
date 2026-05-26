@@ -40,7 +40,15 @@ public:
     void emitHello(const Args& args);
     void emitCell(const srsran_cell_t& cell, double dl_freq, double ul_freq, double sample_rate);
     void emitMIB(uint32_t sfn, int sfn_offset);
+
+    // Emit *one* of:
+    //   - sf_tick (cheap: ts, sfn, sf, cfi, dl_n, ul_n) — every subframe
+    //   - sf       (rich: + dl[], ul[], rb_dl[], rb_ul[], pwr_dl[]) — at most
+    //              every RICH_SF_INTERVAL_MS, so the frontend can render rate
+    //              from the cheap event and detail from the rich one.
+    // Both share the same DCIToJSON entry point; throttling is internal here.
     void emitSubframe(const SubframeInfo& info);
+
     void emitLog(const char* level, const std::string& msg);
     void emitStats(uint32_t sfn, uint32_t sf_processed, uint32_t sf_skipped,
                    uint32_t nof_rnti, uint32_t rb_dl_total, uint32_t rb_ul_total,
@@ -59,6 +67,7 @@ private:
     int        fd = -1;          // raw fd; kept so we can fcntl O_NONBLOCK and write(2) without stdio backpressure
     uint64_t   dropped_events = 0;
     std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point last_rich_sf;  // last time a rich sf event was emitted
 };
 
 /**

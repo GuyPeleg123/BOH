@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { api } from "../lib/api";
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 
 export function CaptureControls({ compact = false }: { compact?: boolean }) {
-  const { state } = useStore();
+  const state = useStore((s) => ({ lifecycle: s.lifecycle, argv: s.argv }), shallow);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const running = state.lifecycle === "running";

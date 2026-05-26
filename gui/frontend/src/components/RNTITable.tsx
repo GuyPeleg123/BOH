@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 import { useStableTick } from "../lib/useStableTick";
 import { rntiColor } from "../lib/color";
 
@@ -29,7 +29,7 @@ function fmtAgo(s: number): string {
 }
 
 export function RNTITable() {
-  const { state } = useStore();
+  const state = useStore((s) => ({ rntis: s.rntis, monotonic: s.monotonic }), shallow);
   // Pace render so individual numbers don't tick up faster than the eye can read.
   useStableTick(500);
 

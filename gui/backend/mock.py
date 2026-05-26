@@ -10,6 +10,7 @@ Activated via env var:  LTESNIFFER_GUI_MOCK=1
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from collections import deque
@@ -55,15 +56,18 @@ class MockRunner:
         if t in ("hello", "cell", "mib", "lifecycle", "stats"):
             self._sticky[t] = event
         self._last_events.append(event)
+        # Mirror SnifferRunner: pre-encode JSON once, queues hold (dict, str).
+        encoded = json.dumps(event)
+        item = (event, encoded)
         # Drop-oldest semantics — mirror SnifferRunner._broadcast so a slow
         # consumer doesn't wedge the WS coroutine.
         for q in list(self._subscribers):
             try:
-                q.put_nowait(event)
+                q.put_nowait(item)
             except asyncio.QueueFull:
                 try: q.get_nowait()
                 except asyncio.QueueEmpty: pass
-                try: q.put_nowait(event)
+                try: q.put_nowait(item)
                 except asyncio.QueueFull: pass
 
     def replay(self) -> list[dict[str, Any]]:

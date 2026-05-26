@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useStore } from "../lib/store";
+import { useStore, shallow } from "../lib/store";
 import { rntiColor, powerColor } from "../lib/color";
 
 interface Props {
@@ -10,7 +10,7 @@ interface Props {
 const REDRAW_INTERVAL_MS = 200; // 5 Hz max; the underlying data updates faster
 
 export function RBWaterfall({ mode, direction }: Props) {
-  const { state } = useStore();
+  const state = useStore((s) => ({ sfHistory: s.sfHistory, cell: s.cell }), shallow);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sizeRef = useRef({ w: 0, h: 0 });
