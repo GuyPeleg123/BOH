@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse } from "./types";
 
 // ---- bearer-token handling --------------------------------------------------
 //
@@ -98,6 +98,10 @@ export const api = {
       body: cfg ? JSON.stringify(cfg) : "null",
     }),
   usrps: () => req<{ devices: USRPDevice[] }>("/api/usrps"),
+  getKnownCells: () => req<KnownCellsResponse>("/api/known-cells"),
+  loadKnownCell: (idx: number) =>
+    req<{ ok: boolean; loaded: string; config: SnifferConfig }>(
+      `/api/known-cells/${idx}/load`, { method: "POST" }),
   getKeys: () => req<KeysResponse>("/api/keys"),
   putKeys: (entries: KeyEntry[]) =>
     req<{ ok: boolean; path: string; wired_into_config: boolean; n_entries: number }>(

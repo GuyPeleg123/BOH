@@ -86,6 +86,8 @@ const SECTIONS: Section[] = [
 export function ConfigPage() {
   const [cfg, setCfg] = useState<SnifferConfig | null>(null);
   const [usrps, setUsrps] = useState<USRPDevice[]>([]);
+  const [knownCells, setKnownCells] = useState<import("../lib/types").KnownCell[]>([]);
+  const [knownCellsPath, setKnownCellsPath] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [autoMsg, setAutoMsg] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -94,7 +96,22 @@ export function ConfigPage() {
   useEffect(() => {
     api.getConfig().then(setCfg).catch((e) => setErr(e.message));
     api.usrps().then((r) => setUsrps(r.devices)).catch(() => {});
+    api.getKnownCells().then((r) => { setKnownCells(r.cells); setKnownCellsPath(r.path); }).catch(() => {});
   }, []);
+
+  async function loadKnownCell(idx: number) {
+    setBusy(true); setErr(null);
+    try {
+      const r = await api.loadKnownCell(idx);
+      setCfg(r.config);
+      setSaved(`Loaded "${r.loaded}"`);
+      setTimeout(() => setSaved(null), 2500);
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function autoDetect() {
     setBusy(true);
@@ -235,6 +252,43 @@ export function ConfigPage() {
           </button>
         </div>
       </div>
+
+      {knownCells.length > 0 && (
+        <div className="panel p-4 mb-4">
+          <div className="flex items-baseline justify-between mb-2">
+            <span className="label">Known cells — one-click load</span>
+            <span className="text-[10px] text-muted font-mono">{knownCellsPath}</span>
+          </div>
+          <div className="flex flex-col gap-2">
+            {knownCells.map((c, i) => (
+              <div key={i} className="flex items-center gap-3 p-2 rounded border border-border bg-bg">
+                <button
+                  className="btn btn-primary !px-3 !py-1 !text-xs"
+                  disabled={busy}
+                  onClick={() => loadKnownCell(i)}
+                  title="Copy these settings into the config form below"
+                >
+                  ↓ Load
+                </button>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-slate-100 truncate">{c.label}</div>
+                  <div className="text-xs text-muted font-mono">
+                    DL <span className="text-slate-200">{c.dl_freq_mhz}</span> MHz ·
+                    UL <span className="text-slate-200">{c.ul_freq_mhz}</span> MHz ·
+                    {c.bandwidth_mhz != null && <> {c.bandwidth_mhz} MHz BW ·</>}
+                    {c.nof_prb} PRB · mode {c.sniffer_mode}
+                    {c.pci != null && <> · PCI {c.pci}</>}
+                  </div>
+                  {c.notes && <div className="text-[11px] text-muted mt-0.5 truncate">{c.notes}</div>}
+                </div>
+                {c.last_success_iso && (
+                  <span className="text-[10px] text-muted font-mono">{c.last_success_iso}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {usrps.length > 0 && (
         <div className="panel p-4 mb-4">

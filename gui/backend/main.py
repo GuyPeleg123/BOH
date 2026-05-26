@@ -31,6 +31,8 @@ from metrics import MetricsBus
 from recorder import SessionRecorder, ReplayRunner
 from state_tracker import StateTracker
 import analytics
+import known_cells as known_cells_mod
+from known_cells import KnownCellsFile, KnownCell, KNOWN_CELLS_PATH
 
 log = logging.getLogger(__name__)
 
@@ -382,6 +384,41 @@ async def spectrum_launch(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/spectrum/stop")
 async def spectrum_stop() -> dict[str, Any]:
     return await spectrum.stop()
+
+
+@app.get("/api/known-cells")
+async def get_known_cells() -> dict[str, Any]:
+    kcf = known_cells_mod.load()
+    return {"cells": [c.model_dump() for c in kcf.cells], "path": str(KNOWN_CELLS_PATH)}
+
+
+@app.put("/api/known-cells")
+async def put_known_cells(body: KnownCellsFile) -> dict[str, Any]:
+    try:
+        path = known_cells_mod.save(body)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    return {"ok": True, "path": str(path), "n_cells": len(body.cells)}
+
+
+@app.post("/api/known-cells/{idx}/load")
+async def load_known_cell_into_config(idx: int) -> dict[str, Any]:
+    """Copy a known cell's freq/USRP/mode settings into the active SnifferConfig.
+    Returns the updated config so the GUI can refresh the form."""
+    kcf = known_cells_mod.load()
+    if idx < 0 or idx >= len(kcf.cells):
+        raise HTTPException(404, f"known cell index {idx} out of range (have {len(kcf.cells)})")
+    cell = kcf.cells[idx]
+    cfg = config_mod.load()
+    cfg.rf_freq = cell.dl_freq_mhz * 1e6
+    cfg.ul_freq = cell.ul_freq_mhz * 1e6
+    cfg.nof_prb = cell.nof_prb
+    cfg.sniffer_mode = cell.sniffer_mode
+    cfg.usrp_a_args = cell.usrp_a_args
+    cfg.usrp_b_args = cell.usrp_b_args
+    cfg.rf_gain = cell.rf_gain
+    config_mod.save(cfg)
+    return {"ok": True, "loaded": cell.label, "config": cfg.model_dump()}
 
 
 @app.get("/api/analytics/rnti-churn")

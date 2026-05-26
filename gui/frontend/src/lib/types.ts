@@ -138,6 +138,26 @@ export interface KeysResponse {
   exists: boolean;
 }
 
+export interface KnownCell {
+  label: string;
+  dl_freq_mhz: number;
+  ul_freq_mhz: number;
+  bandwidth_mhz: number | null;
+  nof_prb: number;
+  pci: number | null;
+  sniffer_mode: number;
+  usrp_a_args: string;
+  usrp_b_args: string;
+  rf_gain: number;
+  last_success_iso: string;
+  notes: string;
+}
+
+export interface KnownCellsResponse {
+  cells: KnownCell[];
+  path: string;
+}
+
 export interface USRPDevice {
   type?: string;
   serial?: string;
