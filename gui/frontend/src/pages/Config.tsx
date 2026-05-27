@@ -70,6 +70,8 @@ const SECTIONS: Section[] = [
       { key: "dci_file_name",   label: "DCI output (empty = stdout)", flag: "-D", widget: "text" },
       { key: "stats_file_name", label: "Stats file", flag: "-E", widget: "text" },
       { key: "keys_file",       label: "PDCP key JSON", flag: "-K", widget: "text" },
+      { key: "pcap_stream_fifo", label: "Live-stream FIFO (Wireshark)", flag: "", widget: "text",
+        hint: "Optional named pipe (e.g. /tmp/lte.pcap). When set, the backend mkfifos this path and passes it to the C++ side as LTESNIFFER_PCAP_STREAM, so Wireshark can dissect MAC PDUs live. Must live under /tmp/ or ~/ltesniffer-captures/. Open Wireshark (Dashboard → 🦈 Wireshark button) BEFORE starting capture — the C++ writer fails silently if no reader is connected yet." },
     ],
   },
   {

@@ -48,6 +48,38 @@ _ALLOWED_BINARIES: set[Path] = {
 }
 
 
+_STREAM_FIFO_ALLOWED_ROOTS = (Path("/tmp"), Path.home() / "ltesniffer-captures")
+
+
+def _ensure_stream_fifo(path_s: str) -> Path:
+    """Validate a pcap-stream FIFO path and create it as a FIFO if missing.
+
+    Refuses paths outside /tmp/ or the default captures dir, refuses symlinks,
+    and refuses existing regular files (don't accidentally append a libpcap
+    header onto someone's important file).
+    """
+    p = Path(path_s).expanduser()
+    if not p.is_absolute():
+        raise PermissionError(f"pcap_stream_fifo must be absolute, got {path_s}")
+    if p.is_symlink():
+        raise PermissionError(f"pcap_stream_fifo refuses symlinks: {p}")
+    if not any(str(p).startswith(str(r) + os.sep) for r in _STREAM_FIFO_ALLOWED_ROOTS):
+        raise PermissionError(
+            f"pcap_stream_fifo must live under one of: "
+            f"{', '.join(str(r) for r in _STREAM_FIFO_ALLOWED_ROOTS)}"
+        )
+    if p.exists():
+        # Must already be a FIFO — refuse to overwrite something else.
+        st = os.stat(p, follow_symlinks=False)
+        import stat as _stat
+        if not _stat.S_ISFIFO(st.st_mode):
+            raise PermissionError(f"{p} exists and is not a FIFO; refusing to touch it")
+        return p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(p, 0o660)
+    return p
+
+
 def _resolve_and_validate_binary(cfg_path: str) -> Path:
     """Resolve `cfg.binary_path` and confirm it's in the allowlist.
 
@@ -191,6 +223,17 @@ class SnifferRunner:
 
         captures_dir = Path(cfg.captures_dir).expanduser()
         captures_dir.mkdir(parents=True, exist_ok=True)
+
+        # If the user opted into the live pcap-stream FIFO, ensure it exists
+        # as an actual FIFO. The C++ side opens it O_WRONLY|O_NONBLOCK, which
+        # fails with ENXIO if no reader is connected — log a hint so the user
+        # knows to open Wireshark *before* hitting Start.
+        if cfg.pcap_stream_fifo:
+            try:
+                _ensure_stream_fifo(cfg.pcap_stream_fifo)
+            except (PermissionError, OSError) as e:
+                self._cleanup_fifo()
+                raise PermissionError(f"pcap_stream_fifo rejected: {e}")
 
         self._state.update(
             running=True,

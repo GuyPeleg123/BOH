@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +20,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 import config as config_mod
 from config import SnifferConfig
 from sniffer import SnifferRunner
+import sniffer as sniffer_mod
 from mock import MockRunner
 from usrp import find_devices, auto_config_patch
 from spectrum import SpectrumLauncher
@@ -262,6 +264,22 @@ async def put_config(cfg: SnifferConfig) -> SnifferConfig:
         except FileNotFoundError:
             # Tolerate not-yet-built binary at save time; start will reject later.
             pass
+    if cfg.pcap_stream_fifo:
+        # Fail fast on out-of-allowlist paths so the user gets a useful error
+        # at Save time, not 30s later when they hit ▶ Start. We don't actually
+        # mkfifo here (that happens at capture/start); just validate the path
+        # shape via the same helper. tolerates the path not existing yet.
+        try:
+            from sniffer import _STREAM_FIFO_ALLOWED_ROOTS
+            p = Path(cfg.pcap_stream_fifo).expanduser()
+            if not p.is_absolute() or p.is_symlink() or \
+               not any(str(p).startswith(str(r) + os.sep) for r in _STREAM_FIFO_ALLOWED_ROOTS):
+                raise PermissionError(
+                    f"must be an absolute non-symlink path under one of: "
+                    f"{', '.join(str(r) for r in _STREAM_FIFO_ALLOWED_ROOTS)}"
+                )
+        except PermissionError as e:
+            raise HTTPException(403, f"pcap_stream_fifo rejected: {e}")
     config_mod.save(cfg)
     return cfg
 
@@ -498,7 +516,7 @@ async def list_captures() -> dict[str, Any]:
     cfg = config_mod.load()
     roots = [str(r) for r in captures_mod.allowed_roots(cfg)]
     return {
-        "captures": captures_mod.list_pcaps(cfg),
+        "captures": captures_mod.list_pcaps(cfg, sniffer_running=runner.running),
         "roots": roots,
         "captures_dir": str(Path(cfg.captures_dir).expanduser()),
     }
@@ -542,6 +560,44 @@ async def events_ws(ws: WebSocket) -> None:
         pass
     finally:
         runner.unsubscribe(q)
+
+
+# --- Wireshark live-stream launcher ------------------------------------------
+#
+# `wireshark -k -i <fifo>` opens Wireshark and starts capturing immediately
+# on the named pipe. Pairs with the cfg.pcap_stream_fifo / LTESNIFFER_PCAP_STREAM
+# wiring on the C++ side so MAC PDUs are dissected as they are written.
+
+@app.post("/api/wireshark/open")
+async def open_wireshark() -> dict[str, Any]:
+    cfg = config_mod.load()
+    if not cfg.pcap_stream_fifo:
+        raise HTTPException(
+            400,
+            "No pcap_stream_fifo set in config. Pick a path on the Config page "
+            "(e.g. /tmp/lte.pcap) and Save first.",
+        )
+    if not shutil.which("wireshark"):
+        raise HTTPException(404, "wireshark not on PATH. Install with: sudo apt install wireshark")
+    disp = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if not disp:
+        raise HTTPException(
+            400,
+            "No $DISPLAY on the backend host; Wireshark needs a desktop session.",
+        )
+    # Make sure the FIFO exists *before* Wireshark opens it (Wireshark blocks
+    # on open until a writer connects, which is exactly what we want — but it
+    # needs the path to exist first).
+    try:
+        sniffer_mod._ensure_stream_fifo(cfg.pcap_stream_fifo)
+    except (PermissionError, OSError) as e:
+        raise HTTPException(400, f"pcap_stream_fifo rejected: {e}")
+    proc = await asyncio.create_subprocess_exec(
+        "wireshark", "-k", "-i", cfg.pcap_stream_fifo,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return {"ok": True, "pid": proc.pid, "fifo": cfg.pcap_stream_fifo}
 
 
 # --- User guide (auth-free; it's the same content as on disk in the repo) ----

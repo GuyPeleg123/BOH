@@ -98,6 +98,7 @@ export interface SnifferConfig {
   dci_file_name: string;
   stats_file_name: string;
   keys_file: string;
+  pcap_stream_fifo: string;
   binary_path: string;
   captures_dir: string;
   sudo: boolean;

@@ -54,6 +54,16 @@ class SnifferConfig(BaseModel):
     dci_file_name: str = Field("", description="-D (empty = stdout)")
     stats_file_name: str = Field("", description="-E")
     keys_file: str = Field("", description="-K")
+    pcap_stream_fifo: str = Field(
+        "",
+        description=(
+            "Optional named-pipe path. When set, every decoded MAC PDU is also "
+            "mirrored to this FIFO so Wireshark can dissect packets live. "
+            "Backend mkfifos the path on capture start; passed through to the "
+            "C++ child as LTESNIFFER_PCAP_STREAM via `sudo env` so it survives "
+            "sudo env_reset. Typical value: /tmp/lte.pcap."
+        ),
+    )
 
     # --- GUI-only ---
     binary_path: str = Field(
@@ -74,6 +84,12 @@ class SnifferConfig(BaseModel):
         argv: list[str] = []
         if self.sudo:
             argv += ["sudo", "-n"]
+        # If the user opted into the live-stream FIFO, prepend
+        #   env LTESNIFFER_PCAP_STREAM=<path>
+        # so the env var survives sudo's env_reset (the C++ PcapWriter reads
+        # this var to decide whether to fork a copy of every MAC PDU to the FIFO).
+        if self.pcap_stream_fifo:
+            argv += ["env", f"LTESNIFFER_PCAP_STREAM={self.pcap_stream_fifo}"]
         argv.append(self.binary_path)
 
         if self.rf_freq > 0:

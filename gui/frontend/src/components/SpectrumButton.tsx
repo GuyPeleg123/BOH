@@ -45,6 +45,10 @@ export function SpectrumButton() {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
+  // Fallback frequency from /api/config so the spectrum can launch *before*
+  // any capture has run — you usually need to look at the band first to find
+  // a cell to tune to.
+  const [configFreq, setConfigFreq] = useState<number>(0);
   const wrapRef = useRef<HTMLDivElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   // Position the portal-rendered popover beneath the button using fixed coords
@@ -107,6 +111,17 @@ export function SpectrumButton() {
     if (open) refreshUsrps();
   }, [open]);
 
+  // Pull the persisted rf_freq from /api/config so the spectrum can launch
+  // before any capture has run. Refreshed when the popover opens so a freshly
+  // edited Config takes effect without a page reload.
+  useEffect(() => {
+    if (!open) return;
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((c) => setConfigFreq(Number(c?.rf_freq) || 0))
+      .catch(() => {});
+  }, [open]);
+
   // Outside-click close. The popover is now portaled to <body>, so checking
   // wrapRef.contains(target) alone wouldn't recognise clicks inside the
   // popover. Check both the wrap (button) and the popover refs.
@@ -122,8 +137,13 @@ export function SpectrumButton() {
     return () => window.removeEventListener("mousedown", onDown);
   }, [open]);
 
-  const freq = state.cell?.dl_freq ?? state.hello?.args?.rf_freq ?? 0;
+  const freq = state.cell?.dl_freq ?? state.hello?.args?.rf_freq ?? configFreq ?? 0;
   const sr = state.cell?.sample_rate ?? 0;
+  const freqSource: "live" | "hello" | "config" | "none" =
+    state.cell?.dl_freq ? "live"
+    : state.hello?.args?.rf_freq ? "hello"
+    : configFreq ? "config"
+    : "none";
 
   // Serials the sniffer is likely holding (from saved rfargs in lifecycle argv).
   const heldSerials = useMemo(() => {
@@ -265,7 +285,10 @@ export function SpectrumButton() {
             {freq > 0 ? (
               <>
                 Tuning <span className="font-mono text-slate-200">{(freq / 1e6).toFixed(3)} MHz</span>
-                {sr > 0 && <> @ <span className="font-mono text-slate-200">{(sr / 1e6).toFixed(2)} MHz</span> sample rate</>}.
+                {sr > 0 && <> @ <span className="font-mono text-slate-200">{(sr / 1e6).toFixed(2)} MHz</span> sample rate</>}
+                {freqSource === "config" && <span className="text-[10px] text-muted/70"> (from saved Config — no capture running)</span>}
+                {freqSource === "hello"  && <span className="text-[10px] text-muted/70"> (from last sniffer launch args)</span>}
+                {freqSource === "live"   && <span className="text-[10px] text-ok/70"> (live cell sync)</span>}.
               </>
             ) : (
               <span className="text-warn"> No DL freq known yet — set one in Config, or start a capture.</span>

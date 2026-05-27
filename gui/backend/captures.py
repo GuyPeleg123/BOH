@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Iterable
 
 from config import SnifferConfig
+
+
+# A pcap is "live" only if a capture is currently running AND the file was
+# modified within this many seconds. Generous enough for slow networks where
+# DCIs are rare, tight enough that an old leftover doesn't claim to be active.
+LIVE_MTIME_WINDOW_S = 20.0
 
 
 # Read-only "well-known" places pcaps tend to live in this user's tree.
@@ -47,11 +54,20 @@ def allowed_roots(cfg: SnifferConfig) -> list[Path]:
     return roots
 
 
-def list_pcaps(cfg: SnifferConfig) -> list[dict]:
-    """Return descriptors for every pcap under each allowed root."""
+def list_pcaps(cfg: SnifferConfig, sniffer_running: bool = False) -> list[dict]:
+    """Return descriptors for every pcap under each allowed root.
+
+    The `active` / "live capture" badge only lights up when:
+      1. the sniffer subprocess is currently running, AND
+      2. the pcap lives inside captures_dir, AND
+      3. the pcap was modified within LIVE_MTIME_WINDOW_S seconds.
+    Without (3), a stale pcap from a previous session that just happens
+    to live in captures_dir would forever be tagged "live capture".
+    """
     out: list[dict] = []
     seen: set[Path] = set()
     captures = Path(cfg.captures_dir).expanduser().resolve()
+    now = time.time()
     for root in allowed_roots(cfg):
         for p in _safe_pcap_iter(root):
             rp = p.resolve()
@@ -62,10 +78,11 @@ def list_pcaps(cfg: SnifferConfig) -> list[dict]:
                 st = rp.stat()
             except OSError:
                 continue
-            source = (
-                "active capture"
-                if rp.parent == captures
-                else str(root)
+            in_captures_dir = rp.parent == captures
+            fresh = (now - st.st_mtime) <= LIVE_MTIME_WINDOW_S
+            active = sniffer_running and in_captures_dir and fresh
+            source = "active capture" if active else (
+                str(captures) if in_captures_dir else str(root)
             )
             out.append({
                 "path": str(rp),
@@ -73,7 +90,7 @@ def list_pcaps(cfg: SnifferConfig) -> list[dict]:
                 "size": st.st_size,
                 "mtime": st.st_mtime,
                 "source": source,
-                "active": rp.parent == captures,
+                "active": active,
             })
     out.sort(key=lambda d: d["mtime"], reverse=True)
     return out

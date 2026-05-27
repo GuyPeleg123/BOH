@@ -115,6 +115,9 @@ export const api = {
       { method: "PUT", body: JSON.stringify({ entries }) }
     ),
   captures: () => req<CapturesResponse>("/api/captures"),
+  openWireshark: () =>
+    req<{ ok: boolean; pid: number; fifo: string }>(
+      "/api/wireshark/open", { method: "POST" }),
   downloadCaptureUrl: (path: string) =>
     `/api/captures/download?path=${encodeURIComponent(path)}`,
 };

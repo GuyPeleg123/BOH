@@ -8,6 +8,7 @@ import { LogPanel } from "../components/LogPanel";
 import { IdentitiesPanel } from "../components/IdentitiesPanel";
 import { PacketFeed } from "../components/PacketFeed";
 import { SpectrumButton } from "../components/SpectrumButton";
+import { WiresharkButton } from "../components/WiresharkButton";
 import { CapturesPanel } from "../components/CapturesPanel";
 
 export function Dashboard() {
@@ -22,8 +23,9 @@ export function Dashboard() {
         <div className="panel p-3 flex items-center gap-2 shrink-0">
           <CaptureControls compact />
         </div>
-        <div className="shrink-0 flex items-center">
+        <div className="shrink-0 flex items-center gap-2">
           <SpectrumButton />
+          <WiresharkButton />
         </div>
         <div className="flex-1 min-w-0">
           <CellCard />

@@ -172,7 +172,12 @@ Read by the C++ binary:
   LTESNIFFER_PCAP_ROTATE_MIN=<N>        Rotate every N minutes.
                                         New files named <base>_<iso8601>_<seq>.pcap.
   LTESNIFFER_PCAP_STREAM=<fifo path>    Mirror every MAC PDU to a named pipe
-                                        for live Wireshark dissection:
+                                        for live Wireshark dissection. The
+                                        GUI now exposes this as
+                                        `pcap_stream_fifo` in SnifferConfig
+                                        plus the 🦈 Wireshark button on the
+                                        Dashboard — see §10.2 for the full
+                                        flow. Direct CLI use still works:
                                           mkfifo /tmp/lte.pcap
                                           wireshark -k -i /tmp/lte.pcap
 
@@ -221,6 +226,11 @@ loopback (default). /api/health and /metrics are always open. /assets/* and
   GET    /api/spectrum                  status + preflight (display, uhd_images, tools)
   POST   /api/spectrum/launch           body: { freq_hz, sample_rate_hz?, tool?, device_args? }
   POST   /api/spectrum/stop
+
+  -- Wireshark live-stream launcher --
+  POST   /api/wireshark/open            spawns `wireshark -k -i <pcap_stream_fifo>`.
+                                        Requires cfg.pcap_stream_fifo to be set
+                                        and a $DISPLAY on the backend host.
 
   -- Captures (pcap files) --
   GET    /api/captures                  list pcaps from allowed roots
@@ -322,39 +332,49 @@ Every event has at minimum {"t":<type>}. Most include a monotonic "ts"
        any held by the running sniffer ("HELD BY SNIFFER"). Pre-flight panel
        inside the popover surfaces: $DISPLAY ok, UHD images installed,
        tool on PATH — with the exact fix command for each red item.
-       Disabled in mock mode (real RF samples required).
+       Disabled in mock mode (real RF samples required). DL freq comes
+       from (in order): live cell sync → last sniffer launch args → saved
+       Config — so you can launch the spectrum before any capture has run.
 
-    c) Cell card
+    c) Wireshark launcher (🦈 Wireshark)
+       Opens Wireshark on cfg.pcap_stream_fifo so MAC PDUs are dissected
+       live. Disabled when no FIFO is set (tooltip points you at Config).
+       Open this BEFORE starting capture — see §10.2 for the ordering
+       caveat and the full flow.
+
+    d) Cell card
        Headline of what's locked: PCI, PRB count, CP type, FDD/TDD,
        DL+UL freq, sample rate, bandwidth, MIB SFN, CFO, % skipped SF.
 
-    d) Metrics tiles (6, refreshed at 1 Hz)
+    e) Metrics tiles (6, refreshed at 1 Hz)
        UEs seen · DCIs decoded · DL/UL split · Throughput · RBs/s ·
        Decoding health %. Values are quantized so digits don't jitter.
 
-    e) Packets · live DCI feed
+    f) Packets · live DCI feed
        Per-DCI table: Dir / SFN.sf / Time / RNTI / Format / MCS / PRB /
        TBS / NDI / HARQ / hex. Filter buttons ALL / DL / UL; RNTI input
        filter; ❚❚ pause button. Hover over the table to auto-pause for
        reading (badge: "+N while paused").
 
-    f) RB waterfall (canvas)
+    g) RB waterfall (canvas)
        Time × frequency heat map. Toggle Alloc (per-RNTI colours) vs
        Power (RSRP gradient). Toggle DL vs UL. Newest at bottom.
        Throttled to 5 Hz repaint.
 
-    g) RNTI table (sortable)
+    h) RNTI table (sortable)
        RNTI · last-seen · DL count · DL RB · DL bytes · UL count · UL RB.
        Default sort: RNTI ascending (stable). Toggle "show only active
        (last 5 s)". Rows fade as they age out.
 
-    h) Tabbed footer
+    i) Tabbed footer
        Logs       — every backend / stderr / state-tracker log event.
                     Hex-key blobs auto-redacted to <redacted-256/128>.
                     Auto-scrolls to bottom; pauses on hover.
        Captures   — pcap files in captures_dir + ~/work/captures +
                     ~/work/LTESniffer/pcap_file_example. Download link
-                    per file; size + age. Active capture dir badge.
+                    per file; size + age. The green "live capture"
+                    badge requires the sniffer to be running AND the
+                    file modified in the last 20 s — see §10.4.
        Identities — IMSI/TMSI/GUTI/UECapa collected by API mode (-z).
 
 7.3 Keys page
@@ -370,7 +390,8 @@ Every event has at minimum {"t":<type>}. Most include a monotonic "ts"
       RF / hardware   — freqs, gain, antennas, USRP rfargs, decimate, CPU mask
       Cell & mode     — sniffer mode, API mode, cell search, fixed cell ID, PRB, target RNTI
       Decoder         — workers, DCI split, shortcut, MCS tracking, debug
-      Output files    — pcap, DCI text, stats CSV, keys
+      Output files    — pcap, DCI text, stats CSV, keys,
+                        pcap_stream_fifo (live Wireshark FIFO — see §10.2)
       GUI             — binary_path, captures_dir, sudo toggle
 
     Above the form:
@@ -471,14 +492,41 @@ API-mode (IMSI/UECapa) PDUs go separately into api_collector.pcap.
   A log line "[PcapWriter] rotated -> path (reason=size|time)" appears
   in the Logs panel each time.
 
-10.2 Live-stream via FIFO (Phase 3.5)
-  Opt-in via:
+10.2 Live-stream via FIFO  (the easy way — wired through the GUI)
+  Same DLT=147 stream as the on-disk pcap, mirrored to a named pipe so
+  Wireshark dissects MAC PDUs as they're decoded.
+
+  GUI flow (recommended):
+    1. Config page → "Live-stream FIFO (Wireshark)" → set e.g.
+       /tmp/lte.pcap → Save.
+    2. Dashboard → 🦈 Wireshark button → opens Wireshark on the FIFO
+       (Wireshark blocks on the reader side until a writer connects).
+    3. Dashboard → ▶ Start capture. The C++ child opens the FIFO for
+       write, both ends connect, packets flow.
+
+  Critical ordering: open Wireshark BEFORE starting capture. The C++
+  PcapWriter opens the FIFO O_WRONLY|O_NONBLOCK and silently skips
+  streaming if no reader is attached (ENXIO). The button warns you
+  in its tooltip if the order is wrong.
+
+  Under the hood:
+    - SnifferConfig.pcap_stream_fifo holds the path.
+    - argv builder prepends  `env LTESNIFFER_PCAP_STREAM=<path>` after
+      sudo -n so the env var survives sudo's `env_reset`.
+    - backend mkfifos the path on capture start with mode 0660.
+    - Path is validated to live under /tmp/ or ~/ltesniffer-captures/
+      (no symlinks, refuses to overwrite an existing non-FIFO file).
+
+  Pure CLI alternative (no GUI):
     mkfifo /tmp/lte.pcap
-    LTESNIFFER_PCAP_STREAM=/tmp/lte.pcap .venv/bin/uvicorn main:app …
-    wireshark -k -i /tmp/lte.pcap         # in a separate shell
-  Same DLT=147 stream as the on-disk pcap, mirrored to the FIFO.
-  Wireshark dissects in real time. If the reader dies, the writer is
-  O_NONBLOCK + SIGPIPE-ignored so the sniffer doesn't wedge.
+    wireshark -k -i /tmp/lte.pcap &            # terminal A
+    sudo -n env LTESNIFFER_PCAP_STREAM=/tmp/lte.pcap \
+         /path/to/LTESniffer -f … -u … -m 2 -A 2 -C \
+         -X "clock=gpsdo,serial=…" -Z "clock=gpsdo,serial=…"
+
+  If the reader dies mid-capture, the writer ignores SIGPIPE so the
+  sniffer keeps going. Click 🦈 Wireshark again to reopen — you'll
+  need to restart capture so the C++ writer re-attaches.
 
 10.3 Filter UL vs DL in Wireshark
   Display filter:    mac-lte.direction == 0      # UL
@@ -489,6 +537,13 @@ API-mode (IMSI/UECapa) PDUs go separately into api_collector.pcap.
   spots. Each row shows size + age and offers a download link. The
   download endpoint allowlist-checks paths so you can't ../ escape
   through it.
+
+  The green "live capture" badge requires ALL of:
+    (1) the sniffer subprocess is currently running, AND
+    (2) the pcap lives in captures_dir, AND
+    (3) the file was modified within the last 20 s.
+  Without (3), a stale pcap left over from a previous session that
+  happens to live in captures_dir would forever claim to be live.
 
 ------------------------------------------------------------------------------
 11. SESSION RECORDER & REPLAY
