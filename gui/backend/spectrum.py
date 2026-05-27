@@ -17,19 +17,38 @@ import time
 from typing import Optional
 
 
-# Ordered by preference: (command, label, argv_builder(freq_hz, sample_rate_hz, device_args) -> list[str])
+# Ordered by preference: (command, label, argv_builder(freq, sr, args, extras) -> list[str])
 #
 # These are all *receiver* tools — they open a USRP, draw a live FFT of the
 # RF spectrum, and stay running until closed. Do NOT add `uhd_siggen_gui`
 # here: it's a *transmitter* (signal generator), not a spectrum analyzer,
 # and clicking it would start beaming a signal instead of viewing one.
+#
+# `extras` is a dict of optional per-launch tuning knobs the GUI exposes:
+#   gain_db:     float (RX gain in dB; None = tool default midpoint)
+#   antenna:     str   (e.g. "RX2"; None = tool default)
+#   fft_size:    int   (FFT bin count, e.g. 1024/2048/4096)
+#   fft_average: str   ("off" | "low" | "medium" | "high")
+#   update_rate: float (FFT redraw rate in Hz)
+def _uhd_fft_argv(f, sr, args, extras):
+    ex = extras or {}
+    out: list[str] = []
+    if args:                                    out += ["-a", args]
+    out += ["-f", str(int(f))]
+    if sr:                                      out += ["-s", str(int(sr))]
+    if ex.get("gain_db") is not None:           out += ["-g", str(float(ex["gain_db"]))]
+    if ex.get("antenna"):                       out += ["-A", str(ex["antenna"])]
+    if ex.get("fft_size"):                      out += ["--fft-size", str(int(ex["fft_size"]))]
+    if ex.get("fft_average") in ("off", "low", "medium", "high"):
+        out += ["--fft-average", ex["fft_average"]]
+    if ex.get("update_rate"):                   out += ["--update-rate", str(float(ex["update_rate"]))]
+    return out
+
+
 TOOLS: list[tuple[str, str, callable]] = [
-    ("uhd_fft",         "uhd_fft (UHD spectrum)",
-     lambda f, sr, args: (["-a", args] if args else []) + ["-f", str(int(f))] + (["-s", str(int(sr))] if sr else [])),
-    ("usrp_fft",        "usrp_fft (legacy)",
-     lambda f, sr, args: (["-a", args] if args else []) + ["-f", str(int(f))] + (["-s", str(int(sr))] if sr else [])),
-    ("gqrx",            "gqrx",
-     lambda _f, _sr, _args: []),  # gqrx config file controls freq + device
+    ("uhd_fft",  "uhd_fft (UHD spectrum)", _uhd_fft_argv),
+    ("usrp_fft", "usrp_fft (legacy)",      _uhd_fft_argv),    # same CLI surface
+    ("gqrx",     "gqrx",                   lambda *_a: []),    # gqrx uses a config file
 ]
 
 # How long after launch we keep watching for an early exit before reporting
@@ -131,7 +150,8 @@ class SpectrumLauncher:
         }
 
     async def launch(self, freq_hz: float, sample_rate_hz: float,
-                     tool: Optional[str] = None, device_args: Optional[str] = None) -> dict:
+                     tool: Optional[str] = None, device_args: Optional[str] = None,
+                     extras: Optional[dict] = None) -> dict:
         if self.running():
             raise RuntimeError("spectrum already running; stop it first")
 
@@ -153,7 +173,7 @@ class SpectrumLauncher:
         if builder is None or shutil.which(chosen_cmd) is None:
             raise FileNotFoundError(f"Tool '{chosen_cmd}' not found")
 
-        argv = [chosen_cmd, *builder(freq_hz, sample_rate_hz, device_args or "")]
+        argv = [chosen_cmd, *builder(freq_hz, sample_rate_hz, device_args or "", extras or {})]
 
         # Reset per-launch state
         self._last_error = None

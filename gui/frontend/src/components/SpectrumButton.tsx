@@ -49,6 +49,16 @@ export function SpectrumButton() {
   // any capture has run — you usually need to look at the band first to find
   // a cell to tune to.
   const [configFreq, setConfigFreq] = useState<number>(0);
+  // User-tunable launch parameters. Each is null/empty until the user touches
+  // it — null means "let the tool pick its default" (uhd_fft midpoint gain,
+  // built-in FFT size etc.).
+  const [freqOverrideMhz, setFreqOverrideMhz] = useState<string>("");  // "" = use derived freq
+  const [spanMhz, setSpanMhz]                 = useState<string>("");  // "" = use sr from cell or 23.04 default
+  const [gainDb, setGainDb]                   = useState<string>("");  // "" = AGC / tool default
+  const [fftSize, setFftSize]                 = useState<string>("1024");
+  const [fftAverage, setFftAverage]           = useState<"off"|"low"|"medium"|"high"|"">("medium");
+  const [antenna, setAntenna]                 = useState<string>("");
+  const [showAdvanced, setShowAdvanced]       = useState<boolean>(false);
   const wrapRef = useRef<HTMLDivElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   // Position the portal-rendered popover beneath the button using fixed coords
@@ -169,15 +179,36 @@ export function SpectrumButton() {
     setChosenSerial((free?.serial ?? usrps[0]?.serial ?? "") as string);
   }, [usrps, heldSerials, chosenSerial]);
 
+  // Resolve final freq/span/extras to send.
+  // Center freq:  user override (MHz) → state-derived freq (Hz).
+  // Span (=sample rate): user override (MHz) → state.cell.sample_rate (Hz) → 23.04 MHz default
+  //                      (≈ 20 MHz LTE bandwidth, a sensible default for B3).
+  const launchFreqHz = freqOverrideMhz.trim() !== ""
+    ? Math.round(parseFloat(freqOverrideMhz) * 1e6)
+    : freq;
+  const launchSpanHz = spanMhz.trim() !== ""
+    ? Math.round(parseFloat(spanMhz) * 1e6)
+    : (sr || 23_040_000);
+
   async function launch(tool?: string) {
     setBusy(true);
     setLaunchErr(null);
     try {
       const device_args = chosenSerial ? buildDeviceArgs(chosenSerial) : "";
+      const body: Record<string, unknown> = {
+        freq_hz: launchFreqHz,
+        sample_rate_hz: launchSpanHz,
+        tool,
+        device_args,
+      };
+      if (gainDb.trim() !== "")  body.gain_db = parseFloat(gainDb);
+      if (antenna.trim() !== "") body.antenna = antenna.trim();
+      if (fftSize)               body.fft_size = parseInt(fftSize, 10);
+      if (fftAverage)            body.fft_average = fftAverage;
       const r = await fetch("/api/spectrum/launch", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ freq_hz: freq, sample_rate_hz: sr, tool, device_args }),
+        body: JSON.stringify(body),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
@@ -236,7 +267,7 @@ export function SpectrumButton() {
 
   const sniffRunning = state.lifecycle === "running";
   const chosenIsHeld = chosenSerial && heldSerials.has(chosenSerial);
-  const launchDisabled = busy || !freq || !!chosenIsHeld;
+  const launchDisabled = busy || !launchFreqHz || !!chosenIsHeld;
 
   return (
     <div ref={wrapRef} className="relative">
@@ -256,7 +287,7 @@ export function SpectrumButton() {
       {open && !isRunning && popPos && createPortal(
         <div
           ref={popoverRef}
-          className="w-[28rem] panel p-3 z-50 shadow-xl border-accent/30"
+          className="w-[30rem] panel p-3 z-50 shadow-xl border-accent/30 max-h-[80vh] overflow-y-auto"
           style={{ position: "fixed", top: popPos.top, left: popPos.left }}
         >
           {/* Pre-flight panel: tells the operator which preconditions are already met */}
@@ -284,17 +315,136 @@ export function SpectrumButton() {
             </div>
           )}
 
-          <div className="text-xs text-muted mb-2">
-            {freq > 0 ? (
-              <>
-                Tuning <span className="font-mono text-slate-200">{(freq / 1e6).toFixed(3)} MHz</span>
-                {sr > 0 && <> @ <span className="font-mono text-slate-200">{(sr / 1e6).toFixed(2)} MHz</span> sample rate</>}
-                {freqSource === "config" && <span className="text-[10px] text-muted/70"> (from saved Config — no capture running)</span>}
-                {freqSource === "hello"  && <span className="text-[10px] text-muted/70"> (from last sniffer launch args)</span>}
-                {freqSource === "live"   && <span className="text-[10px] text-ok/70"> (live cell sync)</span>}.
-              </>
+          {/* Tuning form: every value is editable; defaults come from cell/config */}
+          <div className="mb-3 bg-bg border border-border rounded p-2 space-y-2">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] uppercase tracking-wide text-muted">Tuning</span>
+              <span className="text-[10px] text-muted">
+                {freqSource === "live"   && <span className="text-ok/70">live cell</span>}
+                {freqSource === "hello"  && "last launch"}
+                {freqSource === "config" && "saved config"}
+                {freqSource === "none"   && <span className="text-warn">no source</span>}
+              </span>
+            </div>
+
+            {/* Center freq + span */}
+            <div className="grid grid-cols-2 gap-2">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-muted">Center freq (MHz)</span>
+                <input
+                  type="number" step="0.001" min="0"
+                  className="input !text-xs !py-1 !px-2 font-mono"
+                  placeholder={freq > 0 ? (freq / 1e6).toFixed(3) : "1845.000"}
+                  value={freqOverrideMhz}
+                  onChange={(e) => setFreqOverrideMhz(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-muted">Span / sample rate (MHz)</span>
+                <input
+                  type="number" step="0.01" min="0"
+                  className="input !text-xs !py-1 !px-2 font-mono"
+                  placeholder={sr > 0 ? (sr / 1e6).toFixed(2) : "23.04"}
+                  value={spanMhz}
+                  onChange={(e) => setSpanMhz(e.target.value)}
+                />
+              </label>
+            </div>
+
+            {/* Span presets */}
+            <div className="flex flex-wrap gap-1 items-center">
+              <span className="text-[10px] text-muted mr-1">Span presets:</span>
+              {[
+                { label: "1.4 MHz BW", mhz: "1.92" },
+                { label: "5 MHz BW",   mhz: "7.68" },
+                { label: "10 MHz BW",  mhz: "15.36" },
+                { label: "20 MHz BW",  mhz: "23.04" },
+                { label: "wide 40 MHz", mhz: "40" },
+                { label: "wide 56 MHz", mhz: "56" },
+              ].map((p) => (
+                <button
+                  key={p.mhz}
+                  className={`btn !px-1.5 !py-0.5 !text-[10px] ${spanMhz === p.mhz ? "btn-primary" : ""}`}
+                  onClick={() => setSpanMhz(p.mhz)}
+                  title={`Set sample rate to ${p.mhz} MHz`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Gain + advanced toggle */}
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-[10px] text-muted">RX gain (dB) — empty = tool default</span>
+                <input
+                  type="number" step="1" min="0" max="90"
+                  className="input !text-xs !py-1 !px-2 font-mono"
+                  placeholder="(midpoint)"
+                  value={gainDb}
+                  onChange={(e) => setGainDb(e.target.value)}
+                />
+              </label>
+              <div className="flex items-end">
+                <button
+                  className="btn !px-2 !py-1 !text-xs w-full"
+                  onClick={() => setShowAdvanced((v) => !v)}
+                  title="FFT size, averaging, antenna selection"
+                >
+                  {showAdvanced ? "▾ Hide advanced" : "▸ Show advanced"}
+                </button>
+              </div>
+            </div>
+
+            {showAdvanced && (
+              <div className="grid grid-cols-3 gap-2 pt-1">
+                <label className="flex flex-col gap-0.5">
+                  <span className="text-[10px] text-muted">FFT size</span>
+                  <select
+                    className="input !text-xs !py-1 !px-2 font-mono"
+                    value={fftSize}
+                    onChange={(e) => setFftSize(e.target.value)}
+                  >
+                    {["256","512","1024","2048","4096","8192"].map((v) => <option key={v}>{v}</option>)}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-0.5">
+                  <span className="text-[10px] text-muted">Averaging</span>
+                  <select
+                    className="input !text-xs !py-1 !px-2 font-mono"
+                    value={fftAverage}
+                    onChange={(e) => setFftAverage(e.target.value as any)}
+                  >
+                    <option value="">default</option>
+                    <option value="off">off</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-0.5">
+                  <span className="text-[10px] text-muted">Antenna</span>
+                  <input
+                    type="text"
+                    className="input !text-xs !py-1 !px-2 font-mono"
+                    placeholder="(default)"
+                    value={antenna}
+                    onChange={(e) => setAntenna(e.target.value)}
+                  />
+                </label>
+              </div>
+            )}
+
+            {launchFreqHz > 0 ? (
+              <div className="text-[11px] text-muted font-mono pt-1 border-t border-border/50">
+                Launching: <span className="text-slate-200">{(launchFreqHz / 1e6).toFixed(3)} MHz</span> @
+                <span className="text-slate-200"> {(launchSpanHz / 1e6).toFixed(2)} MS/s</span>
+                {gainDb && <>, gain <span className="text-slate-200">{gainDb} dB</span></>}
+              </div>
             ) : (
-              <span className="text-warn"> No DL freq known yet — set one in Config, or start a capture.</span>
+              <div className="text-[11px] text-warn pt-1 border-t border-border/50">
+                No center freq — enter one or set rf_freq in Config first.
+              </div>
             )}
           </div>
 
@@ -372,7 +522,7 @@ export function SpectrumButton() {
                 onClick={() => launch(t.cmd)}
                 disabled={launchDisabled}
                 title={
-                  !freq ? "DL freq required" :
+                  !launchFreqHz ? "Center freq required" :
                   chosenIsHeld ? "Selected USRP is held by the sniffer" :
                   `Launch ${t.cmd} with ${chosenSerial ? `serial=${chosenSerial}` : "no -a"}`
                 }

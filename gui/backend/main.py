@@ -390,8 +390,15 @@ async def spectrum_launch(body: dict[str, Any]) -> dict[str, Any]:
     device_args = body.get("device_args") or None
     if freq <= 0:
         raise HTTPException(400, "freq_hz required")
+    # Optional tuning knobs forwarded to the spectrum tool's argv. Each is
+    # passed through unchanged when set, omitted (tool default) when not.
+    extras = {
+        k: body.get(k)
+        for k in ("gain_db", "antenna", "fft_size", "fft_average", "update_rate")
+        if body.get(k) not in (None, "")
+    }
     try:
-        return await spectrum.launch(freq, sr, tool, device_args)
+        return await spectrum.launch(freq, sr, tool, device_args, extras)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except RuntimeError as e:
