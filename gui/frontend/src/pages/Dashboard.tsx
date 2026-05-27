@@ -35,9 +35,18 @@ export function Dashboard() {
       {/* row 2: metrics tiles */}
       <MetricsTiles />
 
-      {/* row 3: main grid — packets (large), waterfall (medium), RNTIs (side) */}
+      {/* row 3: main grid — packets (large), waterfall (medium), RNTIs (side).
+          NOTE: each panel is the grid item DIRECTLY, no wrapper div. A wrapper
+          div is `display: block` so its child (the panel) sizes to its
+          intrinsic content height, which means `flex-1` on inner scroll
+          containers has nothing to be flex-1 OF — the panel just grows
+          tall enough to fit every row and overflows the grid cell. Making
+          the panel the grid item itself fixes this: grid items default to
+          `align-self: stretch`, so the panel inherits the grid row's height
+          and its inner `flex-col + flex-1 + min-h-0` chain finally has a
+          bounded container to lay out against. */}
       <div className="grid gap-3 flex-1 min-h-0" style={{ gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr) 340px" }}>
-        <div className="min-h-0"><PacketFeed /></div>
+        <PacketFeed />
 
         <div className="panel p-3 flex flex-col min-h-0">
           <div className="flex items-center gap-2 mb-2 flex-wrap">
@@ -66,7 +75,7 @@ export function Dashboard() {
           </div>
         </div>
 
-        <div className="min-h-0"><RNTITable /></div>
+        <RNTITable />
       </div>
 
       {/* row 4: tabbed footer */}
