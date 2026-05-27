@@ -804,6 +804,20 @@ Wireshark says "Capture file appears truncated"
     The zstd-compressed session recordings need streaming decompress
     (zstandard.ZstdDecompressor().stream_reader(f), not .decompress(bytes)).
 
+Wireshark opens, then dies with "Couldn't run /usr/bin/dumpcap in child
+process: Permission denied"
+  → On Debian/Ubuntu, /usr/bin/dumpcap is mode 0754 owner root group
+    `wireshark`. Non-wireshark-group users can't exec it. Fix:
+        sudo usermod -aG wireshark $USER
+        # log out + back in (groups only update on a fresh login)
+        # restart the GUI backend so it inherits the new group
+    or equivalently:
+        sudo dpkg-reconfigure wireshark-common
+        # answer YES to "Should non-superusers be able to capture packets?"
+    The /api/wireshark/open endpoint now pre-checks `os.access(dumpcap,
+    X_OK)` and 403s with this exact message before spawning Wireshark,
+    so the GUI surfaces the fix instead of failing silently in a dialog.
+
 ------------------------------------------------------------------------------
 19. CODE-ONLY FEATURES (LTESniffer C++ side, not surfaced in GUI)
 ------------------------------------------------------------------------------

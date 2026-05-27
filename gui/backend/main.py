@@ -579,6 +579,23 @@ async def open_wireshark() -> dict[str, Any]:
         )
     if not shutil.which("wireshark"):
         raise HTTPException(404, "wireshark not on PATH. Install with: sudo apt install wireshark")
+    # dumpcap is what Wireshark spawns under the hood to read from interfaces
+    # (incl. FIFOs). On Debian/Ubuntu it's mode 0754 group=wireshark, so the
+    # invoking user must be in the wireshark group OR dumpcap must have the
+    # right caps + be world-executable. Detect this up-front and surface a
+    # clear fix — otherwise Wireshark opens, fails internally, and the user
+    # just sees a cryptic GUI dialog ("Couldn't run /usr/bin/dumpcap in
+    # child process: Permission denied").
+    dumpcap = shutil.which("dumpcap") or "/usr/bin/dumpcap"
+    if os.path.exists(dumpcap) and not os.access(dumpcap, os.X_OK):
+        raise HTTPException(
+            403,
+            f"dumpcap ({dumpcap}) is not executable by the backend user. "
+            "Wireshark would die inside with 'Couldn't run dumpcap'. Fix:\n\n"
+            "  sudo usermod -aG wireshark $USER\n"
+            "  # then log out + back in, and restart the GUI backend\n\n"
+            "Or run:  sudo dpkg-reconfigure wireshark-common  (answer YES)."
+        )
     disp = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
     if not disp:
         raise HTTPException(
