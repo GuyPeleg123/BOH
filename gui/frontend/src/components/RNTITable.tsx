@@ -93,7 +93,7 @@ export function RNTITable() {
           show only active (last {ACTIVE_WINDOW_S}s)
         </label>
       </div>
-      <div className="overflow-auto min-h-0">
+      <div className="flex-1 overflow-auto min-h-0">
         <table className="w-full text-sm font-mono tabular-nums">
           <thead className="sticky top-0 bg-panel z-10">
             <tr className="border-b border-border">
