@@ -146,7 +146,10 @@ export function SpectrumButton() {
     : "none";
 
   // Serials the sniffer is likely holding (from saved rfargs in lifecycle argv).
+  // Only meaningful while the sniffer is actually running — once it stops,
+  // every USRP is free, regardless of what argv the previous run used.
   const heldSerials = useMemo(() => {
+    if (state.lifecycle !== "running") return new Set<string>();
     const argv = state.argv ?? [];
     const out = new Set<string>();
     for (let i = 0; i < argv.length - 1; i++) {
@@ -156,7 +159,7 @@ export function SpectrumButton() {
       }
     }
     return out;
-  }, [state.argv]);
+  }, [state.argv, state.lifecycle]);
 
   // Default the picker to a USRP not currently held by the sniffer (if any free).
   useEffect(() => {

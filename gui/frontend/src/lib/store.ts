@@ -111,11 +111,17 @@ function reduce(s: AppState, a: Action): AppState {
     case "reset":
       return { ...initial, connected: s.connected, mock: s.mock };
     case "runtime":
+      // When the backend reports running=false we mirror that into the store
+      // — and we MUST also clear argv/pid so derived state (e.g. the spectrum
+      // button's "held USRPs" set) doesn't keep treating the last-started
+      // serials as still in use.
       return {
         ...s,
-        lifecycle: a.state.running ? "running" : s.lifecycle,
-        pid: a.state.pid ?? s.pid,
-        argv: a.state.argv && a.state.argv.length ? a.state.argv : s.argv,
+        lifecycle: a.state.running ? "running" : "stopped",
+        pid: a.state.running ? (a.state.pid ?? s.pid) : null,
+        argv: a.state.running
+          ? (a.state.argv && a.state.argv.length ? a.state.argv : s.argv)
+          : [],
       };
     case "events":
       return applyEvents(s, a.evs);
@@ -278,6 +284,9 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
         } else {
           lifecycle = "stopped";
           pid = null;
+          // Clear argv so any derived "USRP held by sniffer" / "spectrum
+          // disabled" state stops being sticky after a stop.
+          argv = [];
           logs = logs === s.logs ? logs.slice() : logs;
           logs.push({ ts: monotonic, level: "info", msg: `process exited (code=${ev.exit_code ?? "?"})` });
           if (logs.length > LOG_HISTORY) logs.splice(0, logs.length - LOG_HISTORY);
