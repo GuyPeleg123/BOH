@@ -261,6 +261,10 @@ void SubframeWorker::work()
       stats += dciSearch.getStats();
       common.addStats(dciSearch.getStats());
       subframeInfo.getSubframePower().computePower(enb_ul.sf_symbols);
+      // Decode DL PDSCH first (all C-RNTIs, SIB, RAR → writes DL MAC PDUs to PCAP).
+      // run_ul_mode handles UL PUSCH + the DL subset needed for UL config learning
+      // (SIB2, RRC Connection Setup); the two passes are independent.
+      run_dl_mode(subframeInfo);
       run_ul_mode(subframeInfo, tti);
     }
     break;
