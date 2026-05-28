@@ -12,8 +12,8 @@ const SECTIONS: Section[] = [
   {
     title: "RF / hardware",
     fields: [
-      { key: "rf_freq",       label: "DL frequency (Hz)", flag: "-f", widget: "freq" },
-      { key: "ul_freq",       label: "UL frequency (Hz)", flag: "-u", widget: "freq" },
+      { key: "rf_freq",       label: "DL frequency (MHz)", flag: "-f", widget: "freq" },
+      { key: "ul_freq",       label: "UL frequency (MHz)", flag: "-u", widget: "freq" },
       { key: "rf_gain",       label: "RX gain (dB, -1 = AGC)", flag: "-g" },
       { key: "rf_nof_rx_ant", label: "RX antennas", flag: "-A" },
       { key: "rf_args",       label: "rfargs (single-USRP)", flag: "-a", widget: "text" },
