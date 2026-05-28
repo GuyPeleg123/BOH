@@ -186,7 +186,8 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 							  uint32_t cur_rnti,
 							  std::string table,
 							  std::string RNTI_name,
-							  uint32_t tti)
+							  uint32_t tti,
+							  bool write_pcap_en)
 {
 	int ret = 0;
 	mimo_ret = dl_sniffer_config_mimo(&falcon_ue_dl->q->cell, cur_format, cur_ran_dci_dl, cur_grant);
@@ -224,7 +225,10 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 			if (pdsch_res[tb].crc)
 			{
 				int result_length = pdsch_cfg->grant.tb[tb].tbs / 8;
-				write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
+				// In DUAL_MODE, decode_dl_mode() already wrote this PDU; the
+				// caller suppresses re-writing here to avoid PCAP duplicates.
+				if (write_pcap_en)
+					write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
 
 				if (key_store)
 					key_store->process_dl_mac_pdu((uint16_t)cur_rnti,
@@ -316,7 +320,7 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 	}
 }
 
-int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result)
+int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result, bool write_pcap_en)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
 	for (auto decoding_mem : (*ran_dl_collection))
@@ -343,7 +347,7 @@ int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_resu
 
 			/*try only 64QAM table*/
 			DL_Sniffer_rar_result result;
-			int ret = run_rar_decode(cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, result);
+			int ret = run_rar_decode(cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, result, write_pcap_en);
 			if (ret == SRSRAN_SUCCESS)
 			{
 				rar_result->push_back(std::move(result));
@@ -392,7 +396,7 @@ int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_resu
 				int mimo_ret = SRSRAN_SUCCESS;
 				bool unknown_mcs;
 				/*Only uses 64QAM MCS table*/
-				int ret = run_decode(mimo_ret, cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, "64QAM table", RNTI_name, tti);
+				int ret = run_decode(mimo_ret, cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, "64QAM table", RNTI_name, tti, write_pcap_en);
 				if (ret == UL_SNIFFER_FOUND_CON_SET)
 				{
 					found_con_ret = true;
@@ -631,7 +635,8 @@ int PDSCH_Decoder::run_rar_decode(srsran_dci_format_t cur_format,
 								  srsran_dci_dl_t *cur_ran_dci_dl,
 								  srsran_pdsch_grant_t *cur_grant,
 								  uint32_t cur_rnti,
-								  DL_Sniffer_rar_result &result)
+								  DL_Sniffer_rar_result &result,
+								  bool write_pcap_en)
 {
 	// std::cout << "Runing table: " << table << std::endl;
 	std::string RNTI_name = "RA_RNTI";
@@ -672,7 +677,10 @@ int PDSCH_Decoder::run_rar_decode(srsran_dci_format_t cur_format,
 			if (pdsch_res[tb].crc)
 			{
 				int result_length = pdsch_cfg->grant.tb[tb].tbs / 8;
-				write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
+				// In DUAL_MODE, decode_dl_mode() already wrote this RAR PDU;
+				// the caller suppresses re-writing here to avoid duplicates.
+				if (write_pcap_en)
+					write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
 
 				/*Unpack PDSCH msg to receive rar*/
 				std::time_t epoch = std::time(nullptr);

@@ -101,15 +101,16 @@ public:
                     srsran_dci_dl_t *cur_ran_dci_dl,
                     srsran_pdsch_grant_t *cur_grant,
                     uint32_t cur_rnti,
-                    std::string table, 
+                    std::string table,
                     std::string rnti_name,
-                    uint32_t tti);
+                    uint32_t tti,
+                    bool write_pcap_en = true);
     int decode_SIB();
     int decode_dl_mode();
 
     int decode_mac_ce(uint32_t rnti);
 
-    int decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result);
+    int decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result, bool write_pcap_en = true);
     
     asn1::rrc::sib_type2_s* getSIB2(){ return &sib2; }
 
@@ -120,7 +121,8 @@ public:
                         srsran_dci_dl_t *cur_ran_dci_dl,
                         srsran_pdsch_grant_t *cur_grant,
                         uint32_t cur_rnti,
-                        DL_Sniffer_rar_result &result);
+                        DL_Sniffer_rar_result &result,
+                        bool write_pcap_en = true);
     int decode_rar(DL_Sniffer_rar_result &result);
     int unpack_rar_response_ul_mode(uint8_t *payload, int length, DL_Sniffer_rar_result &result);
 

@@ -381,7 +381,11 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
 
       /*Create a vector to contain RAR decoding result*/
       std::vector<DL_Sniffer_rar_result> rar_result;
-      int ret = pdschdecoder->decode_ul_mode(ulsche->get_rnti(), &rar_result);
+      // In DUAL_MODE, run_dl_mode() already wrote every DL PDU to PCAP; the UL
+      // pass re-uses decode_ul_mode only for UL grant extraction (RAR) and
+      // RRC Connection Setup config learning, so suppress its PCAP writes.
+      bool ul_mode_write_pcap = (sniffer_mode != DUAL_MODE);
+      int ret = pdschdecoder->decode_ul_mode(ulsche->get_rnti(), &rar_result, ul_mode_write_pcap);
 
       /*Get Uplink and Downlink dci and grant lists*/
       std::vector<DCI_UL> dci_ul = subframeInfo.getDCICollection().getULSnifferDCI_UL();            // get UL DCI0 list
