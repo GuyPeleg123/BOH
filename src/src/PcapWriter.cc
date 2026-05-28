@@ -104,6 +104,12 @@ void LTESniffer_pcap_writer::open(const std::string filename, const std::string 
 
   pcap_file       = DLT_PCAP_Open(MAC_LTE_DLT, first_name.c_str());
   pcap_file_api   = DLT_PCAP_Open(MAC_LTE_DLT, api_filename.c_str());
+  // Flush the global PCAP headers immediately so the files are non-zero on
+  // disk from the very first moment — without this, stdio buffering keeps
+  // the 24-byte header in userspace memory until the buffer fills (8 KB) or
+  // fclose() is called, making the files appear empty while sniffing.
+  if (pcap_file)     std::fflush(pcap_file);
+  if (pcap_file_api) std::fflush(pcap_file_api);
   this->ue_id     = ue_id;
   enable_write    = true;
   bytes_written_  = 0;
@@ -191,6 +197,11 @@ void LTESniffer_pcap_writer::close()
 {
   fprintf(stdout, "Saving MAC PCAP file\n");
   DLT_PCAP_Close(pcap_file);
+  // api_collector.pcap was never closed — its stdio buffer was silently
+  // discarded on process exit.  Close it explicitly here.
+  DLT_PCAP_Close(pcap_file_api);
+  pcap_file     = nullptr;
+  pcap_file_api = nullptr;
   if (pcap_stream_file_) {
     std::fclose(pcap_stream_file_);
     pcap_stream_file_ = nullptr;
@@ -225,6 +236,11 @@ void LTESniffer_pcap_writer::pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes
       rotate_if_needed_locked();
       LTE_PCAP_MAC_WritePDU(pcap_file, &context, pdu, pdu_len_bytes);
       bytes_written_ += pdu_len_bytes + 64;  // ~header overhead estimate
+      // Flush every 64 PDUs so data reaches disk during an active capture
+      // even if the process is later killed before fclose() runs.
+      if ((bytes_written_ & 63) == 0 && pcap_file) {
+        std::fflush(pcap_file);
+      }
       // Mirror to live-stream FIFO if open. Same writer, different FILE*.
       // If the reader's gone away we'll get EPIPE/EBADF — close + null out
       // so subsequent writes are no-ops.
