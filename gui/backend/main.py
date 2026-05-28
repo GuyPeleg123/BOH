@@ -22,7 +22,7 @@ from config import SnifferConfig
 from sniffer import SnifferRunner
 import sniffer as sniffer_mod
 from mock import MockRunner
-from usrp import find_devices, auto_config_patch
+from usrp import find_devices, auto_config_patch, probe_all_gpsdo
 from spectrum import SpectrumLauncher
 import captures as captures_mod
 import keys as keys_mod
@@ -345,6 +345,35 @@ async def usrps_autoconfig() -> dict[str, Any]:
     (not SnifferConfig fields) and should not be written to the config.
     """
     return await auto_config_patch()
+
+
+@app.get("/api/usrps/gpsdo")
+async def probe_usrps_gpsdo() -> dict[str, Any]:
+    """Probe all connected USRPs for GPSDO presence via uhd_usrp_probe.
+
+    Slow endpoint (~3-8 s per device, run concurrently).  The frontend calls
+    this in the background after auto-config and uses the result to
+    conditionally add clock=gpsdo to usrp_a_args / usrp_b_args.
+    """
+    devices = await find_devices()
+    if not devices:
+        return {"devices": [], "message": "No USRPs detected."}
+    probed = await probe_all_gpsdo(devices)
+    with_gpsdo = [d["serial"] for d in probed if d.get("gpsdo") and d.get("serial")]
+    without_gpsdo = [d["serial"] for d in probed if not d.get("gpsdo") and d.get("serial")]
+    if not without_gpsdo:
+        msg = f"GPSDO detected on all {len(probed)} device(s) — clock=gpsdo applied."
+    elif not with_gpsdo:
+        msg = (
+            f"No GPSDO detected on any device ({', '.join(without_gpsdo)}). "
+            "Dual mode may have sync issues without a shared clock reference."
+        )
+    else:
+        msg = (
+            f"GPSDO found on {', '.join(with_gpsdo)}; "
+            f"NOT found on {', '.join(without_gpsdo)}."
+        )
+    return {"devices": probed, "message": msg}
 
 
 @app.get("/api/keys")

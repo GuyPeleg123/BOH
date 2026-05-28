@@ -50,6 +50,52 @@ async def find_devices(timeout: float = 5.0) -> list[dict[str, Any]]:
     return devices
 
 
+async def probe_gpsdo(serial: str, timeout: float = 8.0) -> bool:
+    """Return True if the device reports 'gpsdo' in its Clock sources line.
+
+    Uses uhd_usrp_probe which takes 3-8 seconds per device; run concurrently
+    for multiple devices via probe_all_gpsdo().
+    """
+    if not shutil.which("uhd_usrp_probe") or not serial:
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "uhd_usrp_probe", "--args", f"serial={serial}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+    except FileNotFoundError:
+        return False
+
+    for line in stdout.decode(errors="replace").splitlines():
+        if "Clock sources:" in line and "gpsdo" in line.lower():
+            return True
+    return False
+
+
+async def probe_all_gpsdo(
+    devices: list[dict[str, Any]], timeout: float = 8.0
+) -> list[dict[str, Any]]:
+    """Probe GPSDO presence on all devices concurrently.
+
+    Returns a copy of each device dict with an added 'gpsdo' bool field.
+    """
+    results = await asyncio.gather(
+        *(probe_gpsdo(d.get("serial", ""), timeout) for d in devices),
+        return_exceptions=True,
+    )
+    return [
+        {**d, "gpsdo": bool(r) if not isinstance(r, Exception) else False}
+        for d, r in zip(devices, results)
+    ]
+
+
 def suggest_rf_args(device: dict[str, Any]) -> str:
     """Build a sensible rf_args string for a single device.
 
@@ -57,29 +103,33 @@ def suggest_rf_args(device: dict[str, Any]) -> str:
     already appends those to whatever rf_args the user passes, so including
     them here would cause duplication and confuse UHD's device-address parser.
 
-    For B200/B210 family the internal clock is fine for DL-only mode.
-    The serial is included so that if a second USRP is later connected the
-    correct one is still selected.
+    We explicitly set type=b200 for B200/B210 family devices.  Without it,
+    srsRAN will fall back to the 'soapy' backend (which opens the PC's audio
+    card) whenever UHD takes a moment to re-enumerate after a USB reset,
+    producing completely wrong samples.
     """
-    if device.get("serial"):
-        return f"serial={device['serial']}"
-    return ""
-
-
-def suggest_dual_args(device: dict[str, Any], require_gpsdo: bool = True) -> str:
-    """Build rfargs for a device used in dual-USRP (UL/DUAL) mode.
-
-    Dual mode requires hardware time synchronisation — GPSDO is the standard
-    way to achieve this on a B210 pair.
-
-    NOTE: do NOT add num_recv_frames / recv_frame_size — see suggest_rf_args.
-    """
-    parts = []
-    if require_gpsdo:
-        parts.append("clock=gpsdo")
+    parts: list[str] = []
+    dev_type = device.get("type", "")
+    if dev_type in ("b200", "b210", "b200mini", "b205mini"):
+        parts.append("type=b200")
     if device.get("serial"):
         parts.append(f"serial={device['serial']}")
-    return ",".join(parts)
+    return ",".join(parts) if parts else ""
+
+
+def suggest_dual_args(device: dict[str, Any]) -> str:
+    """Build rfargs for a device used in dual-USRP (UL/DUAL) mode.
+
+    Does NOT include clock=gpsdo — that is added conditionally by the frontend
+    after probing GPSDO presence via probe_all_gpsdo() / uhd_usrp_probe.
+    """
+    parts: list[str] = []
+    dev_type = device.get("type", "")
+    if dev_type in ("b200", "b210", "b200mini", "b205mini"):
+        parts.append("type=b200")
+    if device.get("serial"):
+        parts.append(f"serial={device['serial']}")
+    return ",".join(parts) if parts else ""
 
 
 async def auto_config_patch(timeout: float = 5.0) -> dict[str, Any]:
@@ -87,11 +137,12 @@ async def auto_config_patch(timeout: float = 5.0) -> dict[str, Any]:
 
     Rules:
     • 0 USRPs detected  → empty patch (user must configure manually)
-    • 1 USRP detected   → set rf_args to serial=<serial>,...  (DL-only)
-    • 2+ USRPs detected → set usrp_a_args (first) and usrp_b_args (second)
-                          with clock=gpsdo for dual-mode use
+    • 1 USRP detected   → rf_args=serial=<X>, clear dual fields, mode=0 (DL)
+    • 2+ USRPs detected → usrp_a_args + usrp_b_args, clear rf_args, mode=2 (DUAL)
 
-    The caller can merge this patch into the current config.
+    clock=gpsdo is NOT included here — call probe_all_gpsdo() separately so
+    this endpoint stays fast (<1s).  The caller (frontend) applies GPSDO
+    results once the background probe completes.
     """
     devices = await find_devices(timeout)
     patch: dict[str, Any] = {"_detected_devices": devices}
@@ -102,21 +153,24 @@ async def auto_config_patch(timeout: float = 5.0) -> dict[str, Any]:
 
     if len(devices) == 1:
         patch["rf_args"] = suggest_rf_args(devices[0])
+        patch["usrp_a_args"] = ""
+        patch["usrp_b_args"] = ""
+        patch["sniffer_mode"] = 0
         patch["_message"] = (
-            f"1 USRP detected ({devices[0].get('product','USRP')} "
-            f"serial={devices[0].get('serial','?')}). "
-            "DL-only mode is supported. UL/DUAL requires a second USRP."
+            f"1 USRP detected ({devices[0].get('product', 'USRP')} "
+            f"serial={devices[0].get('serial', '?')}). "
+            "Configured for DL-only mode."
         )
     else:
-        # Two or more: assign first to A (DL), second to B (UL)
-        patch["rf_args"] = ""          # clear single-USRP field
+        patch["rf_args"] = ""
         patch["usrp_a_args"] = suggest_dual_args(devices[0])
         patch["usrp_b_args"] = suggest_dual_args(devices[1])
+        patch["sniffer_mode"] = 2
         patch["_message"] = (
             f"{len(devices)} USRPs detected. "
-            f"A={devices[0].get('serial','?')} (DL), "
-            f"B={devices[1].get('serial','?')} (UL). "
-            "usrp_a_args / usrp_b_args have been pre-filled with clock=gpsdo."
+            f"A={devices[0].get('serial', '?')} (DL), "
+            f"B={devices[1].get('serial', '?')} (UL). "
+            "Configured for dual mode. Probing GPSDO in background…"
         )
 
     return patch

@@ -50,7 +50,11 @@ class SnifferConfig(BaseModel):
     en_debug: bool = Field(False, description="-d")
 
     # --- Output files ---
-    pcap_file: str = Field("ul_sniffer.pcap", description="-F")
+    # NOTE: LTESniffer_Core.cc always uses hardcoded filenames regardless of -F
+    # (ltesniffer_dl_mode.pcap / ltesniffer_dual_mode.pcap / ltesniffer_ul_mode.pcap
+    # + api_collector.pcap).  The -F flag sets args.pcap_file which is never read
+    # back by the Core.  We do NOT pass -F to avoid confusion; captures are
+    # separated by per-run timestamped subdirectory (see sniffer.py).
     dci_file_name: str = Field("", description="-D (empty = stdout)")
     stats_file_name: str = Field("", description="-E")
     keys_file: str = Field("", description="-K")
@@ -134,8 +138,6 @@ class SnifferConfig(BaseModel):
         if self.en_debug:
             argv.append("-d")
 
-        if self.pcap_file:
-            argv += ["-F", self.pcap_file]
         if self.dci_file_name:
             argv += ["-D", self.dci_file_name]
         if self.stats_file_name:

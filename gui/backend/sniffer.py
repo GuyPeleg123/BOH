@@ -14,6 +14,7 @@ import signal
 import tempfile
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
@@ -111,6 +112,7 @@ class SnifferRunner:
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._wait_task: Optional[asyncio.Task] = None  # tracked so we can cancel on restart
+        self._run_dir: Optional[Path] = None            # timestamped subdir for this run's pcaps
         self._subscribers: set[asyncio.Queue] = set()
         self._last_events: deque[dict[str, Any]] = deque(maxlen=500)
         self._dropped_for_slow_consumer = 0
@@ -125,6 +127,7 @@ class SnifferRunner:
             "exit_code": None,
             "last_error": None,
             "argv": [],
+            "run_dir": None,
         }
 
     # ------------------------------------------------------------------ pubsub
@@ -221,8 +224,15 @@ class SnifferRunner:
         argv = cfg.to_argv(str(self._fifo_path))
         argv[argv.index(cfg.binary_path)] = str(binary)
 
+        # Each run gets its own timestamped subdirectory so captures never
+        # overwrite each other.  LTESniffer always uses hardcoded filenames
+        # (ltesniffer_dl_mode.pcap, api_collector.pcap, …) relative to CWD,
+        # so isolating CWD per-run is the cleanest way to separate captures.
         captures_dir = Path(cfg.captures_dir).expanduser()
-        captures_dir.mkdir(parents=True, exist_ok=True)
+        run_tag = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run_dir = captures_dir / run_tag
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self._run_dir = run_dir
 
         # If the user opted into the live pcap-stream FIFO, ensure it exists
         # as an actual FIFO. The C++ side opens it O_WRONLY|O_NONBLOCK, which
@@ -242,6 +252,7 @@ class SnifferRunner:
             exit_code=None,
             last_error=None,
             argv=list(argv),
+            run_dir=str(run_dir),
         )
 
         # Reader task must be running before child opens FIFO for write
@@ -252,10 +263,16 @@ class SnifferRunner:
             *argv,
             stdout=asyncio.subprocess.DEVNULL,   # we don't read it, and PIPE would fill at ~64KB and wedge LTESniffer
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(captures_dir),
+            cwd=str(run_dir),
         )
         self._state["pid"] = self._proc.pid
-        self._broadcast({"t": "lifecycle", "event": "started", "pid": self._proc.pid, "argv": argv})
+        self._broadcast({
+            "t": "lifecycle",
+            "event": "started",
+            "pid": self._proc.pid,
+            "argv": argv,
+            "run_dir": str(run_dir),
+        })
 
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._wait_task = asyncio.create_task(self._wait_exit())
@@ -325,7 +342,12 @@ class SnifferRunner:
         rc = await self._proc.wait()
         self._state["running"] = False
         self._state["exit_code"] = rc
-        self._broadcast({"t": "lifecycle", "event": "exited", "exit_code": rc})
+        self._broadcast({
+            "t": "lifecycle",
+            "event": "exited",
+            "exit_code": rc,
+            "run_dir": str(self._run_dir) if self._run_dir else None,
+        })
         if self._reader_task:
             self._reader_task.cancel()
         if self._stderr_task:

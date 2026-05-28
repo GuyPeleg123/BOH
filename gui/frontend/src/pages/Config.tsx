@@ -1,11 +1,47 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { useStore } from "../lib/store";
 import type { SnifferConfig, USRPDevice } from "../lib/types";
+
+// Fields that auto-detect is allowed to overwrite
+const HARDWARE_KEYS = new Set(["sniffer_mode", "rf_args", "usrp_a_args", "usrp_b_args"]);
+
+// LTE FDD band table for UL freq suggestion
+const LTE_FDD_BANDS: { band: number; dl_low: number; dl_high: number; offset_mhz: number }[] = [
+  { band: 1,  dl_low: 2110, dl_high: 2170, offset_mhz: -190 },
+  { band: 2,  dl_low: 1930, dl_high: 1990, offset_mhz: -80  },
+  { band: 3,  dl_low: 1805, dl_high: 1880, offset_mhz: -95  },
+  { band: 4,  dl_low: 2110, dl_high: 2155, offset_mhz: -400 },
+  { band: 5,  dl_low: 869,  dl_high: 894,  offset_mhz: -45  },
+  { band: 7,  dl_low: 2620, dl_high: 2690, offset_mhz: -120 },
+  { band: 8,  dl_low: 935,  dl_high: 960,  offset_mhz: -45  },
+  { band: 12, dl_low: 729,  dl_high: 746,  offset_mhz: -30  },
+  { band: 13, dl_low: 746,  dl_high: 756,  offset_mhz: 31   },
+  { band: 17, dl_low: 734,  dl_high: 746,  offset_mhz: -30  },
+  { band: 20, dl_low: 791,  dl_high: 821,  offset_mhz: 41   },
+  { band: 25, dl_low: 1930, dl_high: 1995, offset_mhz: -80  },
+  { band: 26, dl_low: 859,  dl_high: 894,  offset_mhz: -45  },
+  { band: 28, dl_low: 758,  dl_high: 803,  offset_mhz: -55  },
+  { band: 30, dl_low: 2350, dl_high: 2360, offset_mhz: -45  },
+  { band: 66, dl_low: 2110, dl_high: 2200, offset_mhz: -400 },
+];
+
+function suggestUlFreq(dl_hz: number): { band: number; ul_mhz: number } | null {
+  const dl_mhz = dl_hz / 1e6;
+  for (const b of LTE_FDD_BANDS) {
+    if (dl_mhz >= b.dl_low && dl_mhz <= b.dl_high) {
+      return { band: b.band, ul_mhz: Math.round((dl_mhz + b.offset_mhz) * 10) / 10 };
+    }
+  }
+  return null;
+}
+
+type SelectOption = { value: number | string; label: string; requiresUsrps?: number };
 
 type Section = {
   title: string;
   fields: { key: keyof SnifferConfig; label: string; hint?: string; flag: string; widget?: "freq" | "select" | "text" }[];
-  selectOptions?: Partial<Record<keyof SnifferConfig, { value: number | string; label: string }[]>>;
+  selectOptions?: Partial<Record<keyof SnifferConfig, SelectOption[]>>;
 };
 
 const SECTIONS: Section[] = [
@@ -38,8 +74,8 @@ const SECTIONS: Section[] = [
     selectOptions: {
       sniffer_mode: [
         { value: 0, label: "0 — DL only" },
-        { value: 1, label: "1 — UL only" },
-        { value: 2, label: "2 — Dual (2 USRPs)" },
+        { value: 1, label: "1 — UL only",        requiresUsrps: 2 },
+        { value: 2, label: "2 — Dual (2 USRPs)", requiresUsrps: 2 },
       ],
       api_mode: [
         { value: -1, label: "-1 — disabled" },
@@ -86,20 +122,173 @@ const SECTIONS: Section[] = [
 ];
 
 export function ConfigPage() {
+  const lifecycle = useStore((s) => s.lifecycle);
+  const lifecycleRef = useRef(lifecycle);
+  useEffect(() => { lifecycleRef.current = lifecycle; }, [lifecycle]);
+
   const [cfg, setCfg] = useState<SnifferConfig | null>(null);
   const [usrps, setUsrps] = useState<USRPDevice[]>([]);
   const [knownCells, setKnownCells] = useState<import("../lib/types").KnownCell[]>([]);
   const [knownCellsPath, setKnownCellsPath] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [autoMsg, setAutoMsg] = useState<string | null>(null);
+  const [gpsdoMsg, setGpsdoMsg] = useState<string | null>(null);
+  const [pollMsg, setPollMsg] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  const prevCountRef = useRef<number>(-1);
+  const autoMsgTimerRef = useRef<number | null>(null);
+  const gpsdoMsgTimerRef = useRef<number | null>(null);
+
+  // --- helpers ---
+
+  function showAutoMsg(msg: string, ttl = 8000) {
+    setAutoMsg(msg);
+    if (autoMsgTimerRef.current) window.clearTimeout(autoMsgTimerRef.current);
+    autoMsgTimerRef.current = window.setTimeout(() => setAutoMsg(null), ttl);
+  }
+
+  function showGpsdoMsg(msg: string, ttl = 10000) {
+    setGpsdoMsg(msg);
+    if (gpsdoMsgTimerRef.current) window.clearTimeout(gpsdoMsgTimerRef.current);
+    gpsdoMsgTimerRef.current = window.setTimeout(() => setGpsdoMsg(null), ttl);
+  }
+
+  function applyPatch(patch: Record<string, any>) {
+    const validKeys = Object.keys(patch).filter(
+      (k) => !k.startsWith("_") && HARDWARE_KEYS.has(k)
+    );
+    if (validKeys.length > 0) {
+      setCfg((c) =>
+        c ? { ...c, ...Object.fromEntries(validKeys.map((k) => [k, patch[k]])) } : c
+      );
+    }
+  }
+
+  function applyGpsdoResults(
+    devices: Array<{ serial?: string; gpsdo: boolean }>,
+    message: string
+  ) {
+    setCfg((c) => {
+      if (!c) return c;
+      let a = c.usrp_a_args;
+      let b = c.usrp_b_args;
+      for (const d of devices) {
+        if (!d.serial || !d.gpsdo) continue;
+        if (a.includes(d.serial) && !a.includes("clock=gpsdo")) {
+          a = "clock=gpsdo," + a;
+        }
+        if (b.includes(d.serial) && !b.includes("clock=gpsdo")) {
+          b = "clock=gpsdo," + b;
+        }
+      }
+      return { ...c, usrp_a_args: a, usrp_b_args: b };
+    });
+    showGpsdoMsg(message);
+  }
+
+  function fireGpsdoProbe() {
+    api.gpsdoProbe()
+      .then((r) => applyGpsdoResults(r.devices, r.message))
+      .catch(() => showGpsdoMsg("GPSDO probe failed — check that uhd_usrp_probe is installed."));
+  }
+
+  // Count how many USRPs the current config addresses (0, 1, or 2)
+  function configuredUsrpCount(c: SnifferConfig): number {
+    if (c.usrp_a_args && c.usrp_b_args) return 2;
+    if (c.rf_args || c.usrp_a_args || c.usrp_b_args) return 1;
+    return 0;
+  }
+
+  // --- mount: load config + usrps together, then smart auto-detect ---
   useEffect(() => {
-    api.getConfig().then(setCfg).catch((e) => setErr(e.message));
-    api.usrps().then((r) => setUsrps(r.devices)).catch(() => {});
-    api.getKnownCells().then((r) => { setKnownCells(r.cells); setKnownCellsPath(r.path); }).catch(() => {});
-  }, []);
+    api.getKnownCells()
+      .then((r) => { setKnownCells(r.cells); setKnownCellsPath(r.path); })
+      .catch(() => {});
+
+    // Load config and USRP list in parallel, then decide whether to auto-patch
+    Promise.all([api.getConfig(), api.usrps()])
+      .then(([config, usrpResult]) => {
+        setCfg(config);
+        setUsrps(usrpResult.devices);
+        prevCountRef.current = usrpResult.devices.length;
+
+        const detected = usrpResult.devices.length;
+        const configured = configuredUsrpCount(config);
+
+        if (detected === 0) {
+          showAutoMsg("No USRPs detected — check USB connection.");
+          return;
+        }
+
+        if (detected < configured && configured > 0) {
+          // Fewer USRPs than configured: warn but don't touch the form
+          showAutoMsg(
+            `${detected} USRP(s) detected but config expects ${configured}. Check USB connections — form not changed.`
+          );
+          return;
+        }
+
+        // detected >= configured (or nothing configured): apply auto-detect
+        api.get<Record<string, any>>("/api/usrps/autoconfig")
+          .then((patch) => {
+            const patchDetected: number = patch._detected_devices?.length ?? 0;
+            // Double-check: only apply if patch doesn't downgrade
+            if (patchDetected >= configured || configured === 0) {
+              applyPatch(patch);
+            }
+            showAutoMsg(patch._message ?? "Auto-detect complete.");
+            if (patchDetected >= 2) fireGpsdoProbe();
+          })
+          .catch(() => {});
+      })
+      .catch((e) => setErr(e.message));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- 5-second USRP poll ---
+  useEffect(() => {
+    const id = window.setInterval(async () => {
+      // Never call uhd_find_devices while the sniffer is running — it competes for USB
+      if (lifecycleRef.current === "running") return;
+
+      try {
+        const r = await api.usrps();
+        const newCount = r.devices.length;
+        const prevCount = prevCountRef.current;
+        setUsrps(r.devices);
+
+        if (prevCount === -1) { prevCountRef.current = newCount; return; }
+        if (newCount === prevCount) return;
+        prevCountRef.current = newCount;
+
+        if (newCount > prevCount) {
+          // More USRPs connected: apply auto-detect if it improves config
+          const patch = await api.get<Record<string, any>>("/api/usrps/autoconfig").catch(() => null);
+          if (patch) {
+            applyPatch(patch);
+            showAutoMsg(`Hardware changed: ${patch._message ?? `${newCount} USRP(s) detected — config updated.`}`);
+            if (newCount >= 2) fireGpsdoProbe();
+          }
+          setPollMsg(null);
+        } else {
+          // Fewer USRPs: auto-downgrade sniffer_mode if it requires more USRPs than available
+          if (newCount < 2) {
+            setCfg((c) =>
+              c && (c.sniffer_mode === 1 || c.sniffer_mode === 2)
+                ? { ...c, sniffer_mode: 0 }
+                : c
+            );
+          }
+          const modeNote = newCount < 2 ? " Switched to DL-only mode." : "";
+          setPollMsg(`⚠ USRP count dropped to ${newCount}.${modeNote} Check connections.`);
+        }
+      } catch {}
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // --- known cells helpers ---
 
   async function refreshKnownCells() {
     try {
@@ -154,18 +343,18 @@ export function ConfigPage() {
     }
   }
 
+  // --- manual auto-detect button (always applies, no downgrade guard) ---
   async function autoDetect() {
     setBusy(true);
     setErr(null);
     setAutoMsg(null);
+    setGpsdoMsg(null);
     try {
       const patch = await api.get<Record<string, any>>("/api/usrps/autoconfig");
-      // Apply non-metadata fields to the config
-      const validKeys = Object.keys(patch).filter((k) => !k.startsWith("_"));
-      if (validKeys.length > 0) {
-        setCfg((c) => c ? { ...c, ...Object.fromEntries(validKeys.map((k) => [k, patch[k]])) } : c);
-      }
-      setAutoMsg(patch._message ?? "Auto-detect complete.");
+      applyPatch(patch);
+      showAutoMsg(patch._message ?? "Auto-detect complete.", 10000);
+      const count: number = patch._detected_devices?.length ?? 0;
+      if (count >= 2) fireGpsdoProbe();
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     } finally {
@@ -211,12 +400,17 @@ export function ConfigPage() {
     }
   }
 
+  const needsUlFreq = (cfg.sniffer_mode === 1 || cfg.sniffer_mode === 2) && cfg.ul_freq === 0;
+  const ulSuggestion = needsUlFreq && cfg.rf_freq > 0 ? suggestUlFreq(cfg.rf_freq) : null;
+
   function field(s: Section, f: Section["fields"][number]) {
     const v = cfg![f.key] as any;
     const isBool = typeof v === "boolean";
     const isText = f.widget === "text";
     const isFreq = f.widget === "freq";
     const isSelect = f.widget === "select";
+    const isUlFreq = f.key === "ul_freq";
+
     return (
       <label key={f.key as string} className="block">
         <div className="flex justify-between items-baseline mb-1">
@@ -239,11 +433,19 @@ export function ConfigPage() {
             value={String(v)}
             onChange={(e) => up(f.key, (isNaN(+e.target.value) ? e.target.value : +e.target.value) as any)}
           >
-            {(s.selectOptions?.[f.key] ?? []).map((o) => (
-              <option key={String(o.value)} value={String(o.value)}>
-                {o.label}
-              </option>
-            ))}
+            {(s.selectOptions?.[f.key] ?? []).map((o) => {
+              const disabled = o.requiresUsrps != null && usrps.length < o.requiresUsrps;
+              return (
+                <option
+                  key={String(o.value)}
+                  value={String(o.value)}
+                  disabled={disabled}
+                  title={disabled ? `Requires ${o.requiresUsrps} USRPs (${usrps.length} detected)` : undefined}
+                >
+                  {o.label}{disabled ? " — requires 2 USRPs" : ""}
+                </option>
+              );
+            })}
           </select>
         ) : isText ? (
           <input
@@ -252,15 +454,31 @@ export function ConfigPage() {
             onChange={(e) => up(f.key, e.target.value as any)}
           />
         ) : isFreq ? (
-          <div className="flex gap-2 items-center">
-            <input
-              className="input font-mono"
-              type="number"
-              step="any"
-              value={(v as number) / 1e6 || ""}
-              onChange={(e) => up(f.key, ((+e.target.value || 0) * 1e6) as any)}
-            />
-            <span className="text-xs text-muted">MHz</span>
+          <div className="flex flex-col gap-1">
+            <div className="flex gap-2 items-center">
+              <input
+                className={`input font-mono${isUlFreq && needsUlFreq ? " border-bad" : ""}`}
+                type="number"
+                step="any"
+                value={(v as number) / 1e6 || ""}
+                onChange={(e) => up(f.key, ((+e.target.value || 0) * 1e6) as any)}
+              />
+              <span className="text-xs text-muted">MHz</span>
+            </div>
+            {isUlFreq && needsUlFreq && (
+              <div className="text-[11px] text-bad">
+                Required for UL/Dual mode.
+                {ulSuggestion && (
+                  <button
+                    type="button"
+                    className="ml-2 underline text-accent"
+                    onClick={() => up("ul_freq", ulSuggestion.ul_mhz * 1e6 as any)}
+                  >
+                    Use Band {ulSuggestion.band} suggestion: {ulSuggestion.ul_mhz} MHz
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         ) : (
           <input
@@ -278,10 +496,9 @@ export function ConfigPage() {
 
   return (
     <div className="p-4 max-w-6xl mx-auto h-full overflow-auto">
-      <div className="flex items-center mb-4 gap-3 flex-wrap">
+      <div className="flex items-center mb-2 gap-3 flex-wrap">
         <h1 className="text-lg font-semibold">Sniffer Configuration</h1>
         <div className="ml-auto flex items-center gap-2 flex-wrap">
-          {autoMsg && <span className="text-ok text-xs max-w-xs truncate" title={autoMsg}>{autoMsg}</span>}
           {saved && <span className="text-ok text-sm">{saved}</span>}
           {err && <span className="text-bad text-sm font-mono">{err}</span>}
           <button className="btn" disabled={busy} onClick={autoDetect} title="Detect connected USRPs and fill serial/rfargs automatically">
@@ -293,6 +510,27 @@ export function ConfigPage() {
           </button>
         </div>
       </div>
+
+      {/* Status banners — auto-dismiss after a few seconds */}
+      {(autoMsg || gpsdoMsg || pollMsg) && (
+        <div className="flex flex-col gap-1 mb-3">
+          {autoMsg && (
+            <div className={`text-xs px-3 py-1.5 rounded border ${autoMsg.includes("⚠") || autoMsg.includes("expects") ? "bg-warn/10 text-warn border-warn/20" : "bg-ok/10 text-ok border-ok/20"}`}>
+              🔍 {autoMsg}
+            </div>
+          )}
+          {gpsdoMsg && (
+            <div className={`text-xs px-3 py-1.5 rounded border ${gpsdoMsg.includes("NOT") || gpsdoMsg.includes("No GPSDO") || gpsdoMsg.includes("failed") ? "bg-warn/10 text-warn border-warn/20" : "bg-ok/10 text-ok border-ok/20"}`}>
+              📡 {gpsdoMsg}
+            </div>
+          )}
+          {pollMsg && (
+            <div className="text-xs px-3 py-1.5 rounded bg-warn/10 text-warn border border-warn/20">
+              ⚠ {pollMsg}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="panel p-4 mb-4">
         <div className="flex items-baseline justify-between mb-2 gap-3">
@@ -354,7 +592,12 @@ export function ConfigPage() {
 
       {usrps.length > 0 && (
         <div className="panel p-4 mb-4">
-          <div className="label mb-2">Detected USRPs</div>
+          <div className="label mb-2">
+            Detected USRPs
+            <span className={`ml-2 text-[10px] font-mono px-1.5 py-0.5 rounded ${usrps.length >= 2 ? "bg-ok/20 text-ok" : "bg-warn/20 text-warn"}`}>
+              {usrps.length} connected
+            </span>
+          </div>
           <div className="flex flex-wrap gap-2">
             {usrps.map((d, i) => (
               <button
@@ -371,6 +614,9 @@ export function ConfigPage() {
                 {d.product ?? d.type ?? "USRP"} · {d.serial ?? "?"}
               </button>
             ))}
+            {usrps.length < 2 && (
+              <span className="text-xs text-muted self-center">UL and Dual modes require 2 USRPs</span>
+            )}
           </div>
         </div>
       )}

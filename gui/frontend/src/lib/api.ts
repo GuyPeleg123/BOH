@@ -98,6 +98,8 @@ export const api = {
       body: cfg ? JSON.stringify(cfg) : "null",
     }),
   usrps: () => req<{ devices: USRPDevice[] }>("/api/usrps"),
+  gpsdoProbe: () =>
+    req<{ devices: Array<USRPDevice & { gpsdo: boolean }>; message: string }>("/api/usrps/gpsdo"),
   getKnownCells: () => req<KnownCellsResponse>("/api/known-cells"),
   loadKnownCell: (idx: number) =>
     req<{ ok: boolean; loaded: string; config: SnifferConfig }>(

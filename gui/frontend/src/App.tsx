@@ -11,7 +11,7 @@ export default function App() {
     <StoreProvider>
       <div className="flex flex-col h-screen">
         <StatusBar />
-        <main className="flex-1 min-h-0">
+        <main className="flex-1 min-h-0 overflow-hidden">
           <Routes>
             <Route path="/"       element={<Dashboard />} />
             <Route path="/config" element={<ConfigPage />} />
