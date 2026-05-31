@@ -76,6 +76,14 @@ private:
     size_t      bytes_written_ = 0;
     int         rotation_seq_ = 0;
     long long   file_opened_ms_ = 0; // monotonic ms since epoch
+    // Periodic-flush counters (in writes, not bytes). Previously the flush
+    // condition was `(bytes_written_ & 63) == 0`, which actually fires only
+    // when bytes_written_ happens to be a multiple of 64 — for irregular PDU
+    // sizes that's stochastic (~1/64 chance per write) and can be zero for an
+    // entire low-volume capture. Real counters make it deterministic.
+    uint32_t    writes_since_flush_      = 0;
+    uint32_t    writes_since_flush_api_  = 0;
+    static constexpr uint32_t FLUSH_EVERY_N_WRITES = 64;
     void rotate_if_needed_locked();
     std::string make_rotated_name(const std::string& base);
 

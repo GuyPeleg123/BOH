@@ -110,9 +110,11 @@ void LTESniffer_pcap_writer::open(const std::string filename, const std::string 
   // fclose() is called, making the files appear empty while sniffing.
   if (pcap_file)     std::fflush(pcap_file);
   if (pcap_file_api) std::fflush(pcap_file_api);
-  this->ue_id     = ue_id;
-  enable_write    = true;
-  bytes_written_  = 0;
+  this->ue_id              = ue_id;
+  enable_write             = true;
+  bytes_written_           = 0;
+  writes_since_flush_      = 0;
+  writes_since_flush_api_  = 0;
   file_opened_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
   if (rotate_bytes_ || rotate_minutes_) {
@@ -187,8 +189,9 @@ void LTESniffer_pcap_writer::rotate_if_needed_locked()
   DLT_PCAP_Close(pcap_file);
   std::string next = make_rotated_name(base_filename_);
   pcap_file = DLT_PCAP_Open(MAC_LTE_DLT, next.c_str());
-  bytes_written_ = 0;
-  file_opened_ms_ = now_ms;
+  bytes_written_      = 0;
+  writes_since_flush_ = 0;
+  file_opened_ms_     = now_ms;
   fprintf(stderr, "[PcapWriter] rotated -> %s (reason=%s)\n",
           next.c_str(), by_bytes ? "size" : "time");
 }
@@ -235,11 +238,15 @@ void LTESniffer_pcap_writer::pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes
     if (pdu) {
       rotate_if_needed_locked();
       LTE_PCAP_MAC_WritePDU(pcap_file, &context, pdu, pdu_len_bytes);
-      bytes_written_ += pdu_len_bytes + 64;  // ~header overhead estimate
-      // Flush every 64 PDUs so data reaches disk during an active capture
-      // even if the process is later killed before fclose() runs.
-      if ((bytes_written_ & 63) == 0 && pcap_file) {
+      bytes_written_ += pdu_len_bytes + 64;  // ~header overhead estimate (used by rotation)
+      // Flush every FLUSH_EVERY_N_WRITES PDUs so data reaches disk during an
+      // active capture even if the process is later killed before fclose()
+      // runs. This used to be `(bytes_written_ & 63) == 0`, which only fires
+      // when bytes_written_ is a multiple of 64 — a stochastic ~1/64 event,
+      // and effectively never for low-volume writers like UL PUSCH.
+      if (pcap_file && ++writes_since_flush_ >= FLUSH_EVERY_N_WRITES) {
         std::fflush(pcap_file);
+        writes_since_flush_ = 0;
       }
       // Mirror to live-stream FIFO if open. Same writer, different FILE*.
       // If the reader's gone away we'll get EPIPE/EBADF — close + null out
@@ -277,6 +284,12 @@ void LTESniffer_pcap_writer::pack_and_write_api(uint8_t* pdu, uint32_t pdu_len_b
 
     if (pdu) {
       LTE_PCAP_MAC_WritePDU(pcap_file_api, &context, pdu, pdu_len_bytes);
+      // Same periodic flush as the main pcap — without it, api_collector.pcap
+      // could silently lose every packet on SIGKILL.
+      if (pcap_file_api && ++writes_since_flush_api_ >= FLUSH_EVERY_N_WRITES) {
+        std::fflush(pcap_file_api);
+        writes_since_flush_api_ = 0;
+      }
     }
   }
   lock.unlock();
