@@ -122,34 +122,49 @@ void LTESniffer_pcap_writer::open(const std::string filename, const std::string 
             rotate_bytes_ / (1024*1024), rotate_minutes_, first_name.c_str());
   }
 
-  // Live-stream FIFO for Wireshark (opt-in via env). Open non-blocking so a
-  // missing/unread FIFO doesn't wedge the capture; ignore SIGPIPE in case
-  // Wireshark goes away mid-capture.
+  // Live-stream FIFO for Wireshark (opt-in via env). Ignore SIGPIPE in case
+  // Wireshark goes away mid-capture, then try an initial non-blocking open.
+  // If no reader is attached yet (user launches Wireshark *after* Start), the
+  // open fails with ENXIO — that's fine: the write path retries periodically,
+  // so frames start flowing the moment Wireshark attaches, with no restart.
   if (const char* stream_path = std::getenv("LTESNIFFER_PCAP_STREAM")) {
     ::signal(SIGPIPE, SIG_IGN);
-    int sfd = ::open(stream_path, O_WRONLY | O_NONBLOCK);
-    if (sfd >= 0) {
-      pcap_stream_file_ = ::fdopen(sfd, "wb");
-      if (pcap_stream_file_) {
-        // libpcap global header for MAC-LTE DLT (147).
-        struct {
-          uint32_t magic; uint16_t v_major, v_minor;
-          int32_t  thiszone; uint32_t sigfigs;
-          uint32_t snaplen; uint32_t linktype;
-        } hdr = { 0xa1b2c3d4, 2, 4, 0, 0, 65535, 147 };
-        std::fwrite(&hdr, sizeof(hdr), 1, pcap_stream_file_);
-        std::fflush(pcap_stream_file_);
-        fprintf(stderr, "[PcapWriter] live stream → %s (open in Wireshark with -k -i %s)\n",
-                stream_path, stream_path);
-      } else {
-        ::close(sfd);
-      }
-    } else {
+    pcap_stream_path_ = stream_path;
+    try_open_stream_locked();
+  }
+}
+
+// Open pcap_stream_path_ for writing (non-blocking) and emit the libpcap
+// global header. Called both at open() and, on a throttle, from the write
+// path so attaching Wireshark at any time begins the live stream.
+void LTESniffer_pcap_writer::try_open_stream_locked()
+{
+  if (pcap_stream_path_.empty() || pcap_stream_file_) return;
+  int sfd = ::open(pcap_stream_path_.c_str(), O_WRONLY | O_NONBLOCK);
+  if (sfd < 0) {
+    // ENXIO just means "no reader yet" — stay quiet so the periodic retry can
+    // catch Wireshark when it attaches. Warn once for genuine errors (bad path,
+    // permissions, not-a-FIFO).
+    if (errno != ENXIO && !stream_open_warned_) {
       fprintf(stderr, "[PcapWriter] stream FIFO open '%s' failed: %s "
                        "(create it first with: mkfifo %s)\n",
-              stream_path, std::strerror(errno), stream_path);
+              pcap_stream_path_.c_str(), std::strerror(errno), pcap_stream_path_.c_str());
+      stream_open_warned_ = true;
     }
+    return;
   }
+  pcap_stream_file_ = ::fdopen(sfd, "wb");
+  if (!pcap_stream_file_) { ::close(sfd); return; }
+  // libpcap global header for MAC-LTE DLT (147).
+  struct {
+    uint32_t magic; uint16_t v_major, v_minor;
+    int32_t  thiszone; uint32_t sigfigs;
+    uint32_t snaplen; uint32_t linktype;
+  } hdr = { 0xa1b2c3d4, 2, 4, 0, 0, 65535, 147 };
+  std::fwrite(&hdr, sizeof(hdr), 1, pcap_stream_file_);
+  std::fflush(pcap_stream_file_);
+  fprintf(stderr, "[PcapWriter] live stream → %s (open in Wireshark with -k -i %s)\n",
+          pcap_stream_path_.c_str(), pcap_stream_path_.c_str());
 }
 
 void LTESniffer_pcap_writer::configure_rotation(size_t bytes, int minutes)
@@ -248,6 +263,18 @@ void LTESniffer_pcap_writer::pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes
         std::fflush(pcap_file);
         writes_since_flush_ = 0;
       }
+      // Lazily (re)attach the live-stream FIFO. If streaming is enabled but no
+      // reader was connected at open() time (Wireshark launched after Start, or
+      // it dropped and came back), retry the non-blocking open ~once/sec so
+      // frames begin flowing as soon as Wireshark attaches — no restart needed.
+      if (!pcap_stream_file_ && !pcap_stream_path_.empty()) {
+        long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ms - stream_last_attempt_ms_ >= 1000) {
+          stream_last_attempt_ms_ = now_ms;
+          try_open_stream_locked();
+        }
+      }
       // Mirror to live-stream FIFO if open. Same writer, different FILE*.
       // If the reader's gone away we'll get EPIPE/EBADF — close + null out
       // so subsequent writes are no-ops.
@@ -255,6 +282,11 @@ void LTESniffer_pcap_writer::pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes
         if (LTE_PCAP_MAC_WritePDU(pcap_stream_file_, &context, pdu, pdu_len_bytes) < 0) {
           std::fclose(pcap_stream_file_);
           pcap_stream_file_ = nullptr;
+        } else {
+          // Flush every frame to the FIFO so Wireshark dissects it live instead
+          // of in ~4 KB stdio bursts. The FIFO is low-volume vs. the on-disk
+          // file, so per-PDU flushing here is cheap and worth the latency win.
+          std::fflush(pcap_stream_file_);
         }
       }
     }
