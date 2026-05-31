@@ -112,6 +112,13 @@ def _to_c_format(entries: list[KeyEntry]) -> list[dict]:
             d["integ_algo"] = e.integ_algo
         if e.hfn_hint:
             d["hfn_hint"] = str(e.hfn_hint)
+        if e.label:
+            # The C++ parser ignores unknown keys (KeyAttaching.cc:160-258 only
+            # looks up rnti/kenb/kasme/nas_count/hfn_hint/cipher_algo/integ_algo),
+            # so persisting `label` here is round-trip safe AND keeps the
+            # operator-friendly hint visible after a reload — without it,
+            # _from_c_format returned None and the UI lost the label.
+            d["label"] = e.label
         out.append(d)
     return out
 
