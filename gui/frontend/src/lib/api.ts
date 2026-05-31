@@ -1,24 +1,17 @@
 import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse } from "./types";
 
-// ---- HTTP Basic Auth over HTTPS --------------------------------------------
+// ---- Session-cookie auth ---------------------------------------------------
 //
-// The browser handles the auth UI natively: on the first request that comes
-// back with `WWW-Authenticate: Basic`, Firefox/Chrome pop a username/password
-// dialog. Once the user enters credentials, the browser caches them for the
-// origin and auto-includes `Authorization: Basic <b64>` on every subsequent
-// request — REST AND WebSocket — for as long as the tab/window lives.
+// The SPA renders an in-app <Login> form when there's no valid session. POST
+// /api/login → server validates bcrypt creds and sets an HttpOnly Secure
+// SameSite=Strict cookie. The browser auto-includes that cookie on every
+// subsequent same-origin request — REST and WebSocket — without any JS help.
 //
-// That means there is nothing for the SPA to do for auth: no token, no
-// localStorage, no URL fragment, no JS-side login form. fetch() just works,
-// and a 401 here means the browser-cached creds are wrong (next page-load
-// the browser will re-prompt).
+// On 401 from any API call, we fire a window-level "auth-lost" event; the
+// React app listens for it and swaps to the Login route.
 
-// kept exported so the WS connector doesn't have to know the auth model —
-// today it returns null (browser handles WS auth via cached Basic creds);
-// if we ever need a cookie/token, this is the seam.
-export function getTokenForWS(): string | null {
-  return null;
-}
+let _onAuthLost: (() => void) | null = null;
+export function setAuthLostHandler(fn: () => void): void { _onAuthLost = fn; }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
@@ -28,17 +21,15 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
     headers,
-    // Send the browser-cached Basic Auth credentials on cross-origin fetches
-    // too (e.g. vite dev server proxying to backend). Same-origin requests
-    // include them by default.
-    credentials: "same-origin",
+    // "include" forces the session cookie even on cross-origin (vite dev
+    // server → backend) — same-origin requests would include it anyway.
+    credentials: "include",
   });
   if (res.status === 401) {
-    // Browser-cached Basic creds are wrong; force a hard reload so the
-    // browser re-issues the auth dialog. No JS prompt — we want the
-    // native dialog so the password manager can offer to save the creds.
-    if (typeof window !== "undefined") {
-      window.location.reload();
+    // Session expired / never authenticated. Tell the React app so it can
+    // render the Login page. Don't reload — preserve any in-flight UI state.
+    if (_onAuthLost && !path.endsWith("/api/whoami") && !path.endsWith("/api/login")) {
+      _onAuthLost();
     }
     throw new Error("401: re-authenticating");
   }
@@ -55,6 +46,14 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   get: <T>(path: string) => req<T>(path),
+  // ── auth (the only /api/* the SPA may hit unauthenticated) ──
+  whoami: () => req<{ username: string }>("/api/whoami"),
+  login:  (username: string, password: string) =>
+    req<{ ok: boolean; username: string }>("/api/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => req<{ ok: boolean }>("/api/logout", { method: "POST" }),
   health: () => req<{ ok: boolean; mock: boolean }>("/api/health"),
   getConfig: () => req<SnifferConfig>("/api/config"),
   putConfig: (cfg: SnifferConfig) =>

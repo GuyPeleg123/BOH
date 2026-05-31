@@ -1,5 +1,14 @@
 import { Link, useLocation } from "react-router-dom";
 import { useStore, shallow } from "../lib/store";
+import { api } from "../lib/api";
+
+async function handleLogout() {
+  // Drop server session + cookie, then force a hard reload to nuke any
+  // in-memory React state that was tied to the authed session (WebSocket,
+  // capture-state polls, etc.). Reload is the simplest path back to Login.
+  try { await api.logout(); } catch {}
+  if (typeof window !== "undefined") window.location.reload();
+}
 
 export function StatusBar() {
   // Only re-render when the connection / lifecycle status or cell identity changes.
@@ -48,6 +57,13 @@ export function StatusBar() {
             {state.cell.nof_prb} PRB · {(state.cell.dl_freq / 1e6).toFixed(1)} MHz
           </span>
         )}
+        <button
+          className="px-2 py-1 rounded-md text-muted hover:text-slate-200 hover:bg-border/50 transition-colors"
+          onClick={handleLogout}
+          title="Log out (clears the session cookie and returns to the login page)"
+        >
+          ⎋ Logout
+        </button>
       </div>
     </div>
   );

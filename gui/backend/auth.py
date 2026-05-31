@@ -1,15 +1,19 @@
-"""HTTP Basic Auth over HTTPS for the GUI's REST + WebSocket endpoints.
+"""Session-cookie authentication for the GUI's REST + WebSocket endpoints.
 
-Replaces the previous bearer-token-in-URL model. The browser handles the
-auth UI natively (native username/password dialog on first visit), and
-the same Authorization header is auto-included on every subsequent
-request — REST and WebSocket — to the same origin.
+The login UX is an in-app React form (not the browser's native Basic Auth
+popup). The form POSTs username + password to /api/login; the server
+verifies bcrypt-hashed credentials from disk and replies with a
+Set-Cookie: ltesniffer_session=<token>; HttpOnly; Secure; SameSite=Strict.
+
+Subsequent requests — REST AND WebSocket — auto-include the cookie because
+the browser sends cookies on same-origin requests. WebSocket upgrades to
+the same origin include cookies too (this is the whole reason we picked
+cookie auth instead of putting a token in the URL).
 
 Threat model: GUI binds an LTESNIFFER_GUI_BIND-detected LAN IP. Every
-request (loopback included) requires a valid `Authorization: Basic`
-header. No tokens-in-URL means nothing leaks via shoulder-surf, browser
-history, or referer headers. TLS prevents the bcrypt-protected password
-from going over the wire in cleartext.
+request (loopback included) requires a valid session cookie. The cookie
+is HttpOnly so JS can't exfiltrate it via XSS; Secure so it only flows
+over TLS; SameSite=Strict so it never leaks via a third-party site.
 
 Credentials live at:
   ~/.config/ltesniffer-gui/auth.json    (mode 0600)
@@ -29,13 +33,13 @@ LTESNIFFER_GUI_PASS env vars on first start. They're consumed once
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import secrets
 import socket
 import string
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -46,7 +50,12 @@ from fastapi import HTTPException, Request, WebSocket
 _CONFIG_DIR = (Path.home() / ".config" / "ltesniffer-gui").resolve()
 AUTH_PATH = _CONFIG_DIR / "auth.json"
 
-REALM = "LTESniffer GUI"
+# Cookie name + sliding-window TTL. In-memory store — server restart kicks
+# everyone out, which is fine for self-hosted gear (and removes any need
+# for a session-revocation mechanism: a restart IS the revocation).
+COOKIE_NAME    = "ltesniffer_session"
+SESSION_TTL_S  = 8 * 60 * 60   # 8 hours of inactivity → expire
+SESSION_RENEW_THRESHOLD_S = 60  # only update last_seen if >60s since last update (avoid mutex thrash)
 
 log = logging.getLogger(__name__)
 
@@ -131,7 +140,7 @@ def _load_or_create_credentials() -> tuple[str, bytes]:
         f"   username: {username}\n"
         f"   password: {password}\n"
         f" {'(from LTESNIFFER_GUI_USER/PASS env)' if (env_user or env_pass) else '(auto-generated; only shown ONCE)'}\n"
-        " Use these in the Firefox login dialog. To rotate: delete the file and restart.\n"
+        " Use these in the in-app Login page. To rotate: delete the file and restart.\n"
         + "═" * 78 + "\n"
     )
     try:
@@ -147,36 +156,20 @@ _USERNAME, _PASSWORD_BCRYPT = _load_or_create_credentials()
 
 
 # ────────────────────────────────────────────────────────────────────────
-# Basic Auth checks
+# Credential check — only used by /api/login
 # ────────────────────────────────────────────────────────────────────────
 
-def _parse_basic(header_value: Optional[str]) -> Optional[tuple[str, str]]:
-    """Parse 'Basic <base64>' → (username, password); None on any malformation."""
-    if not header_value:
-        return None
-    parts = header_value.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "basic":
-        return None
-    try:
-        decoded = base64.b64decode(parts[1], validate=True).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if ":" not in decoded:
-        return None
-    user, pwd = decoded.split(":", 1)
-    return user, pwd
-
-
-def _verify(user: str, pwd: str) -> bool:
+def verify_credentials(user: str, pwd: str) -> bool:
     """Constant-time username compare + bcrypt password verify.
 
-    Constant-time on the username avoids leaking which RNTI of usernames
-    are accepted; bcrypt's checkpw is internally constant-time.
+    Constant-time on the username avoids leaking which usernames are
+    accepted via response-timing; bcrypt's checkpw is internally
+    constant-time on the password.
     """
     if not secrets.compare_digest(user, _USERNAME):
-        # Still hash the password so the wrong-user path takes ~the same
-        # time as the right-user-wrong-password path. Defends against
-        # username enumeration via timing.
+        # Still hash the supplied password so the wrong-user path takes
+        # ~the same time as the right-user-wrong-password path. Defends
+        # against username enumeration via timing differences.
         try:
             bcrypt.checkpw(pwd.encode("utf-8"), _PASSWORD_BCRYPT)
         except ValueError:
@@ -188,57 +181,75 @@ def _verify(user: str, pwd: str) -> bool:
         return False
 
 
-def _challenge() -> HTTPException:
-    return HTTPException(
-        status_code=401,
-        detail="authentication required",
-        headers={"WWW-Authenticate": f'Basic realm="{REALM}", charset="UTF-8"'},
-    )
+# ────────────────────────────────────────────────────────────────────────
+# Session store (in-memory)
+# ────────────────────────────────────────────────────────────────────────
+#
+# {token: {"username": str, "last_seen": float}}.  Server restart kicks
+# everyone out — which is the revocation mechanism. For a self-hosted
+# tool that's the right trade-off (no Redis, no DB, no migration).
+
+_SESSIONS: dict[str, dict] = {}
 
 
-async def require_basic_auth(request: Request) -> None:
-    """FastAPI dependency: rejects requests without valid Basic credentials.
+def create_session(username: str) -> str:
+    """Mint a new session token. Caller sets it as a cookie on the response."""
+    token = secrets.token_urlsafe(32)  # 256-bit, URL-safe
+    _SESSIONS[token] = {"username": username, "last_seen": time.time()}
+    return token
 
-    No loopback bypass — even 127.0.0.1 requests must authenticate. The
-    backend may run inside containers or behind a local proxy where the
-    apparent client host is loopback but the real source isn't; not worth
-    the foot-gun.
+
+def drop_session(token: Optional[str]) -> None:
+    """Idempotent — safe to call with a stale or unknown token."""
+    if token:
+        _SESSIONS.pop(token, None)
+
+
+def session_user(token: Optional[str]) -> Optional[str]:
+    """Return the username for a still-valid session token, else None.
+
+    Also enforces idle-expiry (8h sliding window) and updates last_seen
+    on the cheap (only when the existing last_seen is stale enough to
+    matter, to avoid pointlessly churning the dict on bursty traffic).
     """
-    parsed = _parse_basic(request.headers.get("authorization"))
-    if not parsed or not _verify(parsed[0], parsed[1]):
-        raise _challenge()
+    if not token:
+        return None
+    info = _SESSIONS.get(token)
+    if not info:
+        return None
+    now = time.time()
+    if now - info["last_seen"] > SESSION_TTL_S:
+        _SESSIONS.pop(token, None)
+        return None
+    # Sliding renewal — only touch the dict if the last touch was a while ago.
+    if now - info["last_seen"] > SESSION_RENEW_THRESHOLD_S:
+        info["last_seen"] = now
+    return info["username"]
 
 
-async def require_basic_auth_ws(ws: WebSocket) -> bool:
-    """Equivalent for the WebSocket upgrade.
+# ────────────────────────────────────────────────────────────────────────
+# FastAPI dependencies
+# ────────────────────────────────────────────────────────────────────────
 
-    Modern browsers auto-include the cached Authorization header on a WS
-    upgrade to the same origin where Basic Auth was just satisfied for an
-    HTTP request, so this works without a separate auth step.
+async def require_session(request: Request) -> str:
+    """Reject requests without a valid session cookie. Returns the username.
 
-    Returns True if accepted, else closes the socket with code 4401 (per
-    the well-known "auth failed" convention for WS) and returns False.
+    No loopback bypass — every request authenticates. We return JSON 401
+    with NO WWW-Authenticate header so the browser does not show its
+    native Basic Auth popup (the in-app login form is the only UI).
     """
-    parsed = _parse_basic(ws.headers.get("authorization"))
-    if parsed and _verify(parsed[0], parsed[1]):
+    user = session_user(request.cookies.get(COOKIE_NAME))
+    if not user:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return user
+
+
+async def require_session_ws(ws: WebSocket) -> bool:
+    """WebSocket equivalent. Returns True if accepted, else closes the
+    socket with code 4401 (well-known 'auth failed' for WS) and returns
+    False. The browser auto-sends the same-origin session cookie on the
+    WS upgrade, so no separate token-in-URL is needed."""
+    if session_user(ws.cookies.get(COOKIE_NAME)):
         return True
     await ws.close(code=4401)
     return False
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Public symbols kept stable so main.py imports don't churn
-# ────────────────────────────────────────────────────────────────────────
-
-# Back-compat shims for code that still imports TOKEN / require_token. The
-# token model is gone; these exist only so import-time fails loudly with a
-# clear error rather than via an AttributeError at request time.
-TOKEN = None
-TOKEN_PATH = AUTH_PATH  # what should appear in error messages / banners
-REQUIRE_LOCAL_TOKEN = True  # vestige — always-on auth, no bypass
-
-async def require_token(request: Request) -> None:  # alias for transition
-    return await require_basic_auth(request)
-
-async def require_token_ws(ws: WebSocket) -> bool:  # alias for transition
-    return await require_basic_auth_ws(ws)

@@ -12,7 +12,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -27,7 +28,11 @@ from spectrum import SpectrumLauncher
 import captures as captures_mod
 import keys as keys_mod
 from keys import KeysFile, KEYS_PATH
-from auth import BIND, AUTH_PATH, require_basic_auth, require_basic_auth_ws
+from auth import (
+    BIND, AUTH_PATH, COOKIE_NAME, SESSION_TTL_S,
+    require_session, require_session_ws,
+    verify_credentials, create_session, drop_session, session_user,
+)
 import https as https_mod
 import zmq_pub
 from metrics import MetricsBus
@@ -128,13 +133,13 @@ async def lifespan(app: FastAPI):
     if REPLAY:
         await runner.start(None)
     # Auth banner so the operator can't miss the security posture they're in.
-    # HTTPS + HTTP Basic Auth, no loopback bypass — every request authenticates.
+    # HTTPS + session-cookie auth, no loopback bypass — every request authenticates.
     log.warning(
         "==================================================================\n"
-        "  GUI bound to %s — HTTPS + HTTP Basic Auth (no loopback bypass).\n"
+        "  GUI bound to %s — HTTPS + in-app Login page (no loopback bypass).\n"
         "  Credentials: %s\n"
         "  First start prints the auto-generated password to stderr ONCE.\n"
-        "  Browser will show a native username/password dialog.\n"
+        "  Sessions: in-memory, 8h idle timeout, HttpOnly Secure SameSite=Strict cookie.\n"
         "  To rotate creds: delete %s and restart.\n"
         "==================================================================",
         BIND, AUTH_PATH, AUTH_PATH,
@@ -202,37 +207,90 @@ app.add_middleware(
 )
 
 
-# Routes that bypass Basic Auth. /api/health is the ONLY one — keeping it
-# open lets a misconfigured client tell "wrong creds" (401) apart from
-# "server down" (no response). Everything else — including the SPA index
-# at `/` — requires auth so the browser native dialog fires on first visit.
-_AUTH_FREE_PREFIXES = ("/api/health",)
-_AUTH_FREE_EXACT: set[str] = set()
+# Auth-free routes. /api/login is obviously needed (you can't auth in if
+# you can't reach the login endpoint). /api/health stays open so operators
+# can distinguish "auth failed" (401) from "server down" (no response).
+# The SPA index at `/` is ALSO auth-free so the React app can boot, render
+# the Login.tsx page, and POST credentials. /assets/* serves the bundled
+# JS/CSS the SPA needs to render at all.
+_AUTH_FREE_PREFIXES = ("/api/health", "/api/login", "/assets/")
+_AUTH_FREE_EXACT: set[str] = {"/"}
 
 
 @app.middleware("http")
 async def _auth_gate(request, call_next):
-    """Block every request without valid HTTP Basic credentials. On 401,
-    propagate the WWW-Authenticate: Basic header so the browser shows its
-    native username/password dialog. No loopback bypass.
+    """Block every /api/* request without a valid session cookie.
 
-    /api/health is the single exception — operators need an unauth probe
-    to distinguish "wrong creds" from "server is down"."""
+    No WWW-Authenticate header on 401 — we explicitly DON'T want the
+    browser's native popup; the SPA's <Login> page handles auth UI.
+
+    The SPA shell (`/`) and its assets are served unauthenticated so the
+    React app can render the Login page; every /api/* call from that
+    Login page (except /api/login itself) requires a valid session
+    cookie."""
     path = request.url.path
     if path in _AUTH_FREE_EXACT or any(path.startswith(p) for p in _AUTH_FREE_PREFIXES):
         return await call_next(request)
+    # Only gate /api/*; static SPA routes (catch-all in spa()) also flow
+    # through here, but if they're not in the auth-free list we still let
+    # them through so the SPA can render its own Login UI.
+    if not path.startswith("/api/"):
+        return await call_next(request)
     try:
-        await require_basic_auth(request)
+        await require_session(request)
     except HTTPException as exc:
         from fastapi.responses import JSONResponse
-        # Crucially forward the WWW-Authenticate header — without it the
-        # browser silently fails the request instead of showing the dialog.
-        return JSONResponse(
-            {"detail": exc.detail},
-            status_code=exc.status_code,
-            headers=dict(exc.headers or {}),
-        )
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
     return await call_next(request)
+
+
+# ── Auth endpoints (the only /api/* paths the SPA can hit unauthenticated) ──
+
+class _LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+async def login(body: _LoginBody, response: Response) -> dict[str, Any]:
+    """Validate credentials, mint a session, set the cookie.
+
+    On wrong creds we return 401 with a generic message ("invalid
+    credentials") rather than distinguishing wrong-user from wrong-pass —
+    enumeration defense in depth, layered on the constant-time verify."""
+    if not verify_credentials(body.username, body.password):
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    token = create_session(body.username)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_S,
+        httponly=True,            # JS can't read it (XSS exfiltration defense)
+        secure=True,              # only over TLS (we're HTTPS-only)
+        samesite="strict",        # never sent on cross-site requests
+        path="/",
+    )
+    return {"ok": True, "username": body.username}
+
+
+@app.post("/api/logout")
+async def logout(request: Request, response: Response) -> dict[str, Any]:
+    """Drop the server-side session and clear the cookie. Idempotent —
+    works whether or not the caller had a valid session."""
+    drop_session(request.cookies.get(COOKIE_NAME))
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/whoami")
+async def whoami(request: Request) -> dict[str, Any]:
+    """Cheap auth probe for the SPA: returns 200 + username if the cookie
+    is valid, 401 otherwise. The SPA calls this on mount to decide
+    whether to show Login or Dashboard."""
+    user = session_user(request.cookies.get(COOKIE_NAME))
+    if not user:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    return {"username": user}
 
 
 # /api/health is intentionally token-free: lets a misconfigured client tell
@@ -585,10 +643,10 @@ async def download_capture(path: str) -> FileResponse:
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
     # Auth check BEFORE accept(): we don't want to give an unauthed peer a
-    # 101 upgrade response with our subprotocol/server info. Modern browsers
-    # auto-include the cached Authorization: Basic header on a WS upgrade to
-    # the same origin where Basic Auth was satisfied for the SPA load.
-    if not await require_basic_auth_ws(ws):
+    # 101 upgrade response with our subprotocol/server info. The browser
+    # auto-sends the same-origin session cookie on WS upgrade, so this
+    # works without any URL-side token.
+    if not await require_session_ws(ws):
         return
     await ws.accept()
     # Subscribe *after* capturing the replay snapshot so events that arrive
