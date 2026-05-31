@@ -25,6 +25,10 @@ log = logging.getLogger(__name__)
 SESSIONS_DIR = Path.home() / ".local" / "share" / "ltesniffer-gui" / "sessions"
 SESSION_ROTATE_MB = 50
 SESSION_ROTATE_BYTES = SESSION_ROTATE_MB * 1024 * 1024
+# Keep only the newest N rolled files (~5 GB at 50 MB each). Without this an
+# unattended appliance recording 24/7 fills the disk over weeks, after which
+# config/keys saves AND the recorder itself start failing.
+SESSION_RETENTION = 100
 
 
 def _enabled() -> bool:
@@ -45,6 +49,19 @@ class SessionRecorder:
     def path(self) -> Optional[Path]:
         return self._path
 
+    def _prune_old_sessions(self) -> None:
+        """Delete the oldest session files beyond SESSION_RETENTION. Names are
+        session_<UTC-iso>_<seq>.jsonl.zst so a lexical sort is chronological."""
+        try:
+            files = sorted(SESSIONS_DIR.glob("session_*.jsonl.zst"))
+            for old in files[:-SESSION_RETENTION] if len(files) > SESSION_RETENTION else []:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     def _open_new(self) -> None:
         try:
             import zstandard as zstd
@@ -52,6 +69,7 @@ class SessionRecorder:
             log.warning("session recorder: zstandard not installed; disabling.")
             return
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._prune_old_sessions()
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self._seq += 1
         self._path = SESSIONS_DIR / f"session_{ts}_{self._seq:03d}.jsonl.zst"

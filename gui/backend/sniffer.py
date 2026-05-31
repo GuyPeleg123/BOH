@@ -259,12 +259,24 @@ class SnifferRunner:
         # (fopen blocks until both ends are connected).
         self._reader_task = asyncio.create_task(self._read_events(self._fifo_path))
 
-        self._proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.DEVNULL,   # we don't read it, and PIPE would fill at ~64KB and wedge LTESniffer
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(run_dir),
-        )
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.DEVNULL,   # we don't read it, and PIPE would fill at ~64KB and wedge LTESniffer
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(run_dir),
+            )
+        except Exception as e:
+            # Spawn failed (bad binary, sudo -n denied, ENOMEM…). Without this
+            # the GUI would stay stuck showing "running" forever — running=True
+            # was set above but _proc is None — and Start would be disabled with
+            # no way to recover but a backend restart. Roll the state back.
+            if self._reader_task:
+                self._reader_task.cancel()
+                self._reader_task = None
+            self._cleanup_fifo()
+            self._state.update(running=False, pid=None, last_error=str(e))
+            raise
         self._state["pid"] = self._proc.pid
         self._broadcast({
             "t": "lifecycle",
@@ -348,7 +360,12 @@ class SnifferRunner:
             self._proc.kill()
         except ProcessLookupError:
             pass
-        await self._proc.wait()
+        # Bound the final reap so a wedged wrapper can't hang /api/capture/stop
+        # indefinitely on an unattended box.
+        try:
+            await asyncio.wait_for(self._proc.wait(), 5.0)
+        except asyncio.TimeoutError:
+            pass
 
         # Cancel background tasks in case _wait_exit hasn't fired yet.
         for task in (self._wait_task, self._reader_task, self._stderr_task):
@@ -362,21 +379,26 @@ class SnifferRunner:
     # ----------------------------------------------------------------- private
 
     async def _wait_exit(self) -> None:
-        assert self._proc is not None
-        rc = await self._proc.wait()
-        self._state["running"] = False
-        self._state["exit_code"] = rc
-        self._broadcast({
-            "t": "lifecycle",
-            "event": "exited",
-            "exit_code": rc,
-            "run_dir": str(self._run_dir) if self._run_dir else None,
-        })
-        if self._reader_task:
-            self._reader_task.cancel()
-        if self._stderr_task:
-            self._stderr_task.cancel()
-        self._cleanup_fifo()
+        if self._proc is None:
+            return
+        try:
+            rc = await self._proc.wait()
+            self._state["running"] = False
+            self._state["exit_code"] = rc
+            self._broadcast({
+                "t": "lifecycle",
+                "event": "exited",
+                "exit_code": rc,
+                "run_dir": str(self._run_dir) if self._run_dir else None,
+            })
+            if self._reader_task:
+                self._reader_task.cancel()
+            if self._stderr_task:
+                self._stderr_task.cancel()
+        finally:
+            # Always release the FIFO/temp dir even if broadcast/cancel raised,
+            # so an exit can never leak the pipe or strand the UI's state.
+            self._cleanup_fifo()
 
     def _cleanup_fifo(self) -> None:
         if self._fifo_dir:

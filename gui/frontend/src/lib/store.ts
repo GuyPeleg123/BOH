@@ -4,6 +4,8 @@ import type { Event, RuntimeState } from "./types";
 const SF_HISTORY = 300;          // ring buffer for waterfall
 const LOG_HISTORY = 500;
 const RECENT_DCI = 200;          // live packet feed depth
+const RNTI_CAP = 4000;           // hard cap on tracked RNTIs (16-bit space, but
+const RNTI_KEEP = 3000;          // evicting LRU keeps the RNTITable sort cheap)
 const METRIC_WINDOW_MS = 5_000;  // sliding window for rate metrics
 const FLUSH_HZ = 15;             // max state-update rate to the UI
 
@@ -294,6 +296,14 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
         }
         break;
     }
+  }
+
+  if (rntis && rntis.size > RNTI_CAP) {
+    // Evict the least-recently-seen RNTIs so the Map — and the RNTITable's
+    // per-render sort over it — stay bounded across a multi-day capture.
+    const oldest = Array.from(rntis.values()).sort((a, b) => a.last_seen - b.last_seen);
+    const drop = rntis.size - RNTI_KEEP;
+    for (let i = 0; i < drop; i++) rntis.delete(oldest[i].rnti);
   }
 
   if (newDcis.length) {

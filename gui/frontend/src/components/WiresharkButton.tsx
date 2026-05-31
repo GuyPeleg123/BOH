@@ -48,8 +48,8 @@ export function WiresharkButton() {
     setFifo(path);
     const r = await api.openWireshark();
     setOk(
-      `Saved FIFO=${path}. Wireshark opened (pid ${r.pid}). Restart capture ` +
-      `so the writer reattaches with Wireshark listening.`
+      `Saved FIFO=${path}. Wireshark opened (pid ${r.pid}). ` +
+      `Frames stream in automatically once a capture is running — no restart needed.`
     );
   }
 
@@ -70,8 +70,8 @@ export function WiresharkButton() {
         const r = await api.openWireshark();
         setOk(`Wireshark opened on ${r.fifo} (pid ${r.pid}). ` +
               (lifecycle === "running"
-                ? "⟳ Restart capture so the C++ writer reattaches."
-                : "▶ Now start capture."));
+                ? "Frames will appear within ~1s — no restart needed."
+                : "▶ Now start capture and frames will stream in."));
       }
       setTimeout(() => setOk(null), 8000);
     } catch (e: any) {
