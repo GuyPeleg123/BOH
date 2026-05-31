@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, Navigate } from "react-router-dom";
 import { StoreProvider } from "./lib/store";
 import { StatusBar } from "./components/StatusBar";
 import { Dashboard } from "./pages/Dashboard";
@@ -40,8 +40,13 @@ export default function App() {
 
   if (auth.kind === "checking") {
     return (
-      <div className="flex items-center justify-center h-screen text-muted text-sm">
-        Loading…
+      <div className="flex flex-col items-center justify-center h-screen gap-3 text-muted">
+        {/* Brand mark, gently pulsing, so the cold-start moment reads as
+            "LTESniffer is coming up" rather than a blank dark screen. */}
+        <svg width="40" height="40" viewBox="0 0 16 16" aria-hidden className="animate-pulse">
+          <path d="M2 12 L5 6 L8 10 L11 4 L14 8" stroke="#6cb6ff" strokeWidth="1.5" fill="none" />
+        </svg>
+        <span className="text-sm tracking-wide">Connecting to LTESniffer…</span>
       </div>
     );
   }
@@ -59,6 +64,8 @@ export default function App() {
             <Route path="/config" element={<ConfigPage />} />
             <Route path="/keys"   element={<KeysPage />} />
             <Route path="/help"   element={<HelpPage />} />
+            {/* Unknown path (stale bookmark, typo) → home, not a blank pane. */}
+            <Route path="*"       element={<Navigate to="/" replace />} />
           </Routes>
         </main>
       </div>
