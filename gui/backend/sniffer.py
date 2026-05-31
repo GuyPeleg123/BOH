@@ -277,49 +277,73 @@ class SnifferRunner:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._wait_task = asyncio.create_task(self._wait_exit())
 
-    async def stop(self, timeout: float = 5.0) -> None:
+    async def stop(self, graceful_timeout: float = 15.0) -> None:
+        """Stop the running sniffer.
+
+        Strategy: signal LTESniffer DIRECTLY (not via sudo). `sudo -n` running
+        without a controlling tty does not reliably forward SIGINT/SIGTERM to
+        its child — sudo exits, the child gets reparented to init, and the
+        polite signal is lost. We use the sudoers-whitelisted kill-wrapper to
+        send SIGTERM to the LTESniffer process(es) directly.
+
+        Phases:
+          1. SIGTERM via kill-wrapper. LTESniffer's SignalGate handler (commits
+             2e1619a + 07aea53) catches SIGTERM, sets go_exit=true, the main
+             loop exits, the destructor runs, and pcapwriter.close() flushes
+             the libc stdio buffer to disk. graceful_timeout (15s) is generous
+             enough to cover the dual-mode shutdown sequence (joinPending +
+             srsran_rf_close + ue_sync_free).
+          2. SIGKILL via kill-wrapper, only if still alive. This is the data-
+             loss path — anything still in the 8 KB stdio buffer past the last
+             periodic flush (commit 3eaf404) is dropped.
+          3. Reap the sudo wrapper if it's somehow still around (rare — sudo
+             usually exits when its child does).
+        """
         if not self.running or self._proc is None:
             return
 
-        # Determine whether we launched through sudo so we can kill the real
-        # process (LTESniffer, running as root) before killing the sudo wrapper.
-        # If we only SIGKILL sudo and leave LTESniffer running, it gets
-        # re-parented to init and becomes an OOM-causing orphan.
         uses_sudo = bool(self._state.get("argv") and self._state["argv"][0] == "sudo")
-        sudo_pid = self._proc.pid
+        kill_script = (
+            Path(__file__).resolve().parent.parent.parent
+            / "scripts" / "kill-ltesniffer.sh"
+        )
 
-        # Step 1: polite SIGINT (sudo forwards to LTESniffer automatically).
-        try:
-            self._proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            pass
+        async def _signal_all(sig_name: str, wrapper_timeout: float = 3.0) -> None:
+            """Send `sig_name` to every LTESniffer process via the kill wrapper.
+            If we're not running under sudo, signal our direct child instead."""
+            if uses_sudo:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "-n", str(kill_script), sig_name,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(proc.wait(), wrapper_timeout)
+                except Exception:
+                    pass
+            else:
+                # No sudo → our direct child IS LTESniffer.
+                sig = getattr(signal, f"SIG{sig_name}", signal.SIGTERM)
+                try:
+                    self._proc.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+
+        # Phase 1: polite SIGTERM to LTESniffer directly.
+        await _signal_all("TERM")
 
         try:
-            await asyncio.wait_for(self._proc.wait(), timeout)
-            return  # clean exit — nothing else to do
+            await asyncio.wait_for(self._proc.wait(), graceful_timeout)
+            # clean exit — sudo wrapper exits when its child does.
+            return
         except asyncio.TimeoutError:
             pass
 
-        # Step 2: escalate.  When running under sudo, kill LTESniffer children
-        # *first* so they don't become orphans when sudo is subsequently killed.
-        # We use a dedicated kill-wrapper script that is whitelisted in
-        # sudoers (NOPASSWD) so the non-root backend can reach root processes.
-        if uses_sudo:
-            kill_script = (
-                Path(__file__).resolve().parent.parent.parent
-                / "scripts" / "kill-ltesniffer.sh"
-            )
-            try:
-                kill_proc = await asyncio.create_subprocess_exec(
-                    "sudo", "-n", str(kill_script),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(kill_proc.wait(), 3.0)
-            except Exception:
-                pass
+        # Phase 2: escalate to SIGKILL. Data loss territory — anything still
+        # in the libc stdio buffer past the last periodic flush is gone.
+        await _signal_all("KILL")
 
-        # Step 3: kill the sudo wrapper (or the binary itself if no sudo).
+        # Phase 3: reap the sudo wrapper if it's hanging around.
         try:
             self._proc.kill()
         except ProcessLookupError:
