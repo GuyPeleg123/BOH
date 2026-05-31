@@ -720,9 +720,23 @@ bool LTESniffer_Core::run(){
 
   std::cout << "Destroyed Phy" << std::endl;
   if (args.input_file_name == ""){
-    // srsran_rf_close(&rf_a);
-    // srsran_rf_close(&rf_b);
-    //srsran_ue_dl_free(falcon_ue_dl.q);
+    // Order matters here. The streamer threads can still be inside
+    // srsran_rf_recv_with_time_multi() at this point — they were triggered
+    // one last time by the cv.notify_all() above and will block until UHD
+    // hands them samples (or hits timeout). Calling rf_close on either
+    // handle while one is mid-recv corrupts UHD's shared libusb session
+    // and segfaults inside the SC16→FC32 SIMD converter.
+    //
+    // Sequence:
+    //   1. stop_rx_stream  → makes any pending recv return immediately
+    //   2. join streamers  → guarantees neither thread is still in UHD
+    //   3. rf_close (a→b)  → sequential, no concurrent UHD teardown
+    srsran_rf_stop_rx_stream(&rf_a);
+    if (rf_b_open) srsran_rf_stop_rx_stream(&rf_b);
+    uhd_stream_thread.join();
+    srsran_rf_close(&rf_a);
+    if (rf_b_open) srsran_rf_close(&rf_b);
+
     srsran_ue_sync_free(&ue_sync_a);
     srsran_ue_mib_free(&ue_mib);
   }
@@ -970,7 +984,18 @@ void UhdStreamThread::prepare_stream_thread(void* rf_a_, void* rf_b_, int nsampl
 int UhdStreamThread::get_data_stream_a(){
   while(!uhd_stop){
     std::unique_lock<std::mutex> lock_a(mtx_a);
-    cv.wait(lock_a, [] { return a_triggered; });
+    // Wake on EITHER a trigger from the wrapper OR a shutdown request. The
+    // predicate has to include uhd_stop because the shutdown path may not
+    // set a_triggered if it was already true, and we need a way out of the
+    // wait in that case.
+    cv.wait(lock_a, [] { return a_triggered || uhd_stop; });
+    // Critical: re-check uhd_stop BEFORE entering rf_recv. ptr_a is a stored
+    // pointer to the wrapper's stack-local array; once the wrapper returns,
+    // that pointer is dangling. The shutdown path sets a_triggered=true
+    // (line 711-714) from OUTSIDE the wrapper to wake us — if we proceed
+    // into srsran_rf_recv_with_time_multi here, the SC16→FC32 SIMD converter
+    // dereferences the stale pointer and segfaults inside libuhd.
+    if (uhd_stop) break;
     a_triggered = false;
     {
       srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_a, ptr_a, nof_sample_a, true, &secs_a, &frac_secs_a);
@@ -981,30 +1006,43 @@ int UhdStreamThread::get_data_stream_a(){
     }
     lock_a.unlock();
   }
-  //if uhd_stop == true
-  srsran_rf_close((srsran_rf_t*)rf_a);
-  
+  // NOTE: do NOT call srsran_rf_close() here. Both streamer threads used to
+  // close their own RF handle, which trips two further races: (1) parallel
+  // rf_close on the two B210s corrupts UHD's shared libusb session, and
+  // (2) one streamer's rf_close can run while the other is still inside
+  // rf_recv. Closing is now done sequentially from the main shutdown path
+  // after UhdStreamThread::join().
   return SRSRAN_SUCCESS;
 }
 
 int UhdStreamThread::get_data_stream_b(){
   while(!uhd_stop){
     std::unique_lock<std::mutex> lock_b(mtx_b);
-    cv.wait(lock_b, [] { return b_triggered; });
+    cv.wait(lock_b, [] { return b_triggered || uhd_stop; });
+    // See get_data_stream_a() above for why this check is mandatory before
+    // entering rf_recv. Without it, shutdown's b_triggered=true + notify
+    // (line 715-718) wakes us with a stale ptr_b → segfault in libuhd's
+    // SIMD converter.
+    if (uhd_stop) break;
     b_triggered = false;
     {
       srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_b, ptr_b, nof_sample_b, true, &secs_b, &frac_secs_b);
     }
-    
+
     {
       b_finished = true;
       b_fn_cv.notify_one();
     }
   }
-  //if uhd_stop == true
-  srsran_rf_close((srsran_rf_t*)rf_b);
-  
   return SRSRAN_SUCCESS;
+}
+
+void UhdStreamThread::join(){
+  // Block until both lambdas have returned. Safe to call once at shutdown;
+  // the underlying std::future<int> is move-only and one-shot. Idempotency
+  // is handled by future::valid() — a second call is a no-op.
+  if (future_a.valid()) future_a.wait();
+  if (future_b.valid()) future_b.wait();
 }
 
 std::string UhdStreamThread::frac_sec_double_to_string(double value, int precision)

@@ -113,6 +113,17 @@ public:
   int    get_nof_adjust_sample(){ return nof_adjust_sample;}
   int    get_adjust_type(){return adjust_ab;}
   void   set_adjust_type(int type){ adjust_ab = type;}
+
+  // Wait for both streamer threads to exit their receive loops. Must be
+  // called from the main shutdown path AFTER uhd_stop=true / cv.notify_all()
+  // and AFTER srsran_rf_stop_rx_stream() has been issued on both RF handles
+  // (otherwise an in-flight srsran_rf_recv_with_time_multi() can hang here).
+  // Once this returns, neither streamer is touching its rf_* handle anymore,
+  // so the caller can safely call srsran_rf_close() on each — sequentially,
+  // since UHD's libusb session is shared between the two B210s and parallel
+  // closes corrupt it.
+  void join();
+
 private:
   int adjust_ab = 0; // 0: no, 1: a, 2: b
   int nof_adjust_sample = 0;
