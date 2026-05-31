@@ -68,7 +68,12 @@ SignalGate& SignalGate::getInstance() {
 }
 
 void SignalGate::signalEntry(int sigNo) {
-  if (sigNo == SIGINT) {
+  // Both Ctrl+C (SIGINT) and standard teardown (SIGTERM — what `timeout`,
+  // `kill`, systemd, and Docker send by default) must trigger the same
+  // graceful-shutdown path. Without SIGTERM here, those tools fall through
+  // to SIGKILL and the libc stdio buffers (pcap, csv, …) are dropped along
+  // with everything captured since the last periodic flush.
+  if (sigNo == SIGINT || sigNo == SIGTERM) {
     getInstance().notify();
   }
 }
@@ -83,8 +88,10 @@ void SignalGate::init() {
   sigset_t sigset;
   sigemptyset(&sigset);
   sigaddset(&sigset, SIGINT);
+  sigaddset(&sigset, SIGTERM);
   sigprocmask(SIG_UNBLOCK, &sigset, nullptr);
-  signal(SIGINT, signalEntry);
+  signal(SIGINT,  signalEntry);
+  signal(SIGTERM, signalEntry);
 }
 
 void SignalGate::attach(SignalHandler& handler) {
