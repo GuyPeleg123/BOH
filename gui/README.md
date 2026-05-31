@@ -101,31 +101,58 @@ sudo /lib/x86_64-linux-gnu/uhd/utils/uhd_images_downloader.py
 
 ## Running
 
-Two-process model: backend + frontend dev server (or the backend serves the
-pre-built frontend from `/`).
+The backend serves the pre-built frontend over HTTPS with HTTP Basic Auth.
+Use the launcher script — it handles cert + credential generation for you.
 
-### Production-ish (single port, served by backend)
+### Standard launch (HTTPS + Basic Auth)
 
 ```
 cd gui/backend
-.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+.venv/bin/python serve.py
 # in another shell, only when frontend code changes:
 cd gui/frontend && npm run build
 ```
 
-Open <http://localhost:8000/>.
+Open <https://192.168.20.12:8443/> in Firefox (use *your* LAN IP — the
+launcher prints it to stderr at startup).
 
-### Frontend development with hot-reload
+**First-time setup (one-time, ~30 seconds):**
+
+1. The launcher generates a self-signed TLS cert + key (`~/.config/ltesniffer-gui/{cert.pem,key.pem}`) and a bcrypt-hashed credentials file (`~/.config/ltesniffer-gui/auth.json`).
+2. The auto-generated `admin` password is printed to **stderr ONCE** — capture it now. After the line scrolls off, only the bcrypt hash on disk remains; you cannot recover the plaintext.
+3. Firefox shows a "Warning: Potential Security Risk Ahead" page on first visit (self-signed cert). Click **Advanced** → **Accept the Risk and Continue**. Subsequent visits are silent.
+4. Firefox shows its native username/password dialog. Enter `admin` and the captured password. Click **Save Password** if you want the password manager to remember it.
+
+To rotate credentials: `rm ~/.config/ltesniffer-gui/auth.json && restart serve.py`.
+To rotate cert (e.g. you moved to a different LAN IP): `rm ~/.config/ltesniffer-gui/{cert,key}.pem && restart`.
+
+**Custom credentials at first start:** set the username/password explicitly via env vars (consumed once, then ignored):
 
 ```
-# shell A — backend
+LTESNIFFER_GUI_USER=alice LTESNIFFER_GUI_PASS='super secret' .venv/bin/python serve.py
+```
+
+**Custom bind / port:**
+
+```
+.venv/bin/python serve.py --host 10.0.0.5 --port 9443
+# or via env (overrides autodetect):
+LTESNIFFER_GUI_BIND=10.0.0.5 .venv/bin/python serve.py
+```
+
+### Frontend development with hot-reload (HTTP-only, for dev only)
+
+The Vite dev server proxies `/api` to a backend running on HTTP/8000:
+
+```
+# shell A — backend on HTTP for the vite proxy
 cd gui/backend && .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
 
-# shell B — Vite dev server, proxies /api → 8000
+# shell B — Vite dev server
 cd gui/frontend && npm run dev
 ```
 
-Open <http://localhost:5173/>.
+Open <http://localhost:5173/>. Basic Auth still applies; Firefox will prompt.
 
 ### Mock mode (no SDR / no sudo needed)
 
@@ -133,7 +160,7 @@ Useful for previewing the dashboard or developing the UI on a machine without
 USRPs:
 
 ```
-LTESNIFFER_GUI_MOCK=1 .venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+LTESNIFFER_GUI_MOCK=1 .venv/bin/python serve.py
 ```
 
 The backend replaces `SnifferRunner` with `MockRunner`, which emits a

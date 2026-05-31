@@ -27,7 +27,8 @@ from spectrum import SpectrumLauncher
 import captures as captures_mod
 import keys as keys_mod
 from keys import KeysFile, KEYS_PATH
-from auth import BIND, TOKEN, TOKEN_PATH, REQUIRE_LOCAL_TOKEN, require_token, require_token_ws
+from auth import BIND, AUTH_PATH, require_basic_auth, require_basic_auth_ws
+import https as https_mod
 import zmq_pub
 from metrics import MetricsBus
 from recorder import SessionRecorder, ReplayRunner
@@ -127,22 +128,17 @@ async def lifespan(app: FastAPI):
     if REPLAY:
         await runner.start(None)
     # Auth banner so the operator can't miss the security posture they're in.
-    if BIND in ("0.0.0.0", "::"):
-        log.warning(
-            "==================================================================\n"
-            "  GUI exposed on %s (LTESNIFFER_GUI_BIND=%s).\n"
-            "  Every REST + WebSocket request must carry a bearer token from\n"
-            "    %s\n"
-            "  (Loopback requests still work without it unless\n"
-            "   LTESNIFFER_GUI_REQUIRE_TOKEN_LOCAL=1 is set.)\n"
-            "==================================================================",
-            BIND, BIND, TOKEN_PATH,
-        )
-    else:
-        log.info(
-            "GUI bound to %s (loopback only). Set LTESNIFFER_GUI_BIND=0.0.0.0 "
-            "to expose to LAN. Token at %s.", BIND, TOKEN_PATH,
-        )
+    # HTTPS + HTTP Basic Auth, no loopback bypass — every request authenticates.
+    log.warning(
+        "==================================================================\n"
+        "  GUI bound to %s — HTTPS + HTTP Basic Auth (no loopback bypass).\n"
+        "  Credentials: %s\n"
+        "  First start prints the auto-generated password to stderr ONCE.\n"
+        "  Browser will show a native username/password dialog.\n"
+        "  To rotate creds: delete %s and restart.\n"
+        "==================================================================",
+        BIND, AUTH_PATH, AUTH_PATH,
+    )
     yield
     # ---- shutdown ----
     # Stop all subprocesses so nothing is orphaned when the server exits.
@@ -187,10 +183,13 @@ _recorder = SessionRecorder()
 
 app = FastAPI(title="LTESniffer GUI Backend", lifespan=lifespan)
 # Tightened CORS: spec-compliant, only allows the bind host + dev server.
+# HTTPS is the production posture; HTTP is only listed for the vite dev server
+# during frontend hacking (it talks to the backend through the vite proxy).
 _allowed_origins = [
-    f"http://{BIND}:8000" if BIND not in ("0.0.0.0", "::") else "http://127.0.0.1:8000",
-    "http://127.0.0.1:8000",
-    "http://localhost:8000",
+    f"https://{BIND}:8443",
+    f"https://{BIND}:8000",  # if operator chose 8000 for HTTPS
+    "https://127.0.0.1:8443",
+    "https://localhost:8443",
     "http://localhost:5173",  # vite dev server
     "http://127.0.0.1:5173",
 ]
@@ -203,25 +202,36 @@ app.add_middleware(
 )
 
 
-# Routes that don't require a token. /api/health stays open so a misconfigured
-# client can tell "wrong token" (401) apart from "server down" (no response).
-_AUTH_FREE_PREFIXES = ("/api/health", "/api/help", "/assets/", "/metrics")
-_AUTH_FREE_EXACT = {"/"}  # SPA index — token check happens via the WS instead
+# Routes that bypass Basic Auth. /api/health is the ONLY one — keeping it
+# open lets a misconfigured client tell "wrong creds" (401) apart from
+# "server down" (no response). Everything else — including the SPA index
+# at `/` — requires auth so the browser native dialog fires on first visit.
+_AUTH_FREE_PREFIXES = ("/api/health",)
+_AUTH_FREE_EXACT: set[str] = set()
 
 
 @app.middleware("http")
 async def _auth_gate(request, call_next):
-    """Block /api/* without a bearer token unless we're on loopback (and
-    REQUIRE_LOCAL_TOKEN isn't set). Static + index are always served so the
-    SPA can prompt the user for the token."""
+    """Block every request without valid HTTP Basic credentials. On 401,
+    propagate the WWW-Authenticate: Basic header so the browser shows its
+    native username/password dialog. No loopback bypass.
+
+    /api/health is the single exception — operators need an unauth probe
+    to distinguish "wrong creds" from "server is down"."""
     path = request.url.path
-    if path in _AUTH_FREE_EXACT or any(path.startswith(p) for p in _AUTH_FREE_PREFIXES) or not path.startswith("/api/"):
+    if path in _AUTH_FREE_EXACT or any(path.startswith(p) for p in _AUTH_FREE_PREFIXES):
         return await call_next(request)
     try:
-        await require_token(request)
+        await require_basic_auth(request)
     except HTTPException as exc:
         from fastapi.responses import JSONResponse
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        # Crucially forward the WWW-Authenticate header — without it the
+        # browser silently fails the request instead of showing the dialog.
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+            headers=dict(exc.headers or {}),
+        )
     return await call_next(request)
 
 
@@ -229,7 +239,9 @@ async def _auth_gate(request, call_next):
 # the difference between "wrong token" (401) and "server down" (no response).
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "mock": MOCK, "auth_required": BIND in ("0.0.0.0", "::") or REQUIRE_LOCAL_TOKEN}
+    # auth_required is always True with the new HTTP Basic Auth model — no
+    # loopback bypass. Field kept for client-side compatibility.
+    return {"ok": True, "mock": MOCK, "auth_required": True}
 
 
 @app.get("/metrics")
@@ -572,9 +584,11 @@ async def download_capture(path: str) -> FileResponse:
 
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
-    # Token check BEFORE accept(): we don't want to give an unauthed peer a
-    # 101 upgrade response with our subprotocol/server info.
-    if not await require_token_ws(ws):
+    # Auth check BEFORE accept(): we don't want to give an unauthed peer a
+    # 101 upgrade response with our subprotocol/server info. Modern browsers
+    # auto-include the cached Authorization: Basic header on a WS upgrade to
+    # the same origin where Basic Auth was satisfied for the SPA load.
+    if not await require_basic_auth_ws(ws):
         return
     await ws.accept()
     # Subscribe *after* capturing the replay snapshot so events that arrive

@@ -1,69 +1,46 @@
 import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse } from "./types";
 
-// ---- bearer-token handling --------------------------------------------------
+// ---- HTTP Basic Auth over HTTPS --------------------------------------------
 //
-// On loopback the backend doesn't require a token, but if the operator opens
-// the GUI from another host they need one. We:
-//   1. Look for ?token=<hex> in the current URL, persist it to localStorage,
-//      then strip it from the visible URL.
-//   2. Attach the token as Authorization: Bearer <hex> on every REST call.
-//   3. Append ?token=<hex> to the WS URL (store.ts handles that side).
-// A 401 from any REST call clears the cached token and prompts.
+// The browser handles the auth UI natively: on the first request that comes
+// back with `WWW-Authenticate: Basic`, Firefox/Chrome pop a username/password
+// dialog. Once the user enters credentials, the browser caches them for the
+// origin and auto-includes `Authorization: Basic <b64>` on every subsequent
+// request — REST AND WebSocket — for as long as the tab/window lives.
+//
+// That means there is nothing for the SPA to do for auth: no token, no
+// localStorage, no URL fragment, no JS-side login form. fetch() just works,
+// and a 401 here means the browser-cached creds are wrong (next page-load
+// the browser will re-prompt).
 
-const TOKEN_KEY = "ltesniffer_gui_token";
-
-function _captureTokenFromUrl(): void {
-  try {
-    const u = new URL(window.location.href);
-    const tok = u.searchParams.get("token");
-    if (tok && /^[0-9a-fA-F]{32,128}$/.test(tok)) {
-      localStorage.setItem(TOKEN_KEY, tok);
-      u.searchParams.delete("token");
-      window.history.replaceState({}, "", u.toString());
-    }
-  } catch {}
-}
-
-function getToken(): string | null {
-  _captureTokenFromUrl();
-  try {
-    return localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
-}
-
-export function setToken(t: string | null): void {
-  try {
-    if (t) localStorage.setItem(TOKEN_KEY, t);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch {}
-}
-
+// kept exported so the WS connector doesn't have to know the auth model —
+// today it returns null (browser handles WS auth via cached Basic creds);
+// if we ever need a cookie/token, this is the seam.
 export function getTokenForWS(): string | null {
-  return getToken();
+  return null;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const tok = getToken();
   const headers: Record<string, string> = {
     "content-type": "application/json",
     ...((init?.headers as Record<string, string>) ?? {}),
   };
-  if (tok) headers["authorization"] = `Bearer ${tok}`;
-  const res = await fetch(path, { ...init, headers });
+  const res = await fetch(path, {
+    ...init,
+    headers,
+    // Send the browser-cached Basic Auth credentials on cross-origin fetches
+    // too (e.g. vite dev server proxying to backend). Same-origin requests
+    // include them by default.
+    credentials: "same-origin",
+  });
   if (res.status === 401) {
-    // Likely stale / wrong token — prompt user.
-    const supplied = window.prompt(
-      "GUI requires a bearer token (see ~/.config/ltesniffer-gui/token on the backend host).\nPaste the 64-hex token here:",
-      tok ?? "",
-    );
-    if (supplied && supplied.trim()) {
-      setToken(supplied.trim());
-      return req<T>(path, init);  // retry once with new token
+    // Browser-cached Basic creds are wrong; force a hard reload so the
+    // browser re-issues the auth dialog. No JS prompt — we want the
+    // native dialog so the password manager can offer to save the creds.
+    if (typeof window !== "undefined") {
+      window.location.reload();
     }
-    setToken(null);
-    throw new Error("401: missing or invalid bearer token");
+    throw new Error("401: re-authenticating");
   }
   if (!res.ok) {
     let detail = res.statusText;

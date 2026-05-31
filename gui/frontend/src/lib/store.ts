@@ -455,16 +455,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     function connect() {
       if (cancelled) return;
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      // Inject bearer token via ?token= for the WS handshake (headers can't be
-      // set on the browser-side WebSocket constructor).
-      // Lazy import to avoid a circular dep: api.ts imports types only.
-      const tok = (() => {
-        try {
-          return (window as any).localStorage?.getItem?.("ltesniffer_gui_token") || null;
-        } catch { return null; }
-      })();
-      const qs = tok ? `?token=${encodeURIComponent(tok)}` : "";
-      const url = `${proto}//${window.location.host}/api/events${qs}`;
+      // No token in the URL — the browser auto-includes the cached HTTP
+      // Basic Auth credentials on the WS upgrade because we're on the same
+      // origin where Basic Auth was satisfied for the SPA load. (Browsers
+      // can't set custom Authorization headers on the WebSocket constructor,
+      // but cached Basic creds for the origin go through automatically.)
+      const url = `${proto}//${window.location.host}/api/events`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
 

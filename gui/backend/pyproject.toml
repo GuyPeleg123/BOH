@@ -7,6 +7,14 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "pydantic>=2.6",
+    # HTTP Basic Auth credentials are stored as a bcrypt hash on disk so a
+    # compromised auth.json doesn't reveal the password — bcrypt handles the
+    # salting + verify. Pinned to v4 to avoid the 4.x→5.x API change on the
+    # horizon.
+    "bcrypt>=4.0,<5.0",
+    # Self-signed TLS cert + key are generated in pure Python on first start
+    # (no openssl binary dependency, works the same on every distro).
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
