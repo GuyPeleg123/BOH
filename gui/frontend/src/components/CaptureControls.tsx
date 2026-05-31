@@ -37,18 +37,42 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
     ? "UL frequency is not set — go to Config and set UL frequency before starting"
     : undefined;
 
+  // Visual state: highlight the action that matches the current lifecycle,
+  // ghost the others. Concretely:
+  //   * stopped  → Start is solid, Stop/Restart are subdued
+  //   * running  → Stop  is solid, Start (disabled) and Restart are highlighted
+  // This is mostly cosmetic but in busy dashboards the right next-action
+  // jumps out at a glance.
+  const startCls   = !running ? "btn btn-ok"           : "btn btn-ok opacity-50";
+  const stopCls    = running  ? "btn btn-danger"       : "btn btn-danger opacity-50";
+  const restartCls = "btn btn-primary";
+
   const body = (
     <>
       <button
-        className="btn btn-ok"
+        className={startCls}
         disabled={startDisabled}
-        title={startTitle}
+        title={startTitle ?? (running ? "Already running — use Restart" : "Start a new capture")}
         onClick={() => run(() => api.start())}
       >
-        ▶ Start
+        <span aria-hidden>▶</span> Start
       </button>
-      <button className="btn btn-danger" disabled={busy || !running} onClick={() => run(() => api.stop())}>■ Stop</button>
-      <button className="btn btn-primary" disabled={busy} onClick={() => run(() => api.restart())}>⟳ Restart</button>
+      <button
+        className={stopCls}
+        disabled={busy || !running}
+        title={running ? "Stop the running capture" : "No capture is running"}
+        onClick={() => run(() => api.stop())}
+      >
+        <span aria-hidden>■</span> Stop
+      </button>
+      <button
+        className={restartCls}
+        disabled={busy}
+        title="Stop (if running) and start fresh"
+        onClick={() => run(() => api.restart())}
+      >
+        <span aria-hidden>⟳</span> Restart
+      </button>
     </>
   );
 
