@@ -7,10 +7,15 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 CONFIG_PATH = Path.home() / ".config" / "ltesniffer-gui" / "config.json"
+
+# The only legal LTE downlink bandwidths, in PRBs. Anything else (e.g. a stray
+# 125) makes srsRAN's FFT/MIB init fail with "Invalid number of PRB" and the
+# sniffer never starts — so we snap bad values to the nearest legal one.
+VALID_PRB = (6, 15, 25, 50, 75, 100)
 
 
 class SnifferConfig(BaseModel):
@@ -38,6 +43,15 @@ class SnifferConfig(BaseModel):
     cell_id: int = Field(0, description="Fixed cell ID when -C disabled. -I")
     nof_prb: int = Field(50, description="PRBs of fixed cell. -p")
     target_rnti: int = Field(0, description="Only decode this RNTI; 0 = all. -r")
+
+    @field_validator("nof_prb")
+    @classmethod
+    def _snap_nof_prb(cls, v: int) -> int:
+        # Guard against an illegal value (typed in the form or hand-edited in
+        # config.json) that would otherwise crash the FFT/MIB decoder at start.
+        if v in VALID_PRB:
+            return v
+        return min(VALID_PRB, key=lambda p: abs(p - v))
 
     # --- Decoder tuning ---
     nof_sniffer_thread: int = Field(4, ge=2, description="Number of worker threads. -W")

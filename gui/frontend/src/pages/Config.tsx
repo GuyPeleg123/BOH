@@ -68,7 +68,7 @@ const SECTIONS: Section[] = [
       { key: "api_mode",     label: "API mode",     flag: "-z", widget: "select" },
       { key: "cell_search",  label: "Enable cell search (-C)", flag: "-C" },
       { key: "cell_id",      label: "Fixed cell ID (when -C off)", flag: "-I" },
-      { key: "nof_prb",      label: "PRBs (fixed cell)", flag: "-p" },
+      { key: "nof_prb",      label: "PRBs (fixed cell)", flag: "-p", widget: "select" },
       { key: "target_rnti",  label: "Target RNTI (0 = all)", flag: "-r" },
     ],
     selectOptions: {
@@ -83,6 +83,16 @@ const SECTIONS: Section[] = [
         { value: 1,  label: "1 — IMSI collecting" },
         { value: 2,  label: "2 — UE capability" },
         { value: 3,  label: "3 — all" },
+      ],
+      // Only legal LTE bandwidths — prevents an invalid value (e.g. 125) that
+      // crashes the FFT/MIB init with "Invalid number of PRB".
+      nof_prb: [
+        { value: 6,   label: "6 — 1.4 MHz" },
+        { value: 15,  label: "15 — 3 MHz" },
+        { value: 25,  label: "25 — 5 MHz" },
+        { value: 50,  label: "50 — 10 MHz" },
+        { value: 75,  label: "75 — 15 MHz" },
+        { value: 100, label: "100 — 20 MHz" },
       ],
     },
   },
