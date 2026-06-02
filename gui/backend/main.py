@@ -403,6 +403,10 @@ async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
 
 @app.get("/api/usrps")
 async def list_usrps() -> dict[str, Any]:
+    # NEVER enumerate USB (uhd_find_devices) while a capture holds the USRPs —
+    # the scan resets the bus and disconnects the running radios.
+    if runner.running:
+        return {"devices": [], "running": True, "skipped": "capture running"}
     return {"devices": await find_devices()}
 
 
@@ -414,6 +418,11 @@ async def usrps_autoconfig() -> dict[str, Any]:
     user having to type them manually.  Keys starting with '_' are metadata
     (not SnifferConfig fields) and should not be written to the config.
     """
+    # Auto-detect runs uhd_find_devices — skip entirely while capturing so it
+    # can't reset the bus out from under the live radios.
+    if runner.running:
+        return {"_running": True,
+                "_message": "Capture running — USRP auto-detect skipped to avoid disturbing the radios."}
     return await auto_config_patch()
 
 
@@ -425,6 +434,11 @@ async def probe_usrps_gpsdo() -> dict[str, Any]:
     this in the background after auto-config and uses the result to
     conditionally add clock=gpsdo to usrp_a_args / usrp_b_args.
     """
+    # uhd_usrp_probe OPENS each device — absolutely must not run during a
+    # capture or it yanks the USRP away from the running sniffer.
+    if runner.running:
+        return {"devices": [], "running": True,
+                "message": "Capture running — GPSDO probe skipped (uhd_usrp_probe would reset the radios)."}
     devices = await find_devices()
     if not devices:
         return {"devices": [], "message": "No USRPs detected."}

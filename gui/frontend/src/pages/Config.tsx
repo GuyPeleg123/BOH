@@ -201,47 +201,55 @@ export function ConfigPage() {
     return 0;
   }
 
-  // --- mount: load config + usrps together, then smart auto-detect ---
+  // --- mount: always load config; probe USRPs ONLY when not capturing ---
   useEffect(() => {
     api.getKnownCells()
       .then((r) => { setKnownCells(r.cells); setKnownCellsPath(r.path); })
       .catch(() => {});
 
-    // Load config and USRP list in parallel, then decide whether to auto-patch
-    Promise.all([api.getConfig(), api.usrps()])
-      .then(([config, usrpResult]) => {
+    api.getConfig()
+      .then((config) => {
         setCfg(config);
-        setUsrps(usrpResult.devices);
-        prevCountRef.current = usrpResult.devices.length;
 
-        const detected = usrpResult.devices.length;
-        const configured = configuredUsrpCount(config);
-
-        if (detected === 0) {
-          showAutoMsg("No USRPs detected — check USB connection.");
+        // CRITICAL: never enumerate or probe the USRPs while a capture is
+        // running. uhd_find_devices (USB scan) and uhd_usrp_probe (opens the
+        // device) reset the bus and disconnect the live radios — opening the
+        // Config tab mid-capture used to do exactly that. Just load the form.
+        if (lifecycleRef.current === "running") {
+          showAutoMsg("Capture running — USRP detection paused so it can't disturb the radios. Stop the capture to auto-detect.");
           return;
         }
 
-        if (detected < configured && configured > 0) {
-          // Fewer USRPs than configured: warn but don't touch the form
-          showAutoMsg(
-            `${detected} USRP(s) detected but config expects ${configured}. Check USB connections — form not changed.`
-          );
-          return;
-        }
+        return api.usrps().then((usrpResult) => {
+          setUsrps(usrpResult.devices);
+          prevCountRef.current = usrpResult.devices.length;
 
-        // detected >= configured (or nothing configured): apply auto-detect
-        api.get<Record<string, any>>("/api/usrps/autoconfig")
-          .then((patch) => {
-            const patchDetected: number = patch._detected_devices?.length ?? 0;
-            // Double-check: only apply if patch doesn't downgrade
-            if (patchDetected >= configured || configured === 0) {
-              applyPatch(patch);
-            }
-            showAutoMsg(patch._message ?? "Auto-detect complete.");
-            if (patchDetected >= 2) fireGpsdoProbe();
-          })
-          .catch(() => {});
+          const detected = usrpResult.devices.length;
+          const configured = configuredUsrpCount(config);
+
+          if (detected === 0) {
+            showAutoMsg("No USRPs detected — check USB connection.");
+            return;
+          }
+          if (detected < configured && configured > 0) {
+            showAutoMsg(
+              `${detected} USRP(s) detected but config expects ${configured}. Check USB connections — form not changed.`
+            );
+            return;
+          }
+
+          // detected >= configured (or nothing configured): apply auto-detect
+          return api.get<Record<string, any>>("/api/usrps/autoconfig")
+            .then((patch) => {
+              const patchDetected: number = patch._detected_devices?.length ?? 0;
+              if (patchDetected >= configured || configured === 0) {
+                applyPatch(patch);
+              }
+              showAutoMsg(patch._message ?? "Auto-detect complete.");
+              if (patchDetected >= 2) fireGpsdoProbe();
+            })
+            .catch(() => {});
+        });
       })
       .catch((e) => setErr(e.message));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
