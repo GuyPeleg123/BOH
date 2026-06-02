@@ -270,6 +270,7 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
           rntis = new Map();
           sfHistory = [];
           recentDci = [];
+          logs = [];   // clear the live log panel — each run starts fresh
           totals = { dci: 0, dci_dl: 0, dci_ul: 0, tbs: 0, rb: 0, sf: 0 };
           rateSamples = [];
           cell = null;

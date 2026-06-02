@@ -113,6 +113,7 @@ class SnifferRunner:
         self._stderr_task: Optional[asyncio.Task] = None
         self._wait_task: Optional[asyncio.Task] = None  # tracked so we can cancel on restart
         self._run_dir: Optional[Path] = None            # timestamped subdir for this run's pcaps
+        self._log_fp = None                             # per-run sniffer.log for the history browser
         self._subscribers: set[asyncio.Queue] = set()
         self._last_events: deque[dict[str, Any]] = deque(maxlen=500)
         self._dropped_for_slow_consumer = 0
@@ -234,6 +235,15 @@ class SnifferRunner:
         run_dir.mkdir(parents=True, exist_ok=True)
         self._run_dir = run_dir
 
+        # Persist this run's sniffer output to run_dir/sniffer.log so the GUI's
+        # log-history browser can show it later. Best-effort — never let logging
+        # break the capture.
+        try:
+            self._log_fp = open(run_dir / "sniffer.log", "w", buffering=1)
+            self._log_fp.write(f"# LTESniffer run {run_tag}\n# argv: {' '.join(argv)}\n")
+        except OSError:
+            self._log_fp = None
+
         # If the user opted into the live pcap-stream FIFO, ensure it exists
         # as an actual FIFO. The C++ side opens it O_WRONLY|O_NONBLOCK, which
         # fails with ENXIO if no reader is connected — log a hint so the user
@@ -275,6 +285,7 @@ class SnifferRunner:
                 self._reader_task.cancel()
                 self._reader_task = None
             self._cleanup_fifo()
+            self._close_log()
             self._state.update(running=False, pid=None, last_error=str(e))
             raise
         self._state["pid"] = self._proc.pid
@@ -399,6 +410,15 @@ class SnifferRunner:
             # Always release the FIFO/temp dir even if broadcast/cancel raised,
             # so an exit can never leak the pipe or strand the UI's state.
             self._cleanup_fifo()
+            self._close_log()
+
+    def _close_log(self) -> None:
+        if self._log_fp is not None:
+            try:
+                self._log_fp.close()
+            except OSError:
+                pass
+            self._log_fp = None
 
     def _cleanup_fifo(self) -> None:
         if self._fifo_dir:
@@ -431,6 +451,11 @@ class SnifferRunner:
                     msg = _redact_keys(msg)
                     level = self._stderr_level(msg)
                     self._broadcast({"t": "log", "level": level, "source": "stderr", "msg": msg})
+                    if self._log_fp is not None:
+                        try:
+                            self._log_fp.write(msg + "\n")
+                        except OSError:
+                            pass
         except asyncio.CancelledError:
             pass
 

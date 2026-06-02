@@ -98,4 +98,16 @@ export const api = {
       "/api/wireshark/open", { method: "POST" }),
   downloadCaptureUrl: (path: string) =>
     `/api/captures/download?path=${encodeURIComponent(path)}`,
+  logHistory: () =>
+    req<{ runs: RunLog[] }>("/api/logs/history"),
+  logContent: (path: string) =>
+    req<{ path: string; text: string }>(`/api/logs/content?path=${encodeURIComponent(path)}`),
 };
+
+export interface RunLog {
+  run: string;            // timestamped run tag (= start date/time)
+  started: string | null; // ISO start time, or null for a non-standard name
+  path: string;
+  size: number;
+  mtime: number;
+}

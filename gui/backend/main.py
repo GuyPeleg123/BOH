@@ -26,6 +26,7 @@ from mock import MockRunner
 from usrp import find_devices, auto_config_patch, probe_all_gpsdo
 from spectrum import SpectrumLauncher
 import captures as captures_mod
+import runlogs
 import keys as keys_mod
 from keys import KeysFile, KEYS_PATH
 from auth import (
@@ -629,6 +630,25 @@ async def analytics_rnti_churn(path: str) -> dict[str, Any]:
     if not str(p).endswith(".jsonl.zst"):
         raise HTTPException(415, "expected .jsonl.zst session file")
     return analytics.analyze_rnti_churn(p)
+
+
+@app.get("/api/logs/history")
+async def list_log_history() -> dict[str, Any]:
+    """List past sniffer-run logs (one per capture run), newest first."""
+    cfg = config_mod.load()
+    return {"runs": runlogs.list_run_logs(cfg)}
+
+
+@app.get("/api/logs/content")
+async def get_log_content(path: str) -> dict[str, Any]:
+    """Return the text of one run's sniffer.log (restricted to captures_dir)."""
+    cfg = config_mod.load()
+    try:
+        return {"path": path, "text": runlogs.read_run_log(cfg, path)}
+    except FileNotFoundError:
+        raise HTTPException(404, f"log not found: {path}")
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
 
 
 @app.get("/api/captures")
