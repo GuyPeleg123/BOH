@@ -15,9 +15,12 @@ export function Dashboard() {
   const [bottomTab, setBottomTab] = useState<"logs" | "history" | "captures" | "identities">("logs");
 
   return (
-    <div className="p-3 flex flex-col gap-3 h-full overflow-y-auto">
+    <div className="p-3 flex flex-col gap-3 h-full overflow-hidden">
+      {/* The dashboard fills the viewport and never page-scrolls — each region
+          (packet feed, RNTI table, log footer) scrolls internally instead, so
+          the log panel is always visible without scrolling the whole page. */}
       {/* row 1: capture + spectrum on left, cell card stretches right */}
-      <div className="flex items-stretch gap-3">
+      <div className="flex items-stretch gap-3 shrink-0">
         <div className="panel p-3 flex items-center gap-2 shrink-0">
           <CaptureControls compact />
         </div>
@@ -49,7 +52,7 @@ export function Dashboard() {
       </div>
 
       {/* row 4: tabbed footer */}
-      <div className="panel p-3 flex flex-col min-h-0" style={{ flexBasis: "180px", flexShrink: 0 }}>
+      <div className="panel p-3 flex flex-col min-h-0" style={{ flexBasis: "240px", flexShrink: 0 }}>
         <div className="flex gap-1 mb-2">
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "logs" ? "btn-primary" : ""}`} onClick={() => setBottomTab("logs")}>Logs</button>
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "history" ? "btn-primary" : ""}`} onClick={() => setBottomTab("history")}>Log History</button>

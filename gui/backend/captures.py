@@ -78,11 +78,15 @@ def list_pcaps(cfg: SnifferConfig, sniffer_running: bool = False) -> list[dict]:
                 st = rp.stat()
             except OSError:
                 continue
-            in_captures_dir = rp.parent == captures
+            # The live pcap lands in a per-run SUBDIRECTORY of captures_dir
+            # (captures_dir/<run-tag>/ltesniffer_*.pcap), so "directly in
+            # captures_dir" missed it — treat anything under the captures tree
+            # as a capture-dir file so the active badge actually lights up.
+            under_captures = (rp == captures) or (captures in rp.parents)
             fresh = (now - st.st_mtime) <= LIVE_MTIME_WINDOW_S
-            active = sniffer_running and in_captures_dir and fresh
+            active = sniffer_running and under_captures and fresh
             source = "active capture" if active else (
-                str(captures) if in_captures_dir else str(root)
+                str(captures) if under_captures else str(root)
             )
             out.append({
                 "path": str(rp),
