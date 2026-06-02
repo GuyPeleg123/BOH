@@ -123,8 +123,6 @@ const SECTIONS: Section[] = [
 
 export function ConfigPage() {
   const lifecycle = useStore((s) => s.lifecycle);
-  const lifecycleRef = useRef(lifecycle);
-  useEffect(() => { lifecycleRef.current = lifecycle; }, [lifecycle]);
 
   const [cfg, setCfg] = useState<SnifferConfig | null>(null);
   const [usrps, setUsrps] = useState<USRPDevice[]>([]);
@@ -133,11 +131,9 @@ export function ConfigPage() {
   const [busy, setBusy] = useState(false);
   const [autoMsg, setAutoMsg] = useState<string | null>(null);
   const [gpsdoMsg, setGpsdoMsg] = useState<string | null>(null);
-  const [pollMsg, setPollMsg] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  const prevCountRef = useRef<number>(-1);
   const autoMsgTimerRef = useRef<number | null>(null);
   const gpsdoMsgTimerRef = useRef<number | null>(null);
 
@@ -194,106 +190,17 @@ export function ConfigPage() {
       .catch(() => showGpsdoMsg("GPSDO probe failed — check that uhd_usrp_probe is installed."));
   }
 
-  // Count how many USRPs the current config addresses (0, 1, or 2)
-  function configuredUsrpCount(c: SnifferConfig): number {
-    if (c.usrp_a_args && c.usrp_b_args) return 2;
-    if (c.rf_args || c.usrp_a_args || c.usrp_b_args) return 1;
-    return 0;
-  }
-
-  // --- mount: always load config; probe USRPs ONLY when not capturing ---
+  // --- mount: load the form only. NO hardware probing, ever — the radios are
+  // touched only when the user explicitly clicks "Auto-detect USRPs". This
+  // fully decouples the Config tab from the hardware, so opening it can never
+  // disturb a running capture (no uhd_find_devices, no uhd_usrp_probe). ---
   useEffect(() => {
     api.getKnownCells()
       .then((r) => { setKnownCells(r.cells); setKnownCellsPath(r.path); })
       .catch(() => {});
-
     api.getConfig()
-      .then((config) => {
-        setCfg(config);
-
-        // CRITICAL: never enumerate or probe the USRPs while a capture is
-        // running. uhd_find_devices (USB scan) and uhd_usrp_probe (opens the
-        // device) reset the bus and disconnect the live radios — opening the
-        // Config tab mid-capture used to do exactly that. Just load the form.
-        if (lifecycleRef.current === "running") {
-          showAutoMsg("Capture running — USRP detection paused so it can't disturb the radios. Stop the capture to auto-detect.");
-          return;
-        }
-
-        return api.usrps().then((usrpResult) => {
-          setUsrps(usrpResult.devices);
-          prevCountRef.current = usrpResult.devices.length;
-
-          const detected = usrpResult.devices.length;
-          const configured = configuredUsrpCount(config);
-
-          if (detected === 0) {
-            showAutoMsg("No USRPs detected — check USB connection.");
-            return;
-          }
-          if (detected < configured && configured > 0) {
-            showAutoMsg(
-              `${detected} USRP(s) detected but config expects ${configured}. Check USB connections — form not changed.`
-            );
-            return;
-          }
-
-          // detected >= configured (or nothing configured): apply auto-detect
-          return api.get<Record<string, any>>("/api/usrps/autoconfig")
-            .then((patch) => {
-              const patchDetected: number = patch._detected_devices?.length ?? 0;
-              if (patchDetected >= configured || configured === 0) {
-                applyPatch(patch);
-              }
-              showAutoMsg(patch._message ?? "Auto-detect complete.");
-              if (patchDetected >= 2) fireGpsdoProbe();
-            })
-            .catch(() => {});
-        });
-      })
+      .then(setCfg)
       .catch((e) => setErr(e.message));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // --- 5-second USRP poll ---
-  useEffect(() => {
-    const id = window.setInterval(async () => {
-      // Never call uhd_find_devices while the sniffer is running — it competes for USB
-      if (lifecycleRef.current === "running") return;
-
-      try {
-        const r = await api.usrps();
-        const newCount = r.devices.length;
-        const prevCount = prevCountRef.current;
-        setUsrps(r.devices);
-
-        if (prevCount === -1) { prevCountRef.current = newCount; return; }
-        if (newCount === prevCount) return;
-        prevCountRef.current = newCount;
-
-        if (newCount > prevCount) {
-          // More USRPs connected: apply auto-detect if it improves config
-          const patch = await api.get<Record<string, any>>("/api/usrps/autoconfig").catch(() => null);
-          if (patch) {
-            applyPatch(patch);
-            showAutoMsg(`Hardware changed: ${patch._message ?? `${newCount} USRP(s) detected — config updated.`}`);
-            if (newCount >= 2) fireGpsdoProbe();
-          }
-          setPollMsg(null);
-        } else {
-          // Fewer USRPs: auto-downgrade sniffer_mode if it requires more USRPs than available
-          if (newCount < 2) {
-            setCfg((c) =>
-              c && (c.sniffer_mode === 1 || c.sniffer_mode === 2)
-                ? { ...c, sniffer_mode: 0 }
-                : c
-            );
-          }
-          const modeNote = newCount < 2 ? " Switched to DL-only mode." : "";
-          setPollMsg(`⚠ USRP count dropped to ${newCount}.${modeNote} Check connections.`);
-        }
-      } catch {}
-    }, 5000);
-    return () => window.clearInterval(id);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // --- known cells helpers ---
@@ -360,6 +267,9 @@ export function ConfigPage() {
     try {
       const patch = await api.get<Record<string, any>>("/api/usrps/autoconfig");
       applyPatch(patch);
+      // Populate the "Detected USRPs" panel from this explicit probe (the mount
+      // no longer auto-fills it, by design).
+      setUsrps((patch._detected_devices ?? []) as USRPDevice[]);
       showAutoMsg(patch._message ?? "Auto-detect complete.", 10000);
       const count: number = patch._detected_devices?.length ?? 0;
       if (count >= 2) fireGpsdoProbe();
@@ -509,7 +419,14 @@ export function ConfigPage() {
         <div className="ml-auto flex items-center gap-2 flex-wrap">
           {saved && <span className="text-ok text-sm">{saved}</span>}
           {err && <span className="text-bad text-sm font-mono">{err}</span>}
-          <button className="btn" disabled={busy} onClick={autoDetect} title="Detect connected USRPs and fill serial/rfargs automatically">
+          <button
+            className="btn"
+            disabled={busy || lifecycle === "running"}
+            onClick={autoDetect}
+            title={lifecycle === "running"
+              ? "Stop the capture first — probing USRPs would reset the running radios"
+              : "Detect connected USRPs and fill serial/rfargs automatically"}
+          >
             🔍 Auto-detect USRPs
           </button>
           <button className="btn" disabled={busy} onClick={save}>Save</button>
@@ -520,7 +437,7 @@ export function ConfigPage() {
       </div>
 
       {/* Status banners — auto-dismiss after a few seconds */}
-      {(autoMsg || gpsdoMsg || pollMsg) && (
+      {(autoMsg || gpsdoMsg) && (
         <div className="flex flex-col gap-1 mb-3">
           {autoMsg && (
             <div className={`text-xs px-3 py-1.5 rounded border ${autoMsg.includes("⚠") || autoMsg.includes("expects") ? "bg-warn/10 text-warn border-warn/20" : "bg-ok/10 text-ok border-ok/20"}`}>
@@ -530,11 +447,6 @@ export function ConfigPage() {
           {gpsdoMsg && (
             <div className={`text-xs px-3 py-1.5 rounded border ${gpsdoMsg.includes("NOT") || gpsdoMsg.includes("No GPSDO") || gpsdoMsg.includes("failed") ? "bg-warn/10 text-warn border-warn/20" : "bg-ok/10 text-ok border-ok/20"}`}>
               📡 {gpsdoMsg}
-            </div>
-          )}
-          {pollMsg && (
-            <div className="text-xs px-3 py-1.5 rounded bg-warn/10 text-warn border border-warn/20">
-              ⚠ {pollMsg}
             </div>
           )}
         </div>
