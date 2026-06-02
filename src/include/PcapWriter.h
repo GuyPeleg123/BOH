@@ -87,18 +87,8 @@ private:
     void rotate_if_needed_locked();
     std::string make_rotated_name(const std::string& base);
 
-    // Live-stream FIFO for Wireshark. pcap_stream_file_ is the open write end
-    // (null until a reader attaches); pcap_stream_path_ remembers the target so
-    // the write path can lazily (re)open it if Wireshark is launched after the
-    // capture starts. stream_last_attempt_ms_ throttles those retry opens.
-    FILE*       pcap_stream_file_       = nullptr;
-    std::string pcap_stream_path_;            // LTESNIFFER_PCAP_STREAM; empty = disabled
-    long long   stream_last_attempt_ms_ = 0;  // monotonic ms of last (re)open attempt
-    bool        stream_open_warned_     = false; // log non-ENXIO open errors once
-    // Try to open pcap_stream_path_ O_WRONLY|O_NONBLOCK and write the libpcap
-    // global header on success. No-op if already open or streaming disabled.
-    // ENXIO (no reader yet) is silent so the periodic retry can pick it up.
-    void try_open_stream_locked();
+    // Live-stream FIFO for Wireshark
+    FILE* pcap_stream_file_ = nullptr;
 
     void pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes, uint32_t reTX, bool crc_ok, uint32_t tti,
                                 uint16_t crnti_, uint8_t direction, uint8_t rnti_type);
