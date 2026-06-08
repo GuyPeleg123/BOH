@@ -228,6 +228,10 @@ int dl_sniffer_config_mimo_layers(const srsran_cell_t* cell, const srsran_dci_dl
       grant->nof_layers = cell->nof_ports;
       break;
     case SRSRAN_TXSCHEME_SPATIALMUX:
+      if (cell->nof_ports > 2) {
+        /* srsRAN predecoding_multiplex only implements 1 and 2 Tx ports */
+        return SRSRAN_ERROR;
+      }
       if (nof_tb == 1) {
         grant->nof_layers = 1;
       } else if (nof_tb == 2) {
@@ -242,6 +246,10 @@ int dl_sniffer_config_mimo_layers(const srsran_cell_t* cell, const srsran_dci_dl
            grant->pmi);
       break;
     case SRSRAN_TXSCHEME_CDD:
+      if (cell->nof_ports > 2) {
+        /* srsRAN predecoding_ccd only implements 2 Tx ports */
+        return SRSRAN_ERROR;
+      }
       if (nof_tb != 2) {
         INFO("Wrong number of transport blocks (%d) for CDD.", nof_tb);
         return SRSRAN_ERROR;
