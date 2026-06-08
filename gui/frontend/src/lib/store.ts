@@ -468,11 +468,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     function connect() {
       if (cancelled) return;
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      // No token in the URL — the browser auto-includes the cached HTTP
-      // Basic Auth credentials on the WS upgrade because we're on the same
-      // origin where Basic Auth was satisfied for the SPA load. (Browsers
-      // can't set custom Authorization headers on the WebSocket constructor,
-      // but cached Basic creds for the origin go through automatically.)
+      // No token in the URL — the browser auto-includes the session cookie
+      // on the WS upgrade because the WebSocket is same-origin. Browsers
+      // send credentials (cookies) on WS upgrades to the same origin without
+      // any JS intervention, which is why we use cookie auth rather than
+      // putting a token in the URL (URL tokens are logged in server access logs).
       const url = `${proto}//${window.location.host}/api/events`;
       const ws = new WebSocket(url);
       wsRef.current = ws;

@@ -19,6 +19,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["httpx", "pytest", "pytest-asyncio"]
+# Optional sinks — each is lazily imported at runtime and degrades gracefully
+# if missing; install all of them to get the full feature set.
+extras = [
+    "prometheus_client>=0.19",  # /metrics Prometheus exporter (metrics.py)
+    "zstandard>=0.22",          # session recorder + replay (recorder.py)
+    "pyzmq>=25",                # ZMQ PUB event sink (zmq_pub.py)
+]
 
 [build-system]
 requires = ["setuptools>=64"]

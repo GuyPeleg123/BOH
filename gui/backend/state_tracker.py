@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -147,9 +146,9 @@ class StateTracker:
         ue["dl_count" if direction == "dl" else "ul_count"] += 1
 
     def _sweep(self) -> None:
-        now = time.monotonic()
-        # Use the latest 'ts' we've seen, not wall clock, because event ts is
-        # the C++ emitter's elapsed seconds.
+        # Use the latest event 'ts' (C++ elapsed seconds) rather than wall
+        # clock — so a replay at the correct event-time pacing still triggers
+        # idle/forget transitions properly.
         latest = max((u["last_seen"] for u in self._ues.values()), default=0)
         for rnti, ue in list(self._ues.items()):
             ago = latest - ue["last_seen"]

@@ -94,7 +94,6 @@ export interface SnifferConfig {
   rnti_histogram_threshold: number;
   mcs_tracking_mode: number;
   en_debug: boolean;
-  pcap_file: string;
   dci_file_name: string;
   stats_file_name: string;
   keys_file: string;

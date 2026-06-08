@@ -112,7 +112,6 @@ const SECTIONS: Section[] = [
   {
     title: "Output files",
     fields: [
-      { key: "pcap_file",       label: "PCAP file", flag: "-F", widget: "text" },
       { key: "dci_file_name",   label: "DCI output (empty = stdout)", flag: "-D", widget: "text" },
       { key: "stats_file_name", label: "Stats file", flag: "-E", widget: "text" },
       { key: "keys_file",       label: "PDCP key JSON", flag: "-K", widget: "text" },

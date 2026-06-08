@@ -56,7 +56,7 @@ def _generate(cert_path: Path, key_path: Path, bind_ip: str) -> None:
         x509.NameAttribute(NameOID.COMMON_NAME, bind_ip or "localhost"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LTESniffer GUI (self-signed)"),
     ])
-    now = _dt.datetime.utcnow()
+    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
