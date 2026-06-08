@@ -59,7 +59,11 @@ export function Dashboard() {
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "captures" ? "btn-primary" : ""}`} onClick={() => setBottomTab("captures")}>Captures</button>
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "identities" ? "btn-primary" : ""}`} onClick={() => setBottomTab("identities")}>Identities</button>
         </div>
-        <div className="flex-1 min-h-0">
+        {/* flex flex-col is REQUIRED: the embedded panels use `flex-1` to claim
+            the height and scroll internally. Without it this wrapper is a block,
+            `flex-1` collapses, and the log/captures content overflows + gets
+            clipped by the page's overflow-hidden instead of scrolling. */}
+        <div className="flex-1 min-h-0 flex flex-col">
           {bottomTab === "logs"
             ? <LogPanel embedded />
             : bottomTab === "history"

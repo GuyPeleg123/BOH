@@ -2,7 +2,9 @@ import React, { useEffect, useRef, useSyncExternalStore } from "react";
 import type { Event, RuntimeState } from "./types";
 
 const SF_HISTORY = 300;          // ring buffer for waterfall
-const LOG_HISTORY = 500;
+const LOG_HISTORY = 5000;        // live-panel scrollback depth (the COMPLETE
+                                 // per-run log is always on disk + in the Log
+                                 // History tab; this just bounds the in-memory tail)
 const RECENT_DCI = 200;          // live packet feed depth
 const RNTI_CAP = 4000;           // hard cap on tracked RNTIs (16-bit space, but
 const RNTI_KEEP = 3000;          // evicting LRU keeps the RNTITable sort cheap)
