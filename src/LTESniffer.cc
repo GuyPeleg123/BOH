@@ -14,7 +14,11 @@ using namespace std;
 
 int main(int argc, char** argv) {
   cout << endl;
+#ifdef LTESNIFFER_VERSION
+  cout << "LTESniffer " << LTESNIFFER_VERSION << endl;
+#else
   cout << "LTESniffer" << endl;
+#endif
   cout << endl;
 
   Args args;

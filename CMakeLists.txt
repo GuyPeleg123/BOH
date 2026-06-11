@@ -8,6 +8,16 @@ cmake_minimum_required (VERSION 2.8.11)
 #message("CIP = ${CMAKE_INSTALL_PREFIX} (should be /usr/local")
 project (DL_Sniffer)
 
+# Stamp the build with the git revision so a deployed binary is identifiable.
+execute_process(COMMAND git -C "${CMAKE_SOURCE_DIR}" describe --always --dirty --tags
+                OUTPUT_VARIABLE LTESNIFFER_GIT_VERSION
+                OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT LTESNIFFER_GIT_VERSION)
+  set(LTESNIFFER_GIT_VERSION "unknown")
+endif()
+add_definitions(-DLTESNIFFER_VERSION="${LTESNIFFER_GIT_VERSION}")
+message(STATUS "LTESniffer version: ${LTESNIFFER_GIT_VERSION}")
+
 #set (CMAKE_INSTALL_PREFIX /usr/local)
 
 #message("CIP = ${CMAKE_INSTALL_PREFIX} (should be /usr/local")
@@ -76,6 +86,16 @@ if(CMNALIB_FOUND AND NOT FORCE_SUBPROJECT_CMNALIB)
 else(CMNALIB_FOUND AND NOT FORCE_SUBPROJECT_CMNALIB)
   message("Download CMNALIB as a subproject and build it.")
 
+  # Reproducible + offline-capable dep fetch: pin to an exact commit, and use a
+  # bundled local mirror (external/offline-mirrors/) if present so air-gapped
+  # builds work without the network.
+  if(NOT DEFINED CMNALIB_REPO)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/external/offline-mirrors/c-mnalib.git")
+      set(CMNALIB_REPO "${CMAKE_SOURCE_DIR}/external/offline-mirrors/c-mnalib.git")
+    else()
+      set(CMNALIB_REPO "https://github.com/falkenber9/c-mnalib.git")
+    endif()
+  endif()
   # Download and unpack cmnalib at configure time
   configure_file(external/cmake/cmnalib.CMakeLists.txt.in cmnalib-download/CMakeLists.txt)
   execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
@@ -175,6 +195,15 @@ else(SRSRAN_FOUND AND NOT FORCE_SUBPROJECT_SRSRAN)
 
   message("Download SRSRAN as a subproject and build it.")
 
+  # Reproducible + offline-capable: pin to an exact commit and prefer a bundled
+  # local mirror (external/offline-mirrors/) for air-gapped builds.
+  if(NOT DEFINED SRSRAN_REPO)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/external/offline-mirrors/srsRAN_multi_usrp.git")
+      set(SRSRAN_REPO "${CMAKE_SOURCE_DIR}/external/offline-mirrors/srsRAN_multi_usrp.git")
+    else()
+      set(SRSRAN_REPO "https://github.com/hdtuanss/srsRAN_multi_usrp.git")
+    endif()
+  endif()
   # Download and unpack srsRAN at configure time
   configure_file(external/cmake/srsRAN.CMakeLists.txt.in srsRAN-download/CMakeLists.txt)
   execute_process(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .

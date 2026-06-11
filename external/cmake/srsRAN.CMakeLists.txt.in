@@ -5,9 +5,9 @@ project(srsLTE-download NONE)
 
 include(ExternalProject)
 ExternalProject_Add(srsRAN
-    GIT_REPOSITORY https://github.com/hdtuanss/srsRAN_multi_usrp.git
-    GIT_TAG main
-#    GIT_TAG falcon_v0.1
+    GIT_REPOSITORY @SRSRAN_REPO@
+    GIT_TAG 9d6781cefa7def436def3761b6c861173855af78
+#    (pinned exact commit; was floating branch "main")
     SOURCE_DIR "${CMAKE_BINARY_DIR}/srsRAN-src"
     BINARY_DIR "${CMAKE_BINARY_DIR}/srsRAN-build"
     CONFIGURE_COMMAND ""
