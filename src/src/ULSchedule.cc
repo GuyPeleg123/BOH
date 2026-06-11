@@ -111,30 +111,14 @@ void ULSchedule::set_SIB2(asn1::rrc::sib_type2_s *sib2_)
 
 uint32_t ULSchedule::get_ul_tti(uint32_t cur_tti)
 {
-	uint32_t temp_tti = cur_tti - 4;
-	if (temp_tti >= 0)
-	{
-		return temp_tti;
-	}
-	else
-	{
-		temp_tti = temp_tti + 10240;
-		return temp_tti;
-	}
+	// modulo-10240 wrap; old unsigned `if(cur_tti-4 >= 0)` never took the wrap
+	// branch, underflowing for cur_tti<4 (SFN rollover) -> wrong key.
+	return (cur_tti + 10240u - 4u) % 10240u;
 }
 
 uint32_t ULSchedule::get_rar_ul_tti(uint32_t cur_tti)
 {
-	uint32_t temp_tti = cur_tti - 6;
-	if (temp_tti >= 0)
-	{
-		return temp_tti;
-	}
-	else
-	{
-		temp_tti = temp_tti + 10240;
-		return temp_tti;
-	}
+	return (cur_tti + 10240u - 6u) % 10240u;
 }
 
 void ULSchedule::set_config()

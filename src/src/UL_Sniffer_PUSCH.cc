@@ -268,11 +268,15 @@ void PUSCH_Decoder::decode_run(std::string info, DCI_UL &decoding_mem, std::stri
         float signal_power = enb_ul.chest_res.snr_db;
         float falcon_signal_power = 0.0f;
         float tmp_sum = 0.0f;
-        for (uint32_t rb_idx = 0; rb_idx < ul_cfg.pusch.grant.L_prb; rb_idx++)
         {
-            tmp_sum += sf_power->getRBPowerUL().at(ul_cfg.pusch.grant.n_prb[0] + rb_idx);
+            const auto& rbpow = sf_power->getRBPowerUL();
+            for (uint32_t rb_idx = 0; rb_idx < ul_cfg.pusch.grant.L_prb; rb_idx++)
+            {
+                uint32_t prb = ul_cfg.pusch.grant.n_prb[0] + rb_idx;
+                if (prb < rbpow.size()) tmp_sum += rbpow[prb];   // was .at() -> threw & killed the worker on bad grants
+            }
         }
-        falcon_signal_power = tmp_sum / ul_cfg.pusch.grant.L_prb;
+        falcon_signal_power = (ul_cfg.pusch.grant.L_prb > 0) ? tmp_sum / ul_cfg.pusch.grant.L_prb : 0.0f;
         print_debug(decoding_mem, info, modulation_mode, signal_power, enb_ul.chest_res.noise_estimate_dbm, falcon_signal_power);
     }
 
@@ -501,11 +505,15 @@ void PUSCH_Decoder::decode()
                             /*Compute avg signal power for PRB in UL grant*/
                             float falcon_signal_power = 0.0f;
                             float tmp_sum = 0.0f;
-                            for (uint32_t rb_idx = 0; rb_idx < ul_cfg.pusch.grant.L_prb; rb_idx++)
                             {
-                                tmp_sum += sf_power->getRBPowerUL().at(ul_cfg.pusch.grant.n_prb[0] + rb_idx);
+                                const auto& rbpow = sf_power->getRBPowerUL();
+                                for (uint32_t rb_idx = 0; rb_idx < ul_cfg.pusch.grant.L_prb; rb_idx++)
+                                {
+                                    uint32_t prb = ul_cfg.pusch.grant.n_prb[0] + rb_idx;
+                                    if (prb < rbpow.size()) tmp_sum += rbpow[prb];
+                                }
                             }
-                            falcon_signal_power = tmp_sum / ul_cfg.pusch.grant.L_prb;
+                            falcon_signal_power = (ul_cfg.pusch.grant.L_prb > 0) ? tmp_sum / ul_cfg.pusch.grant.L_prb : 0.0f;
                             decode_run("[PUSCH-16 ]", decoding_mem, modulation_mode, falcon_signal_power);
 
                             if (pusch_res.crc == false && mcs_idx > 20)

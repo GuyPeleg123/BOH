@@ -228,8 +228,8 @@ bool LTESniffer_Core::run(){
     // rf_a_string = "clock=gpsdo,type=x300,addr=192.168.40.2";
     // rf_b_string = "clock=gpsdo,type=x300,addr=192.168.30.2";
 
-    strncpy(rfArgsCStr_a, rf_a_string.c_str(), 1024);
-    strncpy(rfArgsCStr_b, rf_b_string.c_str(), 1024);
+    strncpy(rfArgsCStr_a, rf_a_string.c_str(), 1023); rfArgsCStr_a[1023] = '\0';
+    strncpy(rfArgsCStr_b, rf_b_string.c_str(), 1023); rfArgsCStr_b[1023] = '\0';
 
     // Always open rf_a (needed by all modes)
     if (srsran_rf_open_multi(&rf_a, rfArgsCStr_a, args.rf_nof_rx_ant)) {
@@ -309,7 +309,7 @@ bool LTESniffer_Core::run(){
       cell.phich_resources  = SRSRAN_PHICH_R_1_6;
     }
     srsran_rf_stop_rx_stream(&rf_a);
-    srsran_rf_stop_rx_stream(&rf_b);
+    if (rf_b_open) srsran_rf_stop_rx_stream(&rf_b);
     if (go_exit) {
       uhd_stop = true;
       if (a_triggered == false){
@@ -336,10 +336,12 @@ bool LTESniffer_Core::run(){
         ERROR("Could not set sampling rate");
         exit(-1);
       }
-      float srate_rf_b = srsran_rf_set_rx_srate(&rf_b, (double)srate);
-      if (srate_rf_b != srate) {
-        ERROR("Could not set sampling rate");
-        exit(-1);
+      if (rf_b_open) {
+        float srate_rf_b = srsran_rf_set_rx_srate(&rf_b, (double)srate);
+        if (srate_rf_b != srate) {
+          ERROR("Could not set sampling rate");
+          exit(-1);
+        }
       }
     } else {
       ERROR("Invalid number of PRB %d", cell.nof_prb);
@@ -459,7 +461,7 @@ bool LTESniffer_Core::run(){
 
 #ifndef DISABLE_RF
   if (args.input_file_name == "") {
-    srsran_rf_start_rx_stream(&rf_b, false);
+    if (rf_b_open) srsran_rf_start_rx_stream(&rf_b, false);
     srsran_rf_start_rx_stream(&rf_a, false);
   }
 #endif

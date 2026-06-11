@@ -86,7 +86,7 @@ int PDSCH_Decoder::decode_imsi_tmsi_paging(uint8_t *sdu_ptr, int length)
 	int ret = SRSRAN_ERROR;
 	pcch_msg_s pcch_msg;
 	asn1::cbit_ref bref(sdu_ptr, length);
-	if (pcch_msg.unpack(bref) == asn1::SRSASN_SUCCESS or pcch_msg.msg.type().value == pcch_msg_type_c::types_opts::c1)
+	if (pcch_msg.unpack(bref) == asn1::SRSASN_SUCCESS and pcch_msg.msg.type().value == pcch_msg_type_c::types_opts::c1)
 	{
 		paging_s *paging = &pcch_msg.msg.c1().paging();
 		if (paging->paging_record_list_present)

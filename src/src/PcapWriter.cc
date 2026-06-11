@@ -81,7 +81,7 @@ void PcapWriter::pcap_write_crnti(uint8_t* pdu,
 //New class:
 void LTESniffer_pcap_writer::enable(bool en)
 {
-  enable_write = true; 
+  enable_write = en;   // was hardcoded true -> could never be disabled
 }
 void LTESniffer_pcap_writer::open(const std::string filename, const std::string api_filename, uint32_t ue_id)
 {
@@ -235,7 +235,7 @@ void LTESniffer_pcap_writer::pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes
     context.nbiotMode       = 0;
     context.cc_idx          = 0;
 
-    if (pdu) {
+    if (pdu && pcap_file) {   // null-check: a failed DLT_PCAP_Open must not crash on write
       rotate_if_needed_locked();
       LTE_PCAP_MAC_WritePDU(pcap_file, &context, pdu, pdu_len_bytes);
       bytes_written_ += pdu_len_bytes + 64;  // ~header overhead estimate (used by rotation)
@@ -282,7 +282,7 @@ void LTESniffer_pcap_writer::pack_and_write_api(uint8_t* pdu, uint32_t pdu_len_b
     context.nbiotMode       = 0;
     context.cc_idx          = 0;
 
-    if (pdu) {
+    if (pdu && pcap_file_api) {
       LTE_PCAP_MAC_WritePDU(pcap_file_api, &context, pdu, pdu_len_bytes);
       // Same periodic flush as the main pcap — without it, api_collector.pcap
       // could silently lose every packet on SIGKILL.

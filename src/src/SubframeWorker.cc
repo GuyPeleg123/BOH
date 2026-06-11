@@ -174,16 +174,10 @@ void SubframeWorker::prepare(uint32_t _sf_idx, uint32_t _sfn, bool updateMetaFor
 
 uint16_t get_tti_ul_harq(uint16_t cur_tti)
 {
-  uint32_t temp_tti = cur_tti - 4;
-  if (temp_tti >= 0)
-  {
-    return temp_tti;
-  }
-  else
-  {
-    temp_tti = temp_tti + 10240;
-    return temp_tti;
-  }
+  // Wrap modulo the 10240-tti space. The old `uint32_t t=cur_tti-4; if(t>=0)`
+  // was always-true (unsigned), so for cur_tti<4 it underflowed instead of
+  // wrapping -> garbage key, silently losing UL grants every SFN rollover.
+  return (uint16_t)((cur_tti + 10240u - 4u) % 10240u);
 }
 
 // int update_rv(int old_rv){
