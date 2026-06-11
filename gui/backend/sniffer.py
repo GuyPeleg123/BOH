@@ -269,12 +269,18 @@ class SnifferRunner:
         # (fopen blocks until both ends are connected).
         self._reader_task = asyncio.create_task(self._read_events(self._fifo_path))
 
+        # Pass the live-stream FIFO path via the environment (preserved across
+        # sudo by a scoped `env_keep` rule) instead of a `sudo env …` prefix.
+        child_env = dict(os.environ)
+        if cfg.pcap_stream_fifo:
+            child_env["LTESNIFFER_PCAP_STREAM"] = cfg.pcap_stream_fifo
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.DEVNULL,   # we don't read it, and PIPE would fill at ~64KB and wedge LTESniffer
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(run_dir),
+                env=child_env,
             )
         except Exception as e:
             # Spawn failed (bad binary, sudo -n denied, ENOMEM…). Without this

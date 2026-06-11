@@ -18,6 +18,9 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "srsran/mac/pdu.h"
 #include "srsran/srslog/srslog.h"
@@ -333,7 +336,17 @@ void KeyStore::write_pcap_global_hdr(FILE* fd)
 bool KeyStore::open_output(const std::string& base_path)
 {
     std::string ip_path = base_path + "_decrypted_ip.pcap";
-    ip_pcap_fd_ = fopen(ip_path.c_str(), "wb");
+    // 0600 from creation: this file holds DECRYPTED subscriber IP traffic and
+    // the sniffer runs as root, so a plain fopen() would honour umask and leave
+    // it world-readable (0644). Create restricted, then fchmod to be sure.
+    int fd = open(ip_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        fchmod(fd, 0600);
+        ip_pcap_fd_ = fdopen(fd, "wb");
+        if (!ip_pcap_fd_) close(fd);
+    } else {
+        ip_pcap_fd_ = nullptr;
+    }
     if (!ip_pcap_fd_) {
         fprintf(stderr, "[KeyAttach] Cannot open %s: %s\n", ip_path.c_str(), strerror(errno));
         return false;

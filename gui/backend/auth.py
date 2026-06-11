@@ -80,7 +80,26 @@ def _autodetect_lan_ip() -> str:
         return "127.0.0.1"
 
 
-BIND: str = os.environ.get("LTESNIFFER_GUI_BIND") or _autodetect_lan_ip()
+def _resolve_bind() -> str:
+    """Default to loopback. The GUI is a root-capable admin/decryption console;
+    it must not be reachable from the LAN unless the operator explicitly opts in.
+    - LTESNIFFER_GUI_BIND=<ip>  : explicit bind (warned if not loopback)
+    - LTESNIFFER_GUI_LAN=1       : auto-pick the LAN IP (warned)
+    - otherwise                  : 127.0.0.1
+    """
+    env = os.environ.get("LTESNIFFER_GUI_BIND")
+    if env:
+        if env not in ("127.0.0.1", "localhost", "::1"):
+            log.warning("LTESNIFFER_GUI_BIND=%s — admin GUI reachable beyond loopback!", env)
+        return env
+    if os.environ.get("LTESNIFFER_GUI_LAN") == "1":
+        ip = _autodetect_lan_ip()
+        log.warning("LTESNIFFER_GUI_LAN=1 — binding admin GUI to LAN IP %s (other hosts can reach it)", ip)
+        return ip
+    return "127.0.0.1"
+
+
+BIND: str = _resolve_bind()
 
 
 # ────────────────────────────────────────────────────────────────────────

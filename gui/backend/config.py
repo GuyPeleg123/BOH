@@ -110,12 +110,11 @@ class SnifferConfig(BaseModel):
         argv: list[str] = []
         if self.sudo:
             argv += ["sudo", "-n"]
-        # If the user opted into the live-stream FIFO, prepend
-        #   env LTESNIFFER_PCAP_STREAM=<path>
-        # so the env var survives sudo's env_reset (the C++ PcapWriter reads
-        # this var to decide whether to fork a copy of every MAC PDU to the FIFO).
-        if self.pcap_stream_fifo:
-            argv += ["env", f"LTESNIFFER_PCAP_STREAM={self.pcap_stream_fifo}"]
+        # NOTE: LTESNIFFER_PCAP_STREAM is passed via the child's environment (set
+        # by the runner) and preserved across sudo's env_reset by a scoped
+        # `env_keep` sudoers rule — NOT via a `sudo env VAR=… binary` prefix.
+        # `env` under sudo is an unrestricted-root primitive and must never be
+        # whitelisted, so we do not invoke it here.
         argv.append(self.binary_path)
 
         if self.rf_freq > 0:

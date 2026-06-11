@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
@@ -196,9 +197,11 @@ _allowed_origins = [
     f"https://{BIND}:8000",  # if operator chose 8000 for HTTPS
     "https://127.0.0.1:8443",
     "https://localhost:8443",
-    "http://localhost:5173",  # vite dev server
-    "http://127.0.0.1:5173",
 ]
+# Plaintext vite dev origins are only allowed when explicitly developing — they
+# must never ship enabled on a credentialed-CORS admin console.
+if os.environ.get("LTESNIFFER_GUI_DEV") == "1":
+    _allowed_origins += ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(dict.fromkeys(_allowed_origins)),  # dedupe, preserve order
@@ -252,15 +255,35 @@ class _LoginBody(BaseModel):
     password: str
 
 
+# Per-IP failed-login throttle (in-memory). bcrypt is slow but a strong password
+# can still be online-guessed without a rate limit; lock out an IP after too many
+# failures in a window.
+_LOGIN_FAILS: dict[str, list[float]] = {}
+_LOGIN_WINDOW_S = 300.0
+_LOGIN_MAX_FAILS = 10
+
+
+def _login_throttled(ip: str) -> bool:
+    now = time.monotonic()
+    fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    _LOGIN_FAILS[ip] = fails
+    return len(fails) >= _LOGIN_MAX_FAILS
+
+
 @app.post("/api/login")
-async def login(body: _LoginBody, response: Response) -> dict[str, Any]:
+async def login(body: _LoginBody, request: Request, response: Response) -> dict[str, Any]:
     """Validate credentials, mint a session, set the cookie.
 
     On wrong creds we return 401 with a generic message ("invalid
     credentials") rather than distinguishing wrong-user from wrong-pass —
     enumeration defense in depth, layered on the constant-time verify."""
+    ip = request.client.host if request.client else "?"
+    if _login_throttled(ip):
+        raise HTTPException(status_code=429, detail="too many attempts, try again later")
     if not verify_credentials(body.username, body.password):
+        _LOGIN_FAILS.setdefault(ip, []).append(time.monotonic())
         raise HTTPException(status_code=401, detail="invalid credentials")
+    _LOGIN_FAILS.pop(ip, None)  # reset on success
     token = create_session(body.username)
     response.set_cookie(
         key=COOKIE_NAME,
