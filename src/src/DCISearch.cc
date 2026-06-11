@@ -503,8 +503,9 @@ int DCISearch::search() {
   struct timeval timestamp;
   gettimeofday(&timestamp, nullptr);
   dciCollection.setTimestamp(timestamp);
-  std::string test_string = '[' + std::to_string(sfn) + '-' + std::to_string(sf_idx) + ']';
-  { //PrintLifetime lt(test_string + "FFT: ");
+  // (debug label string removed — was built every subframe but only used by
+  //  commented-out PrintLifetime/cout below)
+  { //PrintLifetime lt: per-subframe label was "[sfn-sf_idx]"
     if (srsran_ue_dl_decode_fft_estimate(falcon_ue_dl.q, sf, ue_dl_cfg) < 0) {
       ERROR("srsran_ue_dl_decode_fft_estimate failed");
     }

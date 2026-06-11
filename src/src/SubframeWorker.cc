@@ -192,8 +192,9 @@ uint16_t get_tti_ul_harq(uint16_t cur_tti)
 
 void SubframeWorker::work()
 {
-  std::string test_string = '[' + std::to_string(idx) + ']' + '[' + std::to_string(sfn) + '-' + std::to_string(sf_idx) + ']';
-  // PrintLifetime worker_lifetime(test_string + " Subframe took: ");
+  // (per-worker debug label string removed — built every subframe, only used by
+  //  the commented-out PrintLifetime below)
+  // PrintLifetime worker_lifetime("[idx][sfn-sf_idx] Subframe took: ");
   uint32_t tti = sfn * 10 + sf_idx;
   ul_sf.tti = tti;
   if (updateMetaFormats)

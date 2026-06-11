@@ -323,7 +323,7 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result, bool write_pcap_en)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -420,7 +420,7 @@ int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_resu
 int PDSCH_Decoder::decode_SIB() // change to decode SIB
 {
 	uint32_t tti = sfn * 10 + sf_idx;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -533,7 +533,7 @@ int PDSCH_Decoder::decode_SIB() // change to decode SIB
 int PDSCH_Decoder::decode_mac_ce(uint32_t rnti)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -708,7 +708,7 @@ int PDSCH_Decoder::decode_rar(DL_Sniffer_rar_result &result)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
 	int ret = SRSRAN_ERROR;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -770,7 +770,7 @@ int PDSCH_Decoder::decode_dl_mode()
 {
 	uint32_t tti = sfn * 10 + sf_idx;
 	// printf("[%d] SF: %d-%d Nof_DCI = %d \n", idx, sfn, sf_idx, ran_dl_collection->size());
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (auto decoding_mem : (*ran_dl_collection))   // by value: this loop mutates decoding_mem (e.g. line ~1160)
 	{
 		if ((decoding_mem.ran_pdsch_grant->tb[0].tbs > 0 && decoding_mem.ran_dci_dl->rnti > 0 &&									 // only decode if packet length > 0 and rnti != 0,
 			 !(nof_antenna == 1 && (decoding_mem.ran_pdsch_grant->nof_tb == 2 || decoding_mem.ran_pdsch_grant_256->nof_tb == 2))) || // only decode DCI with 2 TB if having 2 RX antennas,
