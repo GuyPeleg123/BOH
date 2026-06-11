@@ -280,7 +280,9 @@ async def login(body: _LoginBody, request: Request, response: Response) -> dict[
     ip = request.client.host if request.client else "?"
     if _login_throttled(ip):
         raise HTTPException(status_code=429, detail="too many attempts, try again later")
-    if not verify_credentials(body.username, body.password):
+    # bcrypt(12) takes ~250ms; run it off the event loop so a login (or a flood
+    # of them) can't stall the live WS event stream.
+    if not await asyncio.to_thread(verify_credentials, body.username, body.password):
         _LOGIN_FAILS.setdefault(ip, []).append(time.monotonic())
         raise HTTPException(status_code=401, detail="invalid credentials")
     _LOGIN_FAILS.pop(ip, None)  # reset on success

@@ -281,6 +281,7 @@ class SnifferRunner:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(run_dir),
                 env=child_env,
+                start_new_session=True,   # own process group, so teardown can target the tree
             )
         except Exception as e:
             # Spawn failed (bad binary, sudo -n denied, ENOMEM…). Without this
@@ -502,6 +503,10 @@ class SnifferRunner:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     self._broadcast({"t": "log", "level": "warn", "source": "parser", "msg": f"bad json line: {line[:120]!r}"})
+                    continue
+                # A valid-JSON non-object (bare int/str) would crash every
+                # consumer's event.get(...) downstream — drop it.
+                if not isinstance(event, dict):
                     continue
                 self._broadcast(event)
         except asyncio.CancelledError:

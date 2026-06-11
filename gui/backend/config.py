@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -187,8 +190,10 @@ def load() -> SnifferConfig:
     if CONFIG_PATH.exists():
         try:
             return SnifferConfig.model_validate_json(CONFIG_PATH.read_text())
-        except Exception:
-            pass
+        except Exception as e:
+            # Don't silently revert to defaults — the operator loses their whole
+            # config (incl. clock=gpsdo, freqs) with no signal otherwise.
+            log.warning("config %s failed to parse (%s); using defaults", CONFIG_PATH, e)
     return SnifferConfig()
 
 
