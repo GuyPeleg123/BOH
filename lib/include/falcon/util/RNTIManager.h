@@ -25,6 +25,7 @@
 #include <string.h>
 #include <strings.h>
 #include <string>
+#include <mutex>
 
 #include "falcon/common/Settings.h"
 #include "rnti_manager_c.h"
@@ -116,4 +117,9 @@ private:
   uint32_t threshold;
   uint32_t maxCandidatesPerStepPerFormat;
   std::vector<int32_t> remainingCandidates;
+  // Serializes all access: one RNTIManager is shared by every worker thread and
+  // its containers were mutated lock-free (data race -> corruption/crashes,
+  // non-deterministic decode yield). recursive_mutex so a public method may call
+  // another without self-deadlock. Locked only at public entry points.
+  mutable std::recursive_mutex rm_mutex;
 };

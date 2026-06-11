@@ -408,25 +408,21 @@ void PUSCH_Decoder::decode()
     sf_power->computePower(enb_ul.sf_symbols);
 
     /*combine Uplink grant detected from RAR response (msg 2) and Uplink grant detected from DCI0*/
-    if (dci_ul != nullptr || rar_dci_ul != nullptr)
+    if (!dci_ul.empty() || !rar_dci_ul.empty())
     {
-        if (rar_dci_ul != nullptr && dci_ul != nullptr)
+        if (!rar_dci_ul.empty() && !dci_ul.empty())
         {
-            int rar_size = rar_dci_ul->size();
-            if (rar_size > 0)
+            for (const auto& rar_dci : rar_dci_ul)
             {
-                for (int rar_idx = 0; rar_idx < rar_size; rar_idx++)
-                {
-                    dci_ul->push_back(rar_dci_ul->at(rar_idx));
-                }
+                dci_ul.push_back(rar_dci);
             }
         }
-        else if (rar_dci_ul != nullptr && dci_ul == nullptr)
+        else if (!rar_dci_ul.empty() && dci_ul.empty())
         {
             dci_ul = rar_dci_ul;
         }
         /*Try to decode all member in grant list*/
-        for (auto decoding_mem : (*dci_ul))
+        for (auto decoding_mem : dci_ul)
         {
             /*Investigate current decoding member to know it has a valid UL grant or not*/
             valid_ul_grant = investigate_valid_ul_grant(decoding_mem);
@@ -601,13 +597,13 @@ void PUSCH_Decoder::decode()
     }
 }
 
-void PUSCH_Decoder::init_pusch_decoder(std::vector<DCI_UL> *dci_ul_,
-                                       std::vector<DCI_UL> *rar_dci_ul_,
+void PUSCH_Decoder::init_pusch_decoder(std::vector<DCI_UL> dci_ul_,
+                                       std::vector<DCI_UL> rar_dci_ul_,
                                        srsran_ul_sf_cfg_t &ul_sf_,
                                        SubframePower *sf_power_)
 {
-    dci_ul = dci_ul_;
-    rar_dci_ul = rar_dci_ul_;
+    dci_ul = std::move(dci_ul_);
+    rar_dci_ul = std::move(rar_dci_ul_);
     ul_sf = ul_sf_;
     sf_power = sf_power_;
 }

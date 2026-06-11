@@ -34,38 +34,28 @@ void ULSchedule::push_rar_ULSche(uint32_t tti, const std::vector<DCI_UL> &rar_dc
 	lock.unlock();
 }
 
-std::vector<DCI_UL> *ULSchedule::getULSche(uint32_t tti)
+std::vector<DCI_UL> ULSchedule::getULSche(uint32_t tti)
 {
-	std::unique_lock<std::mutex> lock(ulsche_mutex);
+	std::lock_guard<std::mutex> lock(ulsche_mutex);
 	uint32_t ul_tti = get_ul_tti(tti);
-	std::map<uint32_t, std::vector<DCI_UL>>::iterator iter;
-	iter = ulsche_database.find(ul_tti);
+	auto iter = ulsche_database.find(ul_tti);
 	if (iter != ulsche_database.end())
 	{
-		return &iter->second;
+		return iter->second;   // copy under lock — safe even if another worker erases the key
 	}
-	else
-	{
-		return nullptr;
-	}
-	lock.unlock();
+	return {};
 }
 
-std::vector<DCI_UL> *ULSchedule::get_rar_ULSche(uint32_t tti)
+std::vector<DCI_UL> ULSchedule::get_rar_ULSche(uint32_t tti)
 {
-	std::unique_lock<std::mutex> lock(ulsche_mutex);
+	std::lock_guard<std::mutex> lock(ulsche_mutex);
 	uint32_t ul_tti = get_rar_ul_tti(tti);
-	std::map<uint32_t, std::vector<DCI_UL>>::iterator iter;
-	iter = ulsche_rar_database.find(ul_tti);
+	auto iter = ulsche_rar_database.find(ul_tti);
 	if (iter != ulsche_rar_database.end())
 	{
-		return &iter->second;
+		return iter->second;
 	}
-	else
-	{
-		return nullptr;
-	}
-	lock.unlock();
+	return {};
 }
 
 void ULSchedule::deleteULSche(uint32_t tti)

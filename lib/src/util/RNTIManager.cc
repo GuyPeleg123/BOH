@@ -159,11 +159,13 @@ void RNTIManager::addForbidden(uint16_t rntiStart, uint16_t rntiEnd, uint32_t fo
 }
 
 void RNTIManager::addCandidate(uint16_t rnti, uint32_t formatIdx) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   histograms[formatIdx].add(rnti);
   remainingCandidates[formatIdx]--;
 }
 
 bool RNTIManager::validate(uint16_t rnti, uint32_t formatIdx) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
 
   // evergreen consultation
   if(isEvergreen(rnti, formatIdx)) {
@@ -193,6 +195,7 @@ bool RNTIManager::validate(uint16_t rnti, uint32_t formatIdx) {
 }
 
 bool RNTIManager::validateAndRefresh(uint16_t rnti, uint32_t formatIdx) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   bool result = validate(rnti, formatIdx);
   if(result) {
     lastSeen[rnti] = timestamp;
@@ -201,20 +204,24 @@ bool RNTIManager::validateAndRefresh(uint16_t rnti, uint32_t formatIdx) {
 }
 
 void RNTIManager::activateAndRefresh(uint16_t rnti, uint32_t formatIdx, ActivationReason reason) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   activateRNTI(rnti, reason);
   lastSeen[rnti] = timestamp;
   assocFormatIdx[rnti] = formatIdx;
 }
 
 uint32_t RNTIManager::getFrequency(uint16_t rnti, uint32_t formatIdx) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   return histograms[formatIdx].getFrequency(rnti);
 }
 
 uint32_t RNTIManager::getAssociatedFormatIdx(uint16_t rnti) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   return assocFormatIdx[rnti];
 }
 
 ActivationReason RNTIManager::getActivationReason(uint16_t rnti) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   for(list<RNTIActiveSetItem>::iterator it = activeSet.begin(); it != activeSet.end(); it++) {
     if(it->rnti == rnti) return it->reason;
   }
@@ -222,6 +229,7 @@ ActivationReason RNTIManager::getActivationReason(uint16_t rnti) {
 }
 
 vector<rnti_manager_active_set_t> RNTIManager::getActiveSet() {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   cleanExpired();
   vector<rnti_manager_active_set_t> result(activeSet.size());
   uint32_t index = 0;
@@ -279,6 +287,7 @@ string RNTIManager::getActivationReasonString(ActivationReason reason) {
 
 void RNTIManager::getHistogramSummary(uint32_t *buf)
 {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   memset(buf, 0, RNTI_HISTOGRAM_ELEMENT_COUNT*sizeof(uint32_t));
   for(uint32_t i=0; i<nformats; i++) {
     const uint32_t* histData = histograms[i].getFrequencyAll();
@@ -412,6 +421,7 @@ void RNTIManager::cleanExpired() {
 }
 
 void RNTIManager::stepTime() {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   // add padding to histograms
   for(uint32_t i=0; i<nformats; i++) {
     if(remainingCandidates[i] > 0) {
@@ -423,11 +433,13 @@ void RNTIManager::stepTime() {
 }
 
 void RNTIManager::stepTime(uint32_t nSteps) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   for(uint32_t i=0; i<nSteps; i++) {
     stepTime();
   }
 }
 
 void RNTIManager::setHistogramThreshold(uint32_t threshold) {
+  std::lock_guard<std::recursive_mutex> rm_lock(rm_mutex);
   this->threshold = threshold;
 }

@@ -177,12 +177,15 @@ bool LTESniffer_Core::run(){
     cpu_set_t cpuset;
     pthread_t thread;
 
+    CPU_ZERO(&cpuset);   // was uninitialized stack garbage -> undefined affinity mask
     thread = pthread_self();
     for (int i = 0; i < 8; i++) {
       if (((args.cpu_affinity >> i) & 0x01) == 1) {
         printf("Setting pdsch_ue with affinity to core %d\n", i);
         CPU_SET((size_t)i, &cpuset);
       }
+    }
+    {
       if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset)) {
         ERROR("Error setting main thread affinity to %d", args.cpu_affinity);
         exit(-1);
