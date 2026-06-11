@@ -33,6 +33,14 @@ class SnifferConfig(BaseModel):
     rf_args: str = Field("", description="Free-form rfargs for single-USRP mode. -a")
     usrp_a_args: str = Field("", description="Override USRP A rfargs (dual mode). -X")
     usrp_b_args: str = Field("", description="Override USRP B rfargs (dual mode). -Z")
+    clock_source: str = Field(
+        "gpsdo",
+        description=(
+            "Clock/time reference forced into -X/-Z for UL/dual mode (e.g. 'gpsdo'). "
+            "UL sniffing needs both USRPs on a shared GPSDO time base; this is injected "
+            "automatically so the launcher can't drop it. Set '' to disable."
+        ),
+    )
     decimate: int = Field(0, description="Decimation factor. -Y")
     cpu_affinity: int = Field(-1, description="CPU affinity bitmask; -1 disables. -y")
 
@@ -120,10 +128,23 @@ class SnifferConfig(BaseModel):
             argv += ["-A", str(self.rf_nof_rx_ant)]
         if self.rf_args:
             argv += ["-a", self.rf_args]
+        # Force the shared clock/time reference into the dual-USRP rfargs for
+        # UL/dual mode. The frontend used to add `clock=gpsdo` only in transient
+        # state and it was routinely lost before launch, silently breaking UL
+        # sync. Injecting it here makes it impossible to drop.
+        def _with_clock(rfargs: str) -> str:
+            if not rfargs or not self.clock_source:
+                return rfargs
+            if "clock=" in rfargs:
+                return rfargs
+            if self.sniffer_mode not in (1, 2):  # only UL / dual need GPSDO sync
+                return rfargs
+            return f"clock={self.clock_source}," + rfargs
+
         if self.usrp_a_args:
-            argv += ["-X", self.usrp_a_args]
+            argv += ["-X", _with_clock(self.usrp_a_args)]
         if self.usrp_b_args:
-            argv += ["-Z", self.usrp_b_args]
+            argv += ["-Z", _with_clock(self.usrp_b_args)]
         if self.decimate:
             argv += ["-Y", str(self.decimate)]
         if self.cpu_affinity >= 0:
