@@ -6,11 +6,10 @@ import { LogPanel } from "../components/LogPanel";
 import { IdentitiesPanel } from "../components/IdentitiesPanel";
 import { SpectrumButton } from "../components/SpectrumButton";
 import { WiresharkButton } from "../components/WiresharkButton";
-import { CapturesPanel } from "../components/CapturesPanel";
-import { LogHistoryPanel } from "../components/LogHistoryPanel";
+import { PacketTypeCounter } from "../components/PacketTypeCounter";
 
 export function Dashboard() {
-  const [bottomTab, setBottomTab] = useState<"logs" | "history" | "captures" | "identities">("logs");
+  const [bottomTab, setBottomTab] = useState<"logs" | "identities">("logs");
 
   return (
     <div className="p-3 flex flex-col gap-3 h-full overflow-hidden">
@@ -34,26 +33,17 @@ export function Dashboard() {
       {/* row 2: metrics tiles */}
       <MetricsTiles />
 
-      {/* row 3: tabbed footer — expands to fill remaining height */}
+      {/* row 3: packet type counter */}
+      <PacketTypeCounter />
+
+      {/* row 4: tabbed log footer — expands to fill remaining height */}
       <div className="panel p-3 flex flex-col min-h-0 flex-1">
         <div className="flex gap-1 mb-2">
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "logs" ? "btn-primary" : ""}`} onClick={() => setBottomTab("logs")}>Logs</button>
-          <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "history" ? "btn-primary" : ""}`} onClick={() => setBottomTab("history")}>Log History</button>
-          <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "captures" ? "btn-primary" : ""}`} onClick={() => setBottomTab("captures")}>Captures</button>
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "identities" ? "btn-primary" : ""}`} onClick={() => setBottomTab("identities")}>Identities</button>
         </div>
-        {/* flex flex-col is REQUIRED: the embedded panels use `flex-1` to claim
-            the height and scroll internally. Without it this wrapper is a block,
-            `flex-1` collapses, and the log/captures content overflows + gets
-            clipped by the page's overflow-hidden instead of scrolling. */}
         <div className="flex-1 min-h-0 flex flex-col">
-          {bottomTab === "logs"
-            ? <LogPanel embedded />
-            : bottomTab === "history"
-              ? <LogHistoryPanel embedded />
-              : bottomTab === "captures"
-                ? <CapturesPanel embedded />
-                : <IdentitiesPanel embedded />}
+          {bottomTab === "logs" ? <LogPanel embedded /> : <IdentitiesPanel embedded />}
         </div>
       </div>
     </div>

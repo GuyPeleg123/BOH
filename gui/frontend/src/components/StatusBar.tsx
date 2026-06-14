@@ -62,6 +62,8 @@ export function StatusBar() {
         {tab("/", "Dashboard")}
         {tab("/keys", "Keys")}
         {tab("/config", "Config")}
+        {tab("/captures", "Captures")}
+        {tab("/log-history", "Log History")}
         {tab("/help", "Help")}
       </nav>
 

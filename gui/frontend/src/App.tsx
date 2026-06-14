@@ -7,6 +7,8 @@ import { ConfigPage } from "./pages/Config";
 import { KeysPage } from "./pages/Keys";
 import { HelpPage } from "./pages/Help";
 import { LoginPage } from "./pages/Login";
+import { CapturesPage } from "./pages/CapturesPage";
+import { LogHistoryPage } from "./pages/LogHistoryPage";
 import { api, setAuthLostHandler } from "./lib/api";
 
 type AuthState =
@@ -60,10 +62,12 @@ export default function App() {
         <StatusBar />
         <main className="flex-1 min-h-0 overflow-hidden">
           <Routes>
-            <Route path="/"       element={<Dashboard />} />
-            <Route path="/config" element={<ConfigPage />} />
-            <Route path="/keys"   element={<KeysPage />} />
-            <Route path="/help"   element={<HelpPage />} />
+            <Route path="/"            element={<Dashboard />} />
+            <Route path="/config"      element={<ConfigPage />} />
+            <Route path="/keys"        element={<KeysPage />} />
+            <Route path="/captures"    element={<CapturesPage />} />
+            <Route path="/log-history" element={<LogHistoryPage />} />
+            <Route path="/help"        element={<HelpPage />} />
             {/* Unknown path (stale bookmark, typo) → home, not a blank pane. */}
             <Route path="*"       element={<Navigate to="/" replace />} />
           </Routes>
