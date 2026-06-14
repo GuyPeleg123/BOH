@@ -9,6 +9,7 @@ import { HelpPage } from "./pages/Help";
 import { LoginPage } from "./pages/Login";
 import { CapturesPage } from "./pages/CapturesPage";
 import { LogHistoryPage } from "./pages/LogHistoryPage";
+import { UEsPage } from "./pages/UEsPage";
 import { api, setAuthLostHandler } from "./lib/api";
 
 type AuthState =
@@ -63,6 +64,7 @@ export default function App() {
         <main className="flex-1 min-h-0 overflow-hidden">
           <Routes>
             <Route path="/"            element={<Dashboard />} />
+            <Route path="/ues"         element={<UEsPage />} />
             <Route path="/config"      element={<ConfigPage />} />
             <Route path="/keys"        element={<KeysPage />} />
             <Route path="/captures"    element={<CapturesPage />} />

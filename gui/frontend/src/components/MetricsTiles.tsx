@@ -61,8 +61,6 @@ export function MetricsTiles() {
     const elapsedSec = state.startedAt != null ? Math.floor((Date.now() - state.startedAt) / 1000) : null;
     return {
       totals: state.totals,
-      ues: state.rntis.size,
-      statsNofRnti: state.stats?.nof_rnti ?? null,
       bytes_s: rates.tbs / 8,
       elapsedSec,
       health: (() => {
@@ -77,7 +75,7 @@ export function MetricsTiles() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
 
-  const { totals, health, ues, statsNofRnti, bytes_s, elapsedSec } = snap;
+  const { totals, health, bytes_s, elapsedSec } = snap;
 
   function fmtElapsed(sec: number): string {
     const h = Math.floor(sec / 3600);
@@ -98,11 +96,6 @@ export function MetricsTiles() {
         value={elapsedSec != null ? fmtElapsed(elapsedSec) : "—"}
         sub={elapsedSec != null ? `${elapsedSec.toLocaleString()} seconds` : "not running"}
         accent={elapsedSec != null ? "ok" : undefined}
-      />
-      <Tile
-        label="UEs seen"
-        value={ues.toLocaleString()}
-        sub={statsNofRnti != null ? `stats: ${statsNofRnti}` : "—"}
       />
       <Tile
         label="Throughput"

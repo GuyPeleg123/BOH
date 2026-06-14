@@ -60,6 +60,7 @@ export function StatusBar() {
 
       <nav className="flex gap-1">
         {tab("/", "Dashboard")}
+        {tab("/ues", "UEs")}
         {tab("/keys", "Keys")}
         {tab("/config", "Config")}
         {tab("/captures", "Captures")}
