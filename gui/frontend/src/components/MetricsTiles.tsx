@@ -22,22 +22,6 @@ function fmtBytes(n: number, suffix = "B"): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} G${suffix}`;
 }
 
-/** Quantize a rate so the displayed digits don't jitter every refresh. */
-function quantizeRate(n: number): number {
-  if (n < 1)   return Math.round(n * 10) / 10;
-  if (n < 10)  return Math.round(n * 2) / 2;        // 0.5 steps
-  if (n < 100) return Math.round(n);
-  if (n < 1000) return Math.round(n / 5) * 5;       // 5 steps
-  return Math.round(n / 50) * 50;                   // 50 steps
-}
-
-function fmtRate(n: number, unit: string): string {
-  const q = quantizeRate(n);
-  if (q < 100) return `${q < 10 ? q.toFixed(1) : q} ${unit}`;
-  if (q < 1_000) return `${q} ${unit}`;
-  if (q < 1_000_000) return `${(q / 1000).toFixed(1)}k ${unit}`;
-  return `${(q / 1_000_000).toFixed(1)}M ${unit}`;
-}
 
 function Tile({
   label, value, sub, accent,
@@ -79,8 +63,6 @@ export function MetricsTiles() {
       totals: state.totals,
       ues: state.rntis.size,
       statsNofRnti: state.stats?.nof_rnti ?? null,
-      dciRate: rates.dci,
-      rbRate: rates.rb,
       bytes_s: rates.tbs / 8,
       elapsedSec,
       health: (() => {
@@ -95,7 +77,7 @@ export function MetricsTiles() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
 
-  const { totals, health, ues, statsNofRnti, dciRate, rbRate, bytes_s, elapsedSec } = snap;
+  const { totals, health, ues, statsNofRnti, bytes_s, elapsedSec } = snap;
 
   function fmtElapsed(sec: number): string {
     const h = Math.floor(sec / 3600);
@@ -110,7 +92,7 @@ export function MetricsTiles() {
     health.pct >= 95 ? "warn" : "bad";
 
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
       <Tile
         label="Run time"
         value={elapsedSec != null ? fmtElapsed(elapsedSec) : "—"}
@@ -127,11 +109,6 @@ export function MetricsTiles() {
         value={fmtBytes(bytes_s) + "/s"}
         sub={`total ${fmtBytes(totals.tbs / 8)}`}
         accent="accent"
-      />
-      <Tile
-        label="Resource blocks"
-        value={fmtRate(rbRate, "RB/s")}
-        sub={`total ${totals.rb.toLocaleString()}`}
       />
       <Tile
         label="Decoding health"
