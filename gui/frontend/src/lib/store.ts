@@ -60,6 +60,7 @@ export interface RateSample {
 export interface AppState {
   connected: boolean;
   lifecycle: "stopped" | "running";
+  startedAt: number | null;
   pid: number | null;
   argv: string[];
   mock: boolean;
@@ -81,6 +82,7 @@ export interface AppState {
 const initial: AppState = {
   connected: false,
   lifecycle: "stopped",
+  startedAt: null,
   pid: null,
   argv: [],
   mock: false,
@@ -286,9 +288,11 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
           pid = ev.pid ?? null;
           argv = ev.argv ?? [];
           addedRntis = true;
+          s = { ...s, startedAt: Date.now() };
         } else {
           lifecycle = "stopped";
           pid = null;
+          s = { ...s, startedAt: null };
           // Clear argv so any derived "USRP held by sniffer" / "spectrum
           // disabled" state stops being sticky after a stop.
           argv = [];
@@ -338,6 +342,7 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
     totals, rateSamples,
     lifecycle, pid, argv,
     monotonic,
+    startedAt: s.startedAt,
   };
 }
 

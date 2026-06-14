@@ -74,6 +74,7 @@ export function MetricsTiles() {
 
   const snap = useMemo(() => {
     const rates = useRatesPure(state);
+    const elapsedSec = state.startedAt != null ? Math.floor((Date.now() - state.startedAt) / 1000) : null;
     return {
       totals: state.totals,
       ues: state.rntis.size,
@@ -81,6 +82,7 @@ export function MetricsTiles() {
       dciRate: rates.dci,
       rbRate: rates.rb,
       bytes_s: rates.tbs / 8,
+      elapsedSec,
       health: (() => {
         const s = state.stats;
         if (!s) return null;
@@ -93,35 +95,32 @@ export function MetricsTiles() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
 
-  const { totals, health, ues, statsNofRnti, dciRate, rbRate, bytes_s } = snap;
+  const { totals, health, ues, statsNofRnti, dciRate, rbRate, bytes_s, elapsedSec } = snap;
+
+  function fmtElapsed(sec: number): string {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
   const healthAccent: "ok" | "warn" | "bad" | undefined =
     health == null ? undefined :
     health.pct >= 99 ? "ok" :
     health.pct >= 95 ? "warn" : "bad";
 
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+      <Tile
+        label="Run time"
+        value={elapsedSec != null ? fmtElapsed(elapsedSec) : "—"}
+        sub={elapsedSec != null ? `${elapsedSec.toLocaleString()} seconds` : "not running"}
+        accent={elapsedSec != null ? "ok" : undefined}
+      />
       <Tile
         label="UEs seen"
         value={ues.toLocaleString()}
         sub={statsNofRnti != null ? `stats: ${statsNofRnti}` : "—"}
-      />
-      <Tile
-        label="DCIs decoded"
-        value={totals.dci.toLocaleString()}
-        sub={`${fmtRate(dciRate, "DCI/s")}`}
-        accent={totals.dci > 0 ? "ok" : undefined}
-      />
-      <Tile
-        label="DL / UL"
-        value={
-          <span>
-            <span className="text-accent">{totals.dci_dl.toLocaleString()}</span>
-            <span className="text-muted text-xl mx-1">/</span>
-            <span className="text-warn">{totals.dci_ul.toLocaleString()}</span>
-          </span>
-        }
-        sub="downlink / uplink DCIs"
       />
       <Tile
         label="Throughput"

@@ -2,10 +2,8 @@ import { useState } from "react";
 import { CellCard } from "../components/CellCard";
 import { CaptureControls } from "../components/CaptureControls";
 import { MetricsTiles } from "../components/MetricsTiles";
-import { RNTITable } from "../components/RNTITable";
 import { LogPanel } from "../components/LogPanel";
 import { IdentitiesPanel } from "../components/IdentitiesPanel";
-import { PacketFeed } from "../components/PacketFeed";
 import { SpectrumButton } from "../components/SpectrumButton";
 import { WiresharkButton } from "../components/WiresharkButton";
 import { CapturesPanel } from "../components/CapturesPanel";
@@ -36,23 +34,8 @@ export function Dashboard() {
       {/* row 2: metrics tiles */}
       <MetricsTiles />
 
-      {/* row 3: main grid — packets (large) + RNTI table (wide side).
-          NOTE: each panel is the grid item DIRECTLY, no wrapper div. A wrapper
-          div is `display: block` so its child (the panel) sizes to its
-          intrinsic content height, which means `flex-1` on inner scroll
-          containers has nothing to be flex-1 OF — the panel just grows
-          tall enough to fit every row and overflows the grid cell. Making
-          the panel the grid item itself fixes this: grid items default to
-          `align-self: stretch`, so the panel inherits the grid row's height
-          and its inner `flex-col + flex-1 + min-h-0` chain finally has a
-          bounded container to lay out against. */}
-      <div className="grid gap-3 flex-1 min-h-0" style={{ gridTemplateColumns: "minmax(0, 1fr) 440px" }}>
-        <PacketFeed />
-        <RNTITable />
-      </div>
-
-      {/* row 4: tabbed footer */}
-      <div className="panel p-3 flex flex-col min-h-0" style={{ flexBasis: "240px", flexShrink: 0 }}>
+      {/* row 3: tabbed footer — expands to fill remaining height */}
+      <div className="panel p-3 flex flex-col min-h-0 flex-1">
         <div className="flex gap-1 mb-2">
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "logs" ? "btn-primary" : ""}`} onClick={() => setBottomTab("logs")}>Logs</button>
           <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "history" ? "btn-primary" : ""}`} onClick={() => setBottomTab("history")}>Log History</button>
