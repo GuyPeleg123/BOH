@@ -131,7 +131,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
       <div className="panel w-full max-w-3xl max-h-[90vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center mb-3">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
-            {outMode === "organize" ? "Organize session" : "Decrypt"}: <span className="text-slate-100 normal-case">{file.name}</span>
+            {outMode === "organize" ? "Decrypt & Split per UE" : "Decrypt"}: <span className="text-slate-100 normal-case">{file.name}</span>
           </h2>
           <button className="btn !px-2 !py-0.5 !text-xs ml-auto" onClick={onClose}>✕ close</button>
         </div>
@@ -141,11 +141,11 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
             <span className="text-muted uppercase text-[10px]">Output</span>
             <label className="flex items-center gap-1 cursor-pointer">
               <input type="radio" name="outmode" checked={outMode === "organize"} onChange={() => setOutMode("organize")} />
-              <span>Session folder (per-UE sub-pcaps)</span>
+              <span>Decrypt &amp; split per UE</span>
             </label>
             <label className="flex items-center gap-1 cursor-pointer">
               <input type="radio" name="outmode" checked={outMode === "decrypt"} onChange={() => setOutMode("decrypt")} />
-              <span>Decrypt only (readable text)</span>
+              <span>Decrypt to single file</span>
             </label>
           </div>
           {outMode === "organize" && (
@@ -240,7 +240,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
             <div className="mt-3 text-xs">
               {organized.ok ? (
                 <div className="border border-ok/40 rounded p-2">
-                  <div className="text-ok">✓ Session organized — {organized.ues.length} UE{organized.ues.length === 1 ? "" : "s"} found.</div>
+                  <div className="text-ok">✓ Decrypted & split — {organized.ues.length} UE{organized.ues.length === 1 ? "" : "s"} found.</div>
                   <div className="text-muted mt-1">
                     Folder: <span className="font-mono text-slate-200 break-all">{organized.folder}</span>
                   </div>
@@ -289,8 +289,8 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
           <span className="text-[11px] text-muted">Runs via tshark. Keys are remembered locally in this browser.</span>
           <button className="btn btn-primary !px-3 !py-1 !text-xs ml-auto" disabled={running} onClick={run}>
             {running
-              ? (outMode === "organize" ? "Organizing…" : "Decrypting…")
-              : (outMode === "organize" ? "Organize Session" : "Run Decrypt")}
+              ? (outMode === "organize" ? "Decrypting…" : "Decrypting…")
+              : (outMode === "organize" ? "Decrypt & Split" : "Run Decrypt")}
           </button>
         </div>
       </div>
