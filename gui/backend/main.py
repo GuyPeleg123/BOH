@@ -699,6 +699,29 @@ async def download_capture(path: str) -> FileResponse:
     return FileResponse(p, media_type="application/vnd.tcpdump.pcap", filename=p.name)
 
 
+class _DecryptEntryBody(BaseModel):
+    rnti: int
+    rrcenc_key: str
+    upenc_key: str
+    cipher_algo: str = "EEA2"
+    integ_algo: str = "EIA2"
+
+
+class _DecryptBody(BaseModel):
+    path: str
+    entries: list[_DecryptEntryBody]
+
+
+@app.post("/api/captures/decrypt")
+async def decrypt_capture(body: _DecryptBody) -> dict[str, Any]:
+    """Post-capture PDCP decryption: per-RNTI keys -> readable decode + keyed
+    pcap + .uat sidecar. tshark/IO is blocking, so run it off the event loop.
+    Validation/tshark failures return ok=False (not a 500)."""
+    cfg = config_mod.load()
+    entries = [e.model_dump() for e in body.entries]
+    return await asyncio.to_thread(captures_mod.decrypt_pcap, cfg, body.path, entries)
+
+
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
     # Auth check BEFORE accept(): we don't want to give an unauthed peer a

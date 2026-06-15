@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { CapturesResponse } from "../lib/types";
+import type { CapturesResponse, CaptureFile } from "../lib/types";
 import { useStore } from "../lib/store";
+import { DecryptModal } from "./DecryptModal";
 
 
 
@@ -25,6 +26,7 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
   const state = { lifecycle };
   const [resp, setResp] = useState<CapturesResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [decryptTarget, setDecryptTarget] = useState<CaptureFile | null>(null);
 
   function refresh() {
     api.captures().then(setResp).catch((e) => setErr(e.message));
@@ -59,6 +61,7 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
               <th className="text-right px-2 py-1.5">Size</th>
               <th className="text-right px-2 py-1.5">Modified</th>
               <th className="text-right px-2 py-1.5 w-24">Download</th>
+              <th className="text-right px-2 py-1.5 w-24">Decrypt</th>
             </tr>
           </thead>
           <tbody>
@@ -85,11 +88,20 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
                     <span className="text-muted text-[10px]">empty</span>
                   )}
                 </td>
+                <td className="px-2 py-1 text-right">
+                  {c.size > 0 ? (
+                    <button className="btn !px-2 !py-0.5 !text-xs" title="Decrypt with PDCP keys" onClick={() => setDecryptTarget(c)}>
+                      🔓 decrypt
+                    </button>
+                  ) : (
+                    <span className="text-muted text-[10px]">—</span>
+                  )}
+                </td>
               </tr>
             ))}
             {resp && resp.captures.length === 0 && (
               <tr>
-                <td colSpan={5} className="text-center text-muted py-6">
+                <td colSpan={6} className="text-center text-muted py-6">
                   No pcap files in <span className="font-mono">{resp.captures_dir}</span> or its known siblings.
                   Start a capture to generate one.
                 </td>
@@ -97,12 +109,15 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
             )}
             {err && (
               <tr>
-                <td colSpan={5} className="text-center text-bad py-4 font-mono text-xs">{err}</td>
+                <td colSpan={6} className="text-center text-bad py-4 font-mono text-xs">{err}</td>
               </tr>
             )}
           </tbody>
         </table>
       </div>
+      {decryptTarget && (
+        <DecryptModal file={decryptTarget} onClose={() => setDecryptTarget(null)} onDone={refresh} />
+      )}
     </div>
   );
 

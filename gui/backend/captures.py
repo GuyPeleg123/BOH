@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterable
@@ -120,3 +125,194 @@ def resolve_for_download(cfg: SnifferConfig, path: str) -> Path:
         except ValueError:
             continue
     raise PermissionError(f"{p} is outside the allowed roots")
+
+
+# ---------------------------------------------------------------------------
+# Post-capture PDCP decryption
+#
+# Wireshark deciphers PDCP-LTE at dissection time using its `pdcp_lte_ue_keys`
+# UAT, keyed by UEId. LTESniffer pcaps tag every frame UEId=0 (only RNTI set),
+# so we first rewrite each frame's UEId tag to equal its RNTI, then feed tshark
+# one UAT row per RNTI. tshark can't bake decryption into a pcap (-w keeps the
+# ciphered bytes), so we emit (a) a readable verbose decode and (b) the
+# UEId-rewritten pcap + a .uat sidecar the operator can load in their Wireshark.
+# ---------------------------------------------------------------------------
+
+_HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
+_CIPHER_ALGOS = {"EEA0", "EEA1", "EEA2", "EEA3"}
+_INTEG_ALGOS = {"EIA0", "EIA1", "EIA2", "EIA3"}
+
+# MAC-LTE pcap framing (DLT 147): record data = radioType, direction, rntiType,
+# then TLV tags until the 0x01 payload tag.
+_MAC_LTE_PAYLOAD_TAG = 0x01
+_MAC_LTE_RNTI_TAG = 0x02
+_MAC_LTE_UEID_TAG = 0x03
+_TAGS_2B = {0x02, 0x03, 0x04}              # RNTI, UEID, FRAME/SUBFRAME
+_TAGS_1B = {0x05, 0x06, 0x07, 0x0A, 0x0F}  # predef, retx, crc, carrier, nb-mode
+
+
+def _rewrite_ueid_eq_rnti(in_path: Path, out_path: Path) -> int:
+    """Copy a MAC-LTE pcap setting each frame's UEId tag = its RNTI (in place,
+    no length change) so the per-UEId pdcp_lte_ue_keys table keys per-RNTI.
+    Returns frames rewritten. Frames missing either tag pass through unchanged."""
+    with open(in_path, "rb") as f:
+        gh = f.read(24)
+        if len(gh) < 24:
+            raise ValueError("pcap too short")
+        magic = struct.unpack("<I", gh[:4])[0]
+        endi = "<" if magic in (0xA1B2C3D4, 0xA1B23C4D) else ">"
+        linktype = struct.unpack(endi + "I", gh[20:24])[0]
+        if linktype != 147:
+            raise ValueError(f"not a MAC-LTE pcap (linktype={linktype})")
+        rewritten = 0
+        with open(out_path, "wb") as o:
+            o.write(gh)
+            while True:
+                rh = f.read(16)
+                if len(rh) < 16:
+                    break
+                incl = struct.unpack(endi + "IIII", rh)[2]
+                data = bytearray(f.read(incl))
+                if len(data) < incl:
+                    break
+                i, n = 3, len(data)
+                rnti = None
+                ueid_pos = None
+                while i < n:
+                    tag = data[i]
+                    if tag == _MAC_LTE_PAYLOAD_TAG:
+                        break
+                    if tag == _MAC_LTE_RNTI_TAG and i + 3 <= n:
+                        rnti = (data[i + 1] << 8) | data[i + 2]
+                        i += 3
+                    elif tag == _MAC_LTE_UEID_TAG and i + 3 <= n:
+                        ueid_pos = i + 1
+                        i += 3
+                    elif tag in _TAGS_2B:
+                        i += 3
+                    elif tag in _TAGS_1B:
+                        i += 2
+                    else:
+                        break
+                if rnti is not None and ueid_pos is not None:
+                    data[ueid_pos] = (rnti >> 8) & 0xFF
+                    data[ueid_pos + 1] = rnti & 0xFF
+                    rewritten += 1
+                o.write(rh)
+                o.write(data)
+        return rewritten
+
+
+def decrypt_pcap(cfg: SnifferConfig, input_path: str, entries: list[dict]) -> dict:
+    """Decrypt a captured pcap with per-RNTI keys. Produces a readable decode
+    (.txt), a UEId-rewritten pcap, and a .uat keys sidecar. Returns a structured
+    result (never raises to the caller; tshark failures come back as ok=False)."""
+    res: dict = {
+        "ok": False, "error": None, "stderr": "", "note": None,
+        "keyed_pcap_path": None, "txt_path": None, "uat_path": None,
+        "decoded_text": "", "uat_text": "", "frames_rewritten": 0, "ndecoded": 0,
+    }
+    try:
+        src = resolve_for_download(cfg, input_path)
+    except FileNotFoundError:
+        res["error"] = "input pcap not found"; return res
+    except PermissionError as e:
+        res["error"] = str(e); return res
+
+    if not entries:
+        res["error"] = "no key entries provided"; return res
+    norm = []
+    for e in entries:
+        try:
+            rnti = int(e["rnti"])
+        except (KeyError, ValueError, TypeError):
+            res["error"] = "invalid rnti"; return res
+        if not 0 <= rnti <= 0xFFFF:
+            res["error"] = f"rnti {rnti} out of range (0..65535)"; return res
+        rrc = str(e.get("rrcenc_key", "")).strip()
+        up = str(e.get("upenc_key", "")).strip()
+        if not _HEX32.match(rrc):
+            res["error"] = f"RNTI {rnti}: K_RRCenc must be 32 hex chars"; return res
+        if not _HEX32.match(up):
+            res["error"] = f"RNTI {rnti}: K_UPenc must be 32 hex chars"; return res
+        cipher = str(e.get("cipher_algo", "EEA2"))
+        integ = str(e.get("integ_algo", "EIA2"))
+        if cipher not in _CIPHER_ALGOS:
+            res["error"] = f"RNTI {rnti}: bad cipher_algo {cipher}"; return res
+        if integ not in _INTEG_ALGOS:
+            res["error"] = f"RNTI {rnti}: bad integ_algo {integ}"; return res
+        norm.append({"rnti": rnti, "rrc": rrc.lower(), "up": up.lower(),
+                     "cipher": cipher, "integ": integ})
+
+    if len({e["cipher"] for e in norm}) > 1:
+        res["note"] = ("Multiple cipher algorithms given; tshark applies one global "
+                       "default, so mixed-algo UEs decrypt only if the capture also "
+                       "contains their RRC SecurityModeCommand.")
+
+    stem, d = src.stem, src.parent
+    keyed = d / f"{stem}_keyed.pcap"
+    txt = d / f"{stem}_decrypted.txt"
+    uat = d / f"{stem}.pdcp_lte_ue_keys.uat"
+
+    if not shutil.which("tshark"):
+        res["error"] = "tshark not found on PATH"; return res
+
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="lte-keyed-", suffix=".pcap", delete=False) as tf:
+            tmp = Path(tf.name)
+        res["frames_rewritten"] = _rewrite_ueid_eq_rnti(src, tmp)
+
+        oargs = [
+            "-o", "pdcp-lte.decipher_signalling:TRUE",
+            "-o", "pdcp-lte.decipher_userplane:TRUE",
+            "-o", f"pdcp-lte.default_ciphering_algorithm:{norm[0]['cipher']}",
+            "-o", f"pdcp-lte.default_integrity_algorithm:{norm[0]['integ']}",
+            "-o", "pdcp-lte.show_user_plane_as_ip:TRUE",
+            "-o", "pdcp-lte.show_signalling_plane_as_rrc:TRUE",
+            "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
+        ]
+        uat_rows = []
+        for e in norm:
+            row = f'"{e["rnti"]}","{e["rrc"]}","{e["up"]}",""'  # rrcIntegrity left blank
+            uat_rows.append(row)
+            oargs += ["-o", f"uat:pdcp_lte_ue_keys:{row}"]
+        uat_text = (
+            "# Wireshark PDCP-LTE keys (pdcp_lte_ue_keys.uat)\n"
+            "# Load: copy into ~/.config/wireshark/  then open the *_keyed.pcap\n"
+            "# Columns: ueid(=RNTI), RRC cipher key, UP cipher key, RRC integrity key\n"
+            + "\n".join(uat_rows) + "\n"
+        )
+
+        shutil.move(str(tmp), str(keyed)); tmp = None
+        uat.write_text(uat_text)
+
+        cmd = ["tshark", "-r", str(keyed), *oargs, "-Y", "pdcp-lte", "-V"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res["stderr"] = (proc.stderr or "").strip()
+        decoded = proc.stdout or ""
+        max_bytes = 4 * 1024 * 1024
+        if len(decoded) > max_bytes:
+            decoded = decoded[:max_bytes] + "\n...[truncated]...\n"
+        txt.write_text(decoded)
+
+        res["ndecoded"] = decoded.count("PDCP-LTE")
+        res["keyed_pcap_path"] = str(keyed)
+        res["txt_path"] = str(txt)
+        res["uat_path"] = str(uat)
+        res["decoded_text"] = decoded
+        res["uat_text"] = uat_text
+        res["ok"] = proc.returncode == 0
+        if proc.returncode != 0 and not res["error"]:
+            res["error"] = "tshark exited non-zero — see stderr"
+        return res
+    except subprocess.TimeoutExpired:
+        res["error"] = "tshark timed out (>300s)"; return res
+    except Exception as ex:  # noqa: BLE001 - report any failure structurally
+        res["error"] = f"{type(ex).__name__}: {ex}"; return res
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass

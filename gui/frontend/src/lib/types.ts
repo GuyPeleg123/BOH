@@ -113,6 +113,28 @@ export interface CaptureFile {
   active: boolean;
 }
 
+export interface DecryptEntry {
+  rnti: number;
+  rrcenc_key: string;   // 32 hex chars (K_RRCenc)
+  upenc_key: string;    // 32 hex chars (K_UPenc)
+  cipher_algo: string;  // EEA0|EEA1|EEA2|EEA3
+  integ_algo: string;   // EIA0|EIA1|EIA2|EIA3
+}
+
+export interface DecryptResponse {
+  ok: boolean;
+  error: string | null;
+  stderr: string;
+  note: string | null;
+  keyed_pcap_path: string | null;
+  txt_path: string | null;
+  uat_path: string | null;
+  decoded_text: string;
+  uat_text: string;
+  frames_rewritten: number;
+  ndecoded: number;
+}
+
 export interface CapturesResponse {
   captures: CaptureFile[];
   roots: string[];

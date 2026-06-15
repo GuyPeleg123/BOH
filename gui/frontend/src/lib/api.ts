@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -98,6 +98,11 @@ export const api = {
       "/api/wireshark/open", { method: "POST" }),
   downloadCaptureUrl: (path: string) =>
     `/api/captures/download?path=${encodeURIComponent(path)}`,
+  decryptCapture: (path: string, entries: DecryptEntry[]) =>
+    req<DecryptResponse>("/api/captures/decrypt", {
+      method: "POST",
+      body: JSON.stringify({ path, entries }),
+    }),
   logHistory: () =>
     req<{ runs: RunLog[] }>("/api/logs/history"),
   logContent: (path: string) =>
