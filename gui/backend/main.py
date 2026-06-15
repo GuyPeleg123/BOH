@@ -722,6 +722,34 @@ async def decrypt_capture(body: _DecryptBody) -> dict[str, Any]:
     return await asyncio.to_thread(captures_mod.decrypt_pcap, cfg, body.path, entries)
 
 
+class _OrganizeEntryBody(BaseModel):
+    # rnti optional: in auto mode keys are matched to UEs heuristically
+    rnti: int | None = None
+    rrcenc_key: str
+    upenc_key: str
+    cipher_algo: str = "EEA2"
+    integ_algo: str = "EIA2"
+
+
+class _OrganizeBody(BaseModel):
+    path: str
+    entries: list[_OrganizeEntryBody] = []
+    mode: str = "auto"  # "auto" | "per-rnti"
+
+
+@app.post("/api/captures/organize")
+async def organize_session(body: _OrganizeBody) -> dict[str, Any]:
+    """Build a per-session folder: full pcap + one sub-pcap per UE named by
+    TMSI/IMSI (else RNTI). Keys (optional) are matched to UEs in 'auto' mode by
+    best clean-decode heuristic, or by RNTI in 'per-rnti' mode. tshark/IO is
+    blocking → run off the event loop; failures return ok=False (not a 500)."""
+    cfg = config_mod.load()
+    entries = [e.model_dump() for e in body.entries]
+    return await asyncio.to_thread(
+        captures_mod.organize_session, cfg, body.path, entries, body.mode
+    )
+
+
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
     # Auth check BEFORE accept(): we don't want to give an unauthed peer a

@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -102,6 +102,11 @@ export const api = {
     req<DecryptResponse>("/api/captures/decrypt", {
       method: "POST",
       body: JSON.stringify({ path, entries }),
+    }),
+  organizeSession: (path: string, entries: OrganizeEntry[], mode: "auto" | "per-rnti") =>
+    req<OrganizeResponse>("/api/captures/organize", {
+      method: "POST",
+      body: JSON.stringify({ path, entries, mode }),
     }),
   logHistory: () =>
     req<{ runs: RunLog[] }>("/api/logs/history"),

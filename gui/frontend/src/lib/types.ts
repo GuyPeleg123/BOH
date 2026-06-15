@@ -135,6 +135,33 @@ export interface DecryptResponse {
   ndecoded: number;
 }
 
+export interface OrganizeEntry {
+  rnti?: number | null;   // optional in auto mode
+  rrcenc_key: string;
+  upenc_key: string;
+  cipher_algo: string;
+  integ_algo: string;
+}
+
+export interface OrganizedUE {
+  rnti: number;
+  rnti_hex: string;
+  identity: string | null;     // "tmsi-..." / "imsi-..." or null
+  frames: number;
+  sub_pcap: string;
+  matched_key: string | null;  // truncated key preview, or null if no key matched
+  score: number;               // clean-decode delta the matched key achieved
+  decoded_txt: string | null;
+}
+
+export interface OrganizeResponse {
+  ok: boolean;
+  error: string | null;
+  folder: string | null;
+  ues: OrganizedUE[];
+  note: string | null;
+}
+
 export interface CapturesResponse {
   captures: CaptureFile[];
   roots: string[];

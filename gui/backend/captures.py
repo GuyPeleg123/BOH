@@ -316,3 +316,199 @@ def decrypt_pcap(cfg: SnifferConfig, input_path: str, entries: list[dict]) -> di
                 tmp.unlink()
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Session organizer: split a whole sniff into a folder of per-UE sub-pcaps
+# named by TMSI/IMSI (falling back to RNTI), optionally decrypting each UE.
+# ---------------------------------------------------------------------------
+
+_MIN_FRAMES_PER_UE = 3   # ignore one-hit C-RNTI ghosts from blind search
+
+
+def _tshark_fields(pcap: Path, dfilter: str, fields: list[str], timeout: int = 120) -> list[list[str]]:
+    cmd = ["tshark", "-r", str(pcap)]
+    if dfilter:
+        cmd += ["-Y", dfilter]
+    cmd += ["-T", "fields"]
+    for f in fields:
+        cmd += ["-e", f]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    rows = []
+    for line in out.stdout.splitlines():
+        if line.strip():
+            rows.append(line.split("\t"))
+    return rows
+
+
+def _rnti_identity_map(pcap: Path) -> dict:
+    """Best-effort rnti -> identity label ('imsi-<v>' / 'tmsi-<v>') from cleartext
+    RRC in the pcap and a sibling sniffer.log API table. Empty if none found."""
+    m: dict = {}
+    # (1) RRC Connection Request carrying s-TMSI on the UE's (temp) C-RNTI
+    try:
+        for r in _tshark_fields(pcap,
+                                "lte-rrc.rrcConnectionRequest_element and lte-rrc.m_TMSI",
+                                ["mac-lte.rnti", "lte-rrc.m_TMSI"]):
+            if len(r) >= 2 and r[0] and r[1]:
+                rnti = int(r[0]); tmsi = r[1].split(",")[0]
+                if 0x3D <= rnti <= 0xFFF3:
+                    m.setdefault(rnti, f"tmsi-{tmsi}")
+    except Exception:
+        pass
+    # (2) sibling sniffer.log API identity table (RNTI-mapped, from -z modes)
+    log = pcap.parent / "sniffer.log"
+    if log.exists():
+        try:
+            started = False
+            for line in log.read_text(errors="ignore").splitlines():
+                if "Detected Identity" in line:
+                    started = True
+                    continue
+                if not started:
+                    continue
+                low = line.lower()
+                kind = "imsi" if "imsi" in low else ("tmsi" if "tmsi" in low else None)
+                if not kind:
+                    continue
+                # tokens: pick the long id value and a plausible C-RNTI int
+                toks = line.split()
+                value = next((t for t in toks if len(t) >= 8 and all(c in "0123456789abcdefABCDEF" for c in t)), None)
+                rnti = next((int(t) for t in toks if t.isdigit() and 0x3D <= int(t) <= 0xFFF3), None)
+                if value and rnti is not None:
+                    m[rnti] = f"{kind}-{value}"  # imsi/explicit map wins over the tmsi guess
+        except Exception:
+            pass
+    return m
+
+
+def _safe_label(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", s)[:48]
+
+
+def _decode_count(pcap: Path, rnti: int, key: dict | None) -> int:
+    """Count frames of this RNTI that dissect cleanly to lte-rrc or ip. With the
+    right key, ciphered SRB/DRB decode to RRC/IP; with a wrong key they're garbage."""
+    oargs = [
+        "-o", "pdcp-lte.decipher_signalling:TRUE",
+        "-o", "pdcp-lte.decipher_userplane:TRUE",
+        "-o", "pdcp-lte.show_user_plane_as_ip:TRUE",
+        "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
+    ]
+    if key:
+        oargs += [
+            "-o", f"pdcp-lte.default_ciphering_algorithm:{key['cipher']}",
+            "-o", f"pdcp-lte.default_integrity_algorithm:{key['integ']}",
+            "-o", f'uat:pdcp_lte_ue_keys:"{rnti}","{key["rrc"]}","{key["up"]}",""',
+        ]
+    cmd = ["tshark", "-r", str(pcap), "-Y", f"mac-lte.rnti=={rnti} and (lte-rrc or ip)", *oargs, "-T", "fields", "-e", "frame.number"]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    return len([x for x in out.stdout.splitlines() if x.strip()])
+
+
+def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | None,
+                     mode: str = "auto") -> dict:
+    """Build a session folder: the full pcap + one sub-pcap per UE (recurring
+    C-RNTI), named by TMSI/IMSI when known else by RNTI. If keys are given,
+    decrypt each UE — `mode='auto'` heuristically matches keys to UEs by which
+    one yields the most clean RRC/IP decodes; `mode='per-rnti'` uses the RNTI on
+    each key entry. Returns a structured manifest (never raises to the caller)."""
+    res: dict = {"ok": False, "error": None, "folder": None, "ues": [], "note": None}
+    try:
+        src = resolve_for_download(cfg, input_path)
+    except FileNotFoundError:
+        res["error"] = "input pcap not found"; return res
+    except PermissionError as e:
+        res["error"] = str(e); return res
+    if not shutil.which("tshark"):
+        res["error"] = "tshark not found on PATH"; return res
+
+    entries = entries or []
+    keys = []
+    for e in entries:
+        rrc = str(e.get("rrcenc_key", "")).strip().lower()
+        up = str(e.get("upenc_key", "")).strip().lower()
+        if not (_HEX32.match(rrc) and _HEX32.match(up)):
+            res["error"] = "every key needs valid 32-hex K_RRCenc and K_UPenc"; return res
+        keys.append({
+            "rnti": int(e["rnti"]) if str(e.get("rnti", "")).strip() not in ("", "None") else None,
+            "rrc": rrc, "up": up,
+            "cipher": str(e.get("cipher_algo", "EEA2")), "integ": str(e.get("integ_algo", "EIA2")),
+        })
+
+    stem, d = src.stem, src.parent
+    folder = d / f"{stem}_session"
+    try:
+        folder.mkdir(exist_ok=True)
+        # ueid:=rnti rewrite -> keyed full pcap (the one we split + decrypt)
+        full = folder / f"{stem}_full.pcap"
+        _rewrite_ueid_eq_rnti(src, full)
+
+        idmap = _rnti_identity_map(full)
+
+        # recurring C-RNTIs only (skip SI/P/RA and one-hit ghosts) — PLUS any
+        # RNTI we recovered an identity for, even a single-frame one: a UE that
+        # announced its TMSI/IMSI is real, not a blind-search ghost.
+        counts: dict = {}
+        for r in _tshark_fields(full, "mac-lte", ["mac-lte.rnti", "mac-lte.rnti-type"]):
+            if len(r) >= 2 and r[0] and r[1] == "3":
+                rnti = int(r[0]); counts[rnti] = counts.get(rnti, 0) + 1
+        keep = {rn for rn, c in counts.items() if c >= _MIN_FRAMES_PER_UE}
+        keep |= {rn for rn in idmap if rn in counts}
+        rntis = sorted(keep, key=lambda rn: counts.get(rn, 0), reverse=True)[:64]
+
+        for rnti in rntis:
+            ident = idmap.get(rnti)
+            label = _safe_label(ident) if ident else f"rnti-{rnti:04x}"
+            sub = folder / f"ue_{label}.pcap"
+            subprocess.run(["tshark", "-r", str(full), "-Y", f"mac-lte.rnti=={rnti}", "-w", str(sub)],
+                           capture_output=True, text=True, timeout=180)
+            ue = {"rnti": rnti, "rnti_hex": f"0x{rnti:04X}", "identity": ident,
+                  "frames": counts[rnti], "sub_pcap": str(sub),
+                  "matched_key": None, "score": 0, "decoded_txt": None}
+
+            # choose a key
+            key = None
+            if mode == "per-rnti":
+                key = next((k for k in keys if k["rnti"] == rnti), None)
+            elif keys:  # auto-match: best clean-decode delta over the no-key baseline
+                base = _decode_count(sub, rnti, None)
+                best, best_delta = None, 0
+                for k in keys:
+                    delta = _decode_count(sub, rnti, k) - base
+                    if delta > best_delta:
+                        best, best_delta = k, delta
+                if best and best_delta >= 2:
+                    key = best; ue["score"] = best_delta
+
+            if key:
+                ue["matched_key"] = f"{key['rrc'][:8]}…/{key['up'][:8]}…"
+                txt = folder / f"ue_{label}_decrypted.txt"
+                oargs = [
+                    "-o", "pdcp-lte.decipher_signalling:TRUE", "-o", "pdcp-lte.decipher_userplane:TRUE",
+                    "-o", f"pdcp-lte.default_ciphering_algorithm:{key['cipher']}",
+                    "-o", f"pdcp-lte.default_integrity_algorithm:{key['integ']}",
+                    "-o", "pdcp-lte.show_user_plane_as_ip:TRUE", "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
+                    "-o", f'uat:pdcp_lte_ue_keys:"{rnti}","{key["rrc"]}","{key["up"]}",""',
+                ]
+                dec = subprocess.run(["tshark", "-r", str(sub), *oargs, "-Y", "pdcp-lte", "-V"],
+                                     capture_output=True, text=True, timeout=180).stdout
+                txt.write_text(dec[:4 * 1024 * 1024])
+                ue["decoded_txt"] = str(txt)
+            res["ues"].append(ue)
+
+        named = sum(1 for u in res["ues"] if u["identity"])
+        if res["ues"] and named == 0:
+            res["note"] = ("No UE identities (TMSI/IMSI) were recoverable from this capture — "
+                           "sub-pcaps are named by RNTI. Run with API mode (-z) and capture RRC "
+                           "Connection Requests / paging to get identity names.")
+        # session manifest
+        import json as _json
+        (folder / "session.json").write_text(_json.dumps({"source": str(src), "ues": res["ues"]}, indent=2))
+        res["folder"] = str(folder)
+        res["ok"] = True
+        return res
+    except subprocess.TimeoutExpired:
+        res["error"] = "tshark timed out"; return res
+    except Exception as ex:  # noqa: BLE001
+        res["error"] = f"{type(ex).__name__}: {ex}"; return res
