@@ -701,8 +701,14 @@ async def download_capture(path: str) -> FileResponse:
 
 class _DecryptEntryBody(BaseModel):
     rnti: int
-    rrcenc_key: str
-    upenc_key: str
+    # Supply the ciphering keys directly, OR a K_eNB, OR K_ASME + NAS uplink
+    # count — the backend derives K_RRCenc/K_UPenc (TS 33.401) when the raw
+    # keys are absent. Keys default to "" so a derive-only entry validates.
+    rrcenc_key: str = ""
+    upenc_key: str = ""
+    kasme: str | None = None
+    nas_count: int | None = None
+    kenb: str | None = None
     cipher_algo: str = "EEA2"
     integ_algo: str = "EIA2"
 
@@ -722,11 +728,39 @@ async def decrypt_capture(body: _DecryptBody) -> dict[str, Any]:
     return await asyncio.to_thread(captures_mod.decrypt_pcap, cfg, body.path, entries)
 
 
+class _DeriveBody(BaseModel):
+    kasme: str | None = None
+    nas_count: int | None = None
+    kenb: str | None = None
+    cipher_algo: str = "EEA2"
+    integ_algo: str = "EIA2"
+
+
+@app.post("/api/keys/derive")
+async def derive_keys(body: _DeriveBody) -> dict[str, Any]:
+    """Derive the access-stratum keys (K_RRCenc/int, K_UPenc/int) from
+    K_ASME + NAS uplink COUNT, or from a K_eNB directly (3GPP TS 33.401).
+    Returns ok=False with an error message on bad input rather than a 500."""
+    import keyderiv
+    try:
+        d = keyderiv.derive_keys(
+            kasme=body.kasme, nas_count=body.nas_count, kenb=body.kenb,
+            cipher_algo=body.cipher_algo, integ_algo=body.integ_algo,
+        )
+        return {"ok": True, "error": None, **d}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
 class _OrganizeEntryBody(BaseModel):
-    # rnti optional: in auto mode keys are matched to UEs heuristically
+    # rnti optional: in auto mode keys are matched to UEs heuristically.
+    # Keys may be given directly or derived from K_eNB / (K_ASME + NAS count).
     rnti: int | None = None
-    rrcenc_key: str
-    upenc_key: str
+    rrcenc_key: str = ""
+    upenc_key: str = ""
+    kasme: str | None = None
+    nas_count: int | None = None
+    kenb: str | None = None
     cipher_algo: str = "EEA2"
     integ_algo: str = "EIA2"
 

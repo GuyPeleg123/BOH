@@ -115,10 +115,27 @@ export interface CaptureFile {
 
 export interface DecryptEntry {
   rnti: number;
-  rrcenc_key: string;   // 32 hex chars (K_RRCenc)
-  upenc_key: string;    // 32 hex chars (K_UPenc)
+  // Give the ciphering keys directly, OR a K_eNB, OR K_ASME + NAS uplink count
+  // (the backend derives K_RRCenc/K_UPenc per TS 33.401).
+  rrcenc_key?: string;  // 32 hex chars (K_RRCenc)
+  upenc_key?: string;   // 32 hex chars (K_UPenc)
+  kasme?: string | null;       // 64 hex chars (K_ASME)
+  nas_count?: number | null;   // NAS uplink COUNT
+  kenb?: string | null;        // 64 hex chars (K_eNB)
   cipher_algo: string;  // EEA0|EEA1|EEA2|EEA3
   integ_algo: string;   // EIA0|EIA1|EIA2|EIA3
+}
+
+export interface DeriveResponse {
+  ok: boolean;
+  error: string | null;
+  k_enb?: string;
+  cipher_algo?: string;
+  integ_algo?: string;
+  rrcenc_key?: string;
+  rrcint_key?: string;
+  upenc_key?: string;
+  upint_key?: string;
 }
 
 export interface DecryptResponse {
@@ -137,8 +154,11 @@ export interface DecryptResponse {
 
 export interface OrganizeEntry {
   rnti?: number | null;   // optional in auto mode
-  rrcenc_key: string;
-  upenc_key: string;
+  rrcenc_key?: string;
+  upenc_key?: string;
+  kasme?: string | null;
+  nas_count?: number | null;
+  kenb?: string | null;
   cipher_algo: string;
   integ_algo: string;
 }

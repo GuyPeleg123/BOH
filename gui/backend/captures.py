@@ -142,6 +142,31 @@ _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 _CIPHER_ALGOS = {"EEA0", "EEA1", "EEA2", "EEA3"}
 _INTEG_ALGOS = {"EIA0", "EIA1", "EIA2", "EIA3"}
 
+import keyderiv
+
+
+def _resolve_entry_keys(e: dict) -> tuple[str, str]:
+    """Return (rrcenc, upenc) 32-hex ciphering keys for a key entry, deriving
+    them from K_ASME+NAS_count (or K_eNB) when the raw keys aren't supplied.
+    Raises ValueError with a user-facing message on bad input."""
+    rrc = str(e.get("rrcenc_key", "") or "").strip().lower()
+    up = str(e.get("upenc_key", "") or "").strip().lower()
+    if _HEX32.match(rrc) and _HEX32.match(up):
+        return rrc, up
+    # not given directly — try to derive
+    kasme = str(e.get("kasme", "") or "").strip()
+    kenb = str(e.get("kenb", "") or "").strip()
+    nas = e.get("nas_count", None)
+    if kenb or (kasme and nas is not None):
+        d = keyderiv.derive_keys(
+            kasme=kasme or None, nas_count=nas, kenb=kenb or None,
+            cipher_algo=str(e.get("cipher_algo", "EEA2")),
+            integ_algo=str(e.get("integ_algo", "EIA2")),
+        )
+        return d["rrcenc_key"], d["upenc_key"]
+    raise ValueError("provide K_RRCenc+K_UPenc (32 hex each), or K_eNB, "
+                     "or K_ASME + NAS uplink count to derive them")
+
 # MAC-LTE pcap framing (DLT 147): record data = radioType, direction, rntiType,
 # then TLV tags until the 0x01 payload tag.
 _MAC_LTE_PAYLOAD_TAG = 0x01
@@ -229,12 +254,10 @@ def decrypt_pcap(cfg: SnifferConfig, input_path: str, entries: list[dict]) -> di
             res["error"] = "invalid rnti"; return res
         if not 0 <= rnti <= 0xFFFF:
             res["error"] = f"rnti {rnti} out of range (0..65535)"; return res
-        rrc = str(e.get("rrcenc_key", "")).strip()
-        up = str(e.get("upenc_key", "")).strip()
-        if not _HEX32.match(rrc):
-            res["error"] = f"RNTI {rnti}: K_RRCenc must be 32 hex chars"; return res
-        if not _HEX32.match(up):
-            res["error"] = f"RNTI {rnti}: K_UPenc must be 32 hex chars"; return res
+        try:
+            rrc, up = _resolve_entry_keys(e)
+        except ValueError as ke:
+            res["error"] = f"RNTI {rnti}: {ke}"; return res
         cipher = str(e.get("cipher_algo", "EEA2"))
         integ = str(e.get("integ_algo", "EIA2"))
         if cipher not in _CIPHER_ALGOS:
@@ -426,10 +449,10 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
     entries = entries or []
     keys = []
     for e in entries:
-        rrc = str(e.get("rrcenc_key", "")).strip().lower()
-        up = str(e.get("upenc_key", "")).strip().lower()
-        if not (_HEX32.match(rrc) and _HEX32.match(up)):
-            res["error"] = "every key needs valid 32-hex K_RRCenc and K_UPenc"; return res
+        try:
+            rrc, up = _resolve_entry_keys(e)
+        except ValueError as ke:
+            res["error"] = str(ke); return res
         keys.append({
             "rnti": int(e["rnti"]) if str(e.get("rnti", "")).strip() not in ("", "None") else None,
             "rrc": rrc, "up": up,

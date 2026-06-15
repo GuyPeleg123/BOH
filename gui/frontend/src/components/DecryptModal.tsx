@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { CaptureFile, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse } from "../lib/types";
 
@@ -13,9 +13,14 @@ interface FormEntry {
   upenc_key: string;
   cipher_algo: string;
   integ_algo: string;
+  kasme: string;       // optional: 64 hex (K_ASME) to derive keys from
+  nas_count: string;   // optional: NAS uplink COUNT (decimal)
+  derive: boolean;     // UI: show the K_ASME+NAS derive panel for this row
 }
 
-const blank = (): FormEntry => ({ rnti: "", rrcenc_key: "", upenc_key: "", cipher_algo: "EEA2", integ_algo: "EIA2" });
+const HEX64 = /^[0-9a-fA-F]{64}$/;
+
+const blank = (): FormEntry => ({ rnti: "", rrcenc_key: "", upenc_key: "", cipher_algo: "EEA2", integ_algo: "EIA2", kasme: "", nas_count: "", derive: false });
 
 function loadSaved(): FormEntry[] {
   try {
@@ -58,14 +63,31 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
   const addEntry = () => setEntries((es) => [...es, blank()]);
   const removeEntry = (i: number) => setEntries((es) => (es.length > 1 ? es.filter((_, j) => j !== i) : es));
 
+  // Derive K_RRCenc/K_UPenc from a row's K_ASME + NAS count and drop them into
+  // the key fields, so the user sees exactly what will be used.
+  async function deriveRow(i: number) {
+    setClientErr(null);
+    const e = entries[i];
+    if (!HEX64.test(e.kasme.trim())) { setClientErr(`K_ASME must be exactly 64 hex chars`); return; }
+    if (!/^\d+$/.test(e.nas_count.trim())) { setClientErr(`NAS count must be a non-negative integer`); return; }
+    try {
+      const r = await api.deriveKeys({ kasme: e.kasme.trim(), nas_count: parseInt(e.nas_count.trim(), 10), cipher_algo: e.cipher_algo, integ_algo: e.integ_algo });
+      if (!r.ok) { setClientErr(r.error || "derivation failed"); return; }
+      update(i, { rrcenc_key: r.rrcenc_key ?? "", upenc_key: r.upenc_key ?? "" });
+    } catch (err) {
+      setClientErr(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function run() {
     setClientErr(null);
     setResult(null);
     setOrganized(null);
 
-    // Validate each entry. A row counts as "filled" if it has any key text;
-    // in organize+auto with no keys at all we do a split-only run.
-    const filled = entries.filter((e) => e.rrcenc_key.trim() || e.upenc_key.trim() || e.rnti.trim());
+    // A row provides keys EITHER directly (K_RRCenc/K_UPenc) OR via a K_ASME +
+    // NAS uplink count that the backend derives. A row counts as "filled" if it
+    // has any of those, or an RNTI. In organize+auto, a fully blank set = split-only.
+    const filled = entries.filter((e) => e.rrcenc_key.trim() || e.upenc_key.trim() || e.kasme.trim() || e.rnti.trim());
     const rows = keysRequired ? entries : filled;
     if (keysRequired && rows.length === 0) { setClientErr("Add at least one key."); return; }
 
@@ -78,14 +100,24 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
         if (rnti == null && rntiRequired) { setClientErr(`Invalid RNTI "${e.rnti}" — expect hex like 0x4A01 (0–0xFFFF)`); return; }
       }
       const haveKeys = e.rrcenc_key.trim() || e.upenc_key.trim();
-      if (keysRequired || haveKeys) {
+      let payload: Partial<DecryptEntry>;
+      if (haveKeys) {
         if (!HEX32.test(e.rrcenc_key.trim())) { setClientErr(`K_RRCenc must be exactly 32 hex chars`); return; }
         if (!HEX32.test(e.upenc_key.trim())) { setClientErr(`K_UPenc must be exactly 32 hex chars`); return; }
+        payload = { rrcenc_key: e.rrcenc_key.trim(), upenc_key: e.upenc_key.trim() };
+      } else if (e.kasme.trim()) {
+        // derive from K_ASME + NAS count (backend does TS 33.401)
+        if (!HEX64.test(e.kasme.trim())) { setClientErr(`K_ASME must be exactly 64 hex chars`); return; }
+        if (!/^\d+$/.test(e.nas_count.trim())) { setClientErr(`NAS count must be a non-negative integer`); return; }
+        payload = { kasme: e.kasme.trim(), nas_count: parseInt(e.nas_count.trim(), 10) };
+      } else if (keysRequired) {
+        setClientErr(`Provide K_RRCenc+K_UPenc, or a K_ASME + NAS count to derive them`); return;
       } else {
         continue; // organize+auto blank row → skip
       }
-      organizeKeys.push({ rnti, rrcenc_key: e.rrcenc_key.trim(), upenc_key: e.upenc_key.trim(), cipher_algo: e.cipher_algo, integ_algo: e.integ_algo });
-      if (rnti != null) decryptKeys.push({ rnti, rrcenc_key: e.rrcenc_key.trim(), upenc_key: e.upenc_key.trim(), cipher_algo: e.cipher_algo, integ_algo: e.integ_algo });
+      const common = { cipher_algo: e.cipher_algo, integ_algo: e.integ_algo };
+      organizeKeys.push({ rnti, ...payload, ...common });
+      if (rnti != null) decryptKeys.push({ rnti, ...payload, ...common } as DecryptEntry);
     }
 
     try { localStorage.setItem(LS_KEY, JSON.stringify(entries)); } catch { /* ignore */ }
@@ -184,18 +216,43 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
             </thead>
             <tbody>
               {entries.map((e, i) => (
-                <tr key={i} className="border-b border-border/30">
-                  <td className="px-1 py-1"><input className="input !text-xs !w-24 font-mono" placeholder="0x4A01" value={e.rnti} onChange={(ev) => update(i, { rnti: ev.target.value })} /></td>
-                  <td className="px-1 py-1"><input className="input !text-xs font-mono" placeholder="32 hex chars" value={e.rrcenc_key} onChange={(ev) => update(i, { rrcenc_key: ev.target.value })} /></td>
-                  <td className="px-1 py-1"><input className="input !text-xs font-mono" placeholder="32 hex chars" value={e.upenc_key} onChange={(ev) => update(i, { upenc_key: ev.target.value })} /></td>
-                  <td className="px-1 py-1"><select className="input !text-xs !w-auto" value={e.cipher_algo} onChange={(ev) => update(i, { cipher_algo: ev.target.value })}>{CIPHERS.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
-                  <td className="px-1 py-1"><select className="input !text-xs !w-auto" value={e.integ_algo} onChange={(ev) => update(i, { integ_algo: ev.target.value })}>{INTEGS.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
-                  <td className="px-1 py-1 text-right"><button className="text-bad text-sm px-1" title="remove" onClick={() => removeEntry(i)}>✕</button></td>
-                </tr>
+                <Fragment key={i}>
+                  <tr className="border-b border-border/30">
+                    <td className="px-1 py-1"><input className="input !text-xs !w-24 font-mono" placeholder="0x4A01" value={e.rnti} onChange={(ev) => update(i, { rnti: ev.target.value })} /></td>
+                    <td className="px-1 py-1"><input className="input !text-xs font-mono" placeholder="32 hex chars" value={e.rrcenc_key} onChange={(ev) => update(i, { rrcenc_key: ev.target.value })} /></td>
+                    <td className="px-1 py-1"><input className="input !text-xs font-mono" placeholder="32 hex chars" value={e.upenc_key} onChange={(ev) => update(i, { upenc_key: ev.target.value })} /></td>
+                    <td className="px-1 py-1"><select className="input !text-xs !w-auto" value={e.cipher_algo} onChange={(ev) => update(i, { cipher_algo: ev.target.value })}>{CIPHERS.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
+                    <td className="px-1 py-1"><select className="input !text-xs !w-auto" value={e.integ_algo} onChange={(ev) => update(i, { integ_algo: ev.target.value })}>{INTEGS.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
+                    <td className="px-1 py-1 text-right whitespace-nowrap">
+                      <button className={`text-sm px-1 ${e.derive ? "text-primary" : "text-muted"}`} title="Derive keys from K_ASME + NAS count" onClick={() => update(i, { derive: !e.derive })}>🔑</button>
+                      <button className="text-bad text-sm px-1" title="remove" onClick={() => removeEntry(i)}>✕</button>
+                    </td>
+                  </tr>
+                  {e.derive && (
+                    <tr className="border-b border-border/30 bg-bg/40">
+                      <td />
+                      <td colSpan={5} className="px-1 pb-2">
+                        <div className="flex flex-wrap items-end gap-2">
+                          <label className="flex flex-col text-[10px] text-muted">K_ASME (64 hex)
+                            <input className="input !text-xs font-mono !w-[34rem] max-w-full" placeholder="64 hex chars" value={e.kasme} onChange={(ev) => update(i, { kasme: ev.target.value })} />
+                          </label>
+                          <label className="flex flex-col text-[10px] text-muted">NAS UL count
+                            <input className="input !text-xs font-mono !w-28" placeholder="e.g. 0" value={e.nas_count} onChange={(ev) => update(i, { nas_count: ev.target.value })} />
+                          </label>
+                          <button className="btn btn-primary !px-2 !py-0.5 !text-xs" onClick={() => deriveRow(i)}>Derive → keys</button>
+                          <span className="text-[10px] text-muted">cipher/integ come from this row's dropdowns. You can also just submit — the server derives.</span>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               ))}
             </tbody>
           </table>
-          <button className="btn !px-2 !py-0.5 !text-xs mt-2" onClick={addEntry}>＋ Add UE</button>
+          <div className="flex items-center gap-3 mt-2">
+            <button className="btn !px-2 !py-0.5 !text-xs" onClick={addEntry}>＋ Add UE</button>
+            <span className="text-[10px] text-muted">Don't have K_RRCenc/K_UPenc? Click 🔑 on a row to derive them from K_ASME + NAS uplink count.</span>
+          </div>
 
           {clientErr && <div className="mt-3 text-bad text-xs font-mono border border-bad/40 rounded p-2">{clientErr}</div>}
 

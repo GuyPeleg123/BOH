@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -107,6 +107,11 @@ export const api = {
     req<OrganizeResponse>("/api/captures/organize", {
       method: "POST",
       body: JSON.stringify({ path, entries, mode }),
+    }),
+  deriveKeys: (body: { kasme?: string | null; nas_count?: number | null; kenb?: string | null; cipher_algo: string; integ_algo: string }) =>
+    req<DeriveResponse>("/api/keys/derive", {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
   logHistory: () =>
     req<{ runs: RunLog[] }>("/api/logs/history"),
