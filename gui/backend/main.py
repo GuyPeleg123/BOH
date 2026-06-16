@@ -699,6 +699,28 @@ async def download_capture(path: str) -> FileResponse:
     return FileResponse(p, media_type="application/vnd.tcpdump.pcap", filename=p.name)
 
 
+class _BruteforceBody(BaseModel):
+    path: str
+    kasme: str
+    nas_lo: int
+    nas_hi: int
+    rnti: int | None = None
+    cipher_algo: str = "EEA2"
+    integ_algo: str = "EIA2"
+
+
+@app.post("/api/keys/bruteforce-nas")
+async def bruteforce_nas(body: _BruteforceBody) -> dict[str, Any]:
+    """Brute-force the NAS uplink COUNT over a range, deriving keys from K_ASME
+    and testing which count actually decrypts the target UE. Blocking (many
+    tshark runs) → off the event loop; bad input returns ok=False, not a 500."""
+    cfg = config_mod.load()
+    return await asyncio.to_thread(
+        captures_mod.bruteforce_nas, cfg, body.path, body.kasme,
+        body.nas_lo, body.nas_hi, body.rnti, body.cipher_algo, body.integ_algo,
+    )
+
+
 @app.get("/api/fs/browse")
 async def fs_browse(path: str | None = None) -> dict[str, Any]:
     """Directory listing for the decrypt file picker. Defaults to captures_dir;

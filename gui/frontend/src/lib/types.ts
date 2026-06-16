@@ -138,6 +138,23 @@ export interface DeriveResponse {
   upint_key?: string;
 }
 
+export interface BruteforceResponse {
+  ok: boolean;
+  found: boolean;
+  error: string | null;
+  note: string | null;
+  nas_count: number | null;
+  rnti_used: number | null;
+  tested: number;
+  decode_count: number;
+  baseline: number;
+  k_enb?: string | null;
+  rrcenc_key?: string | null;
+  rrcint_key?: string | null;
+  upenc_key?: string | null;
+  upint_key?: string | null;
+}
+
 export interface DecryptResponse {
   ok: boolean;
   error: string | null;

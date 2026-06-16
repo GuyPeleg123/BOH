@@ -58,6 +58,8 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
   // Full derived-key set per row (K_eNB + RRC/UP enc/int), shown for copying.
   const [derived, setDerived] = useState<Record<number, DeriveResponse>>({});
   const [copied, setCopied] = useState<string | null>(null);
+  const [bruteBusy, setBruteBusy] = useState<number | null>(null);
+  const [bruteMsg, setBruteMsg] = useState<Record<number, string>>({});
   // In organize+auto, RNTI is optional and keys may be empty (split-only run).
   const rntiRequired = outMode === "decrypt" || keyMatch === "per-rnti";
   const keysRequired = outMode === "decrypt";
@@ -88,6 +90,40 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
       setDerived((d) => ({ ...d, [i]: r }));
     } catch (err) {
       setClientErr(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // Brute-force the NAS uplink count over a range (e.g. "120-321") against the
+  // selected pcap: the server derives keys per candidate and tests which one
+  // decrypts. On a hit, fill the row's keys + NAS count and show the full set.
+  async function bruteRow(i: number) {
+    setClientErr(null);
+    setBruteMsg((m) => ({ ...m, [i]: "" }));
+    const e = entries[i];
+    if (!selPath) { setClientErr("Select a pcap first (Browse…)."); setBrowsing(true); return; }
+    if (!HEX64.test(e.kasme.trim())) { setClientErr(`K_ASME must be exactly 64 hex chars`); return; }
+    const m = e.nas_count.trim().match(/^(\d+)\s*-\s*(\d+)$/);
+    if (!m) { setClientErr(`Enter a NAS range like 120-321 in the NAS field to brute-force`); return; }
+    const lo = parseInt(m[1], 10), hi = parseInt(m[2], 10);
+    const rnti = parseRnti(e.rnti);
+    setBruteBusy(i);
+    try {
+      const r = await api.bruteforceNas({
+        path: selPath, kasme: e.kasme.trim(), nas_lo: lo, nas_hi: hi,
+        rnti: rnti ?? null, cipher_algo: e.cipher_algo, integ_algo: e.integ_algo,
+      });
+      if (!r.ok) { setClientErr(r.error || "brute-force failed"); return; }
+      if (r.found && r.nas_count != null) {
+        update(i, { rrcenc_key: r.rrcenc_key ?? "", upenc_key: r.upenc_key ?? "", nas_count: String(r.nas_count) });
+        setDerived((d) => ({ ...d, [i]: { ok: true, error: null, cipher_algo: e.cipher_algo, integ_algo: e.integ_algo, k_enb: r.k_enb ?? undefined, rrcenc_key: r.rrcenc_key ?? undefined, rrcint_key: r.rrcint_key ?? undefined, upenc_key: r.upenc_key ?? undefined, upint_key: r.upint_key ?? undefined } }));
+        setBruteMsg((mm) => ({ ...mm, [i]: `✓ NAS count = ${r.nas_count} (RNTI 0x${(r.rnti_used ?? 0).toString(16)}, ${r.decode_count} decoded vs ${r.baseline} baseline, ${r.tested} tried)` }));
+      } else {
+        setBruteMsg((mm) => ({ ...mm, [i]: r.note || "no NAS count in range decrypted this UE" }));
+      }
+    } catch (err) {
+      setClientErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBruteBusy(null);
     }
   }
 
@@ -266,12 +302,22 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                           <label className="flex flex-col text-[10px] text-muted">K_ASME (64 hex)
                             <input className="input !text-xs font-mono !w-[34rem] max-w-full" placeholder="64 hex chars" value={e.kasme} onChange={(ev) => update(i, { kasme: ev.target.value })} />
                           </label>
-                          <label className="flex flex-col text-[10px] text-muted">NAS UL count
-                            <input className="input !text-xs font-mono !w-28" placeholder="e.g. 0" value={e.nas_count} onChange={(ev) => update(i, { nas_count: ev.target.value })} />
+                          <label className="flex flex-col text-[10px] text-muted">NAS UL count <span className="text-muted/70">(or range 120-321)</span>
+                            <input className="input !text-xs font-mono !w-36" placeholder="0  or  120-321" value={e.nas_count} onChange={(ev) => update(i, { nas_count: ev.target.value })} />
                           </label>
-                          <button className="btn btn-primary !px-2 !py-0.5 !text-xs" onClick={() => deriveRow(i)}>Derive keys</button>
-                          <span className="text-[10px] text-muted">cipher/integ come from this row's dropdowns. You can also just submit — the server derives.</span>
+                          <button className="btn btn-primary !px-2 !py-0.5 !text-xs" disabled={bruteBusy === i} onClick={() => deriveRow(i)}>Derive keys</button>
+                          <button className="btn !px-2 !py-0.5 !text-xs" disabled={bruteBusy === i}
+                                  title="Try every NAS count in the range against the selected pcap until one decrypts"
+                                  onClick={() => bruteRow(i)}>
+                            {bruteBusy === i ? "Brute-forcing…" : "Brute-force NAS"}
+                          </button>
                         </div>
+                        <div className="text-[10px] text-muted mt-1">
+                          Single count → Derive. Range (e.g. <span className="font-mono">120-321</span>) → Brute-force tests each against the selected pcap (this row's RNTI, or the busiest one) until it decrypts. cipher/integ come from this row's dropdowns.
+                        </div>
+                        {bruteMsg[i] && (
+                          <div className={`text-[11px] mt-1 ${bruteMsg[i].startsWith("✓") ? "text-ok" : "text-warn"}`}>{bruteMsg[i]}</div>
+                        )}
                         {derived[i] && (
                           <div className="mt-2 border border-border rounded p-2 bg-bg">
                             <div className="text-[10px] uppercase text-muted mb-1">

@@ -598,3 +598,110 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
         res["error"] = "tshark timed out"; return res
     except Exception as ex:  # noqa: BLE001
         res["error"] = f"{type(ex).__name__}: {ex}"; return res
+
+
+# ---------------------------------------------------------------------------
+# NAS-count brute force
+#
+# When you hold K_ASME for a UE but not the exact NAS uplink COUNT (it gates
+# K_eNB → all AS keys), sweep a candidate range: derive keys for each count and
+# keep the one that actually decrypts the UE's PDCP — measured by the same
+# clean lte-rrc/ip decode heuristic the auto-match uses. The capture is
+# pre-filtered to the target RNTI once so each candidate test is cheap.
+# ---------------------------------------------------------------------------
+_BF_MAX_CANDIDATES = 2048   # keep a full sweep under a few minutes
+_BF_MIN_DELTA = 2           # clean-decode jump over baseline that counts as "works"
+
+
+def bruteforce_nas(cfg: SnifferConfig, input_path: str, kasme: str,
+                   nas_lo, nas_hi, rnti=None,
+                   cipher_algo: str = "EEA2", integ_algo: str = "EIA2") -> dict:
+    """Find the NAS uplink COUNT in [nas_lo, nas_hi] that decrypts the target
+    UE, deriving keys from K_ASME per candidate (TS 33.401). Returns the winning
+    count + the full derived key set, or found=False. Never raises to caller."""
+    res: dict = {"ok": False, "found": False, "error": None, "note": None,
+                 "nas_count": None, "rnti_used": None, "tested": 0,
+                 "decode_count": 0, "baseline": 0,
+                 "k_enb": None, "rrcenc_key": None, "rrcint_key": None,
+                 "upenc_key": None, "upint_key": None}
+    try:
+        src = resolve_input_pcap(cfg, input_path)
+    except FileNotFoundError:
+        res["error"] = "input pcap not found"; return res
+    except PermissionError as e:
+        res["error"] = str(e); return res
+    if not shutil.which("tshark"):
+        res["error"] = "tshark not found on PATH"; return res
+    try:
+        nas_lo, nas_hi = int(nas_lo), int(nas_hi)
+    except (TypeError, ValueError):
+        res["error"] = "NAS range must be integers"; return res
+    if nas_lo > nas_hi:
+        nas_lo, nas_hi = nas_hi, nas_lo
+    if nas_lo < 0 or nas_hi > 0xFFFFFFFF:
+        res["error"] = "NAS count out of range (0..2^32-1)"; return res
+    n = nas_hi - nas_lo + 1
+    if n > _BF_MAX_CANDIDATES:
+        res["error"] = f"range too large ({n} counts); cap is {_BF_MAX_CANDIDATES} — narrow it"; return res
+    # validate K_ASME / algos up front by deriving the first candidate
+    try:
+        keyderiv.derive_keys(kasme=kasme, nas_count=nas_lo, cipher_algo=cipher_algo, integ_algo=integ_algo)
+    except ValueError as e:
+        res["error"] = str(e); return res
+
+    tmp_full = tmp_small = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="lte-bf-full-", suffix=".pcap", delete=False) as tf:
+            tmp_full = Path(tf.name)
+        _rewrite_ueid_eq_rnti(src, tmp_full)  # UEId:=RNTI so the Wireshark UAT applies
+        if rnti is None:
+            counts: dict = {}
+            for r in _tshark_fields(tmp_full, "mac-lte", ["mac-lte.rnti", "mac-lte.rnti-type"]):
+                if len(r) >= 2 and r[0] and r[1] == "3":
+                    rr = int(r[0]); counts[rr] = counts.get(rr, 0) + 1
+            if not counts:
+                res["error"] = "no C-RNTI traffic to test against in this capture"; return res
+            rnti = max(counts, key=counts.get)
+        rnti = int(rnti)
+        res["rnti_used"] = rnti
+        # pre-filter to the target RNTI so each candidate test runs on a tiny pcap
+        with tempfile.NamedTemporaryFile(prefix="lte-bf-small-", suffix=".pcap", delete=False) as tf:
+            tmp_small = Path(tf.name)
+        subprocess.run(["tshark", "-r", str(tmp_full), "-Y", f"mac-lte.rnti=={rnti}", "-w", str(tmp_small)],
+                       capture_output=True, text=True, timeout=180)
+        baseline = _decode_count(tmp_small, rnti, None)
+        res["baseline"] = baseline
+        strong = baseline + 5  # a clear win → stop early
+        best_nas = None; best_d = None; best_cnt = baseline
+        for nas in range(nas_lo, nas_hi + 1):
+            d = keyderiv.derive_keys(kasme=kasme, nas_count=nas, cipher_algo=cipher_algo, integ_algo=integ_algo)
+            key = {"rrc": d["rrcenc_key"], "up": d["upenc_key"], "cipher": cipher_algo, "integ": integ_algo}
+            cnt = _decode_count(tmp_small, rnti, key)
+            res["tested"] += 1
+            if cnt > best_cnt:
+                best_cnt, best_nas, best_d = cnt, nas, d
+            if cnt >= strong:
+                best_cnt, best_nas, best_d = cnt, nas, d
+                break
+        if best_d is not None and (best_cnt - baseline) >= _BF_MIN_DELTA:
+            res.update({"ok": True, "found": True, "nas_count": best_nas, "decode_count": best_cnt,
+                        "k_enb": best_d["k_enb"], "rrcenc_key": best_d["rrcenc_key"],
+                        "rrcint_key": best_d["rrcint_key"], "upenc_key": best_d["upenc_key"],
+                        "upint_key": best_d["upint_key"]})
+        else:
+            res["ok"] = True
+            res["note"] = (f"No NAS count in {nas_lo}–{nas_hi} decrypted RNTI 0x{rnti:04x} "
+                           f"(baseline {baseline}, best {best_cnt} over {res['tested']} tried). "
+                           f"Check K_ASME / cipher / RNTI, or widen the range.")
+        return res
+    except subprocess.TimeoutExpired:
+        res["error"] = "tshark timed out"; return res
+    except Exception as ex:  # noqa: BLE001
+        res["error"] = f"{type(ex).__name__}: {ex}"; return res
+    finally:
+        for t in (tmp_full, tmp_small):
+            try:
+                if t and t.exists():
+                    t.unlink()
+            except OSError:
+                pass

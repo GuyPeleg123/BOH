@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse, BruteforceResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -112,6 +112,11 @@ export const api = {
     }),
   deriveKeys: (body: { kasme?: string | null; nas_count?: number | null; kenb?: string | null; cipher_algo: string; integ_algo: string }) =>
     req<DeriveResponse>("/api/keys/derive", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  bruteforceNas: (body: { path: string; kasme: string; nas_lo: number; nas_hi: number; rnti?: number | null; cipher_algo: string; integ_algo: string }) =>
+    req<BruteforceResponse>("/api/keys/bruteforce-nas", {
       method: "POST",
       body: JSON.stringify(body),
     }),
