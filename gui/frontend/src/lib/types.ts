@@ -182,6 +182,22 @@ export interface OrganizeResponse {
   note: string | null;
 }
 
+export interface BrowseEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+  is_pcap: boolean;
+}
+
+export interface BrowseResponse {
+  cwd: string | null;
+  parent: string | null;
+  default: string | null;   // the captures_dir (where the picker opens)
+  entries: BrowseEntry[];
+  error: string | null;
+}
+
 export interface CapturesResponse {
   captures: CaptureFile[];
   roots: string[];

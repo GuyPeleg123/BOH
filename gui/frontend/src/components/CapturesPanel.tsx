@@ -27,6 +27,7 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
   const [resp, setResp] = useState<CapturesResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [decryptTarget, setDecryptTarget] = useState<CaptureFile | null>(null);
+  const [decryptOpen, setDecryptOpen] = useState(false);
 
   function refresh() {
     api.captures().then(setResp).catch((e) => setErr(e.message));
@@ -50,7 +51,9 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
         <span className="text-muted">
           Searching: <span className="font-mono text-slate-300">{resp?.roots.length ?? 0} root(s)</span>
         </span>
-        <button className="btn !px-2 !py-0.5 !text-xs ml-auto" onClick={refresh}>↻ refresh</button>
+        <button className="btn !px-2 !py-0.5 !text-xs ml-auto" title="Pick any pcap on the machine to decrypt (opens in the captures folder)"
+                onClick={() => { setDecryptTarget(null); setDecryptOpen(true); }}>🔓 Decrypt a file…</button>
+        <button className="btn !px-2 !py-0.5 !text-xs" onClick={refresh}>↻ refresh</button>
       </div>
       <div className="flex-1 overflow-auto bg-bg border border-border rounded">
         <table className="w-full text-xs font-mono">
@@ -90,7 +93,7 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
                 </td>
                 <td className="px-2 py-1 text-right">
                   {c.size > 0 ? (
-                    <button className="btn !px-2 !py-0.5 !text-xs" title="Decrypt with PDCP keys" onClick={() => setDecryptTarget(c)}>
+                    <button className="btn !px-2 !py-0.5 !text-xs" title="Decrypt with PDCP keys" onClick={() => { setDecryptTarget(c); setDecryptOpen(true); }}>
                       🔓 decrypt
                     </button>
                   ) : (
@@ -115,8 +118,8 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
           </tbody>
         </table>
       </div>
-      {decryptTarget && (
-        <DecryptModal file={decryptTarget} onClose={() => setDecryptTarget(null)} onDone={refresh} />
+      {decryptOpen && (
+        <DecryptModal file={decryptTarget} onClose={() => setDecryptOpen(false)} onDone={refresh} />
       )}
     </div>
   );

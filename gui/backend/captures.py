@@ -127,6 +127,69 @@ def resolve_for_download(cfg: SnifferConfig, path: str) -> Path:
     raise PermissionError(f"{p} is outside the allowed roots")
 
 
+_PCAP_SUFFIXES = {".pcap", ".pcapng", ".cap"}
+
+
+def resolve_input_pcap(cfg: SnifferConfig, path: str) -> Path:
+    """Resolve a pcap to DECRYPT/ORGANIZE. Unlike resolve_for_download this is
+    not limited to the allowed roots — the operator can pick any capture file
+    anywhere on the machine (this is an authenticated, local admin GUI). Still
+    insists it's an existing pcap-type file, not a directory or arbitrary blob."""
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(path)
+    if not p.is_file():
+        raise PermissionError(f"{p} is not a file")
+    if p.suffix.lower() not in _PCAP_SUFFIXES:
+        raise PermissionError("not a capture file (expected .pcap/.pcapng/.cap)")
+    return p
+
+
+def browse_dir(cfg: SnifferConfig, path: str | None) -> dict:
+    """List a directory for the GUI file picker. Defaults to captures_dir.
+    Returns subdirectories + capture files so the operator can navigate from
+    the pcap folder to anywhere on the machine. Never raises to the caller."""
+    res: dict = {"cwd": None, "parent": None, "default": None, "entries": [], "error": None}
+    default = Path(cfg.captures_dir).expanduser()
+    if not default.exists():
+        default = Path.home()
+    res["default"] = str(default.resolve())
+    try:
+        d = (Path(path).expanduser() if path else default).resolve()
+        if not d.exists():
+            d = default.resolve()
+        if not d.is_dir():
+            d = d.parent
+        res["cwd"] = str(d)
+        res["parent"] = str(d.parent) if d.parent != d else None
+        entries: list[dict] = []
+        for child in sorted(d.iterdir(), key=lambda c: c.name.lower()):
+            if child.name.startswith("."):
+                continue
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                entries.append({"name": child.name, "path": str(child), "is_dir": True,
+                                "size": 0, "is_pcap": False})
+            elif child.suffix.lower() in _PCAP_SUFFIXES:
+                try:
+                    sz = child.stat().st_size
+                except OSError:
+                    sz = 0
+                entries.append({"name": child.name, "path": str(child), "is_dir": False,
+                                "size": sz, "is_pcap": True})
+        # dirs first, then pcap files
+        entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+        res["entries"] = entries
+        return res
+    except PermissionError:
+        res["error"] = f"permission denied: {path}"; return res
+    except Exception as ex:  # noqa: BLE001
+        res["error"] = f"{type(ex).__name__}: {ex}"; return res
+
+
 # ---------------------------------------------------------------------------
 # Post-capture PDCP decryption
 #
@@ -238,7 +301,7 @@ def decrypt_pcap(cfg: SnifferConfig, input_path: str, entries: list[dict]) -> di
         "decoded_text": "", "uat_text": "", "frames_rewritten": 0, "ndecoded": 0,
     }
     try:
-        src = resolve_for_download(cfg, input_path)
+        src = resolve_input_pcap(cfg, input_path)
     except FileNotFoundError:
         res["error"] = "input pcap not found"; return res
     except PermissionError as e:
@@ -438,7 +501,7 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
     each key entry. Returns a structured manifest (never raises to the caller)."""
     res: dict = {"ok": False, "error": None, "folder": None, "ues": [], "note": None}
     try:
-        src = resolve_for_download(cfg, input_path)
+        src = resolve_input_pcap(cfg, input_path)
     except FileNotFoundError:
         res["error"] = "input pcap not found"; return res
     except PermissionError as e:

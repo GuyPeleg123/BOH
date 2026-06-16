@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -93,6 +93,8 @@ export const api = {
       { method: "PUT", body: JSON.stringify({ entries }) }
     ),
   captures: () => req<CapturesResponse>("/api/captures"),
+  browseFs: (path?: string) =>
+    req<BrowseResponse>(`/api/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
   openWireshark: () =>
     req<{ ok: boolean; pid: number; fifo: string }>(
       "/api/wireshark/open", { method: "POST" }),

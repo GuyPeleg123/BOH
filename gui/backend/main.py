@@ -699,6 +699,14 @@ async def download_capture(path: str) -> FileResponse:
     return FileResponse(p, media_type="application/vnd.tcpdump.pcap", filename=p.name)
 
 
+@app.get("/api/fs/browse")
+async def fs_browse(path: str | None = None) -> dict[str, Any]:
+    """Directory listing for the decrypt file picker. Defaults to captures_dir;
+    can navigate anywhere on the machine (authenticated local admin GUI)."""
+    cfg = config_mod.load()
+    return await asyncio.to_thread(captures_mod.browse_dir, cfg, path)
+
+
 class _DecryptEntryBody(BaseModel):
     rnti: int
     # Supply the ciphering keys directly, OR a K_eNB, OR K_ASME + NAS uplink

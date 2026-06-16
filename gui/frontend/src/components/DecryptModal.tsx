@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { CaptureFile, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse } from "../lib/types";
+import { FileBrowser } from "./FileBrowser";
 
 const LS_KEY = "ltesniffer-decrypt-entries";
 const CIPHERS = ["EEA0", "EEA1", "EEA2", "EEA3"];
@@ -40,7 +41,13 @@ function parseRnti(s: string): number | null {
 type OutMode = "decrypt" | "organize";
 type KeyMatch = "auto" | "per-rnti";
 
-export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onClose: () => void; onDone: () => void }) {
+export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | null; onClose: () => void; onDone: () => void }) {
+  // Selected pcap. Defaults to the file the modal was opened on (a capture
+  // row), but the user can Browse to any pcap on the machine — opening in the
+  // captures folder by default.
+  const [selPath, setSelPath] = useState<string>(file?.path ?? "");
+  const [selName, setSelName] = useState<string>(file?.name ?? "");
+  const [browsing, setBrowsing] = useState<boolean>(!file);  // open picker if no file preselected
   const [entries, setEntries] = useState<FormEntry[]>(loadSaved);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<DecryptResponse | null>(null);
@@ -83,6 +90,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
     setClientErr(null);
     setResult(null);
     setOrganized(null);
+    if (!selPath) { setClientErr("Select a pcap to decrypt (Browse…)."); setBrowsing(true); return; }
 
     // A row provides keys EITHER directly (K_RRCenc/K_UPenc) OR via a K_ASME +
     // NAS uplink count that the backend derives. A row counts as "filled" if it
@@ -124,11 +132,11 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
     setRunning(true);
     try {
       if (outMode === "organize") {
-        const r = await api.organizeSession(file.path, organizeKeys, keyMatch);
+        const r = await api.organizeSession(selPath, organizeKeys, keyMatch);
         setOrganized(r);
         if (r.ok) onDone();
       } else {
-        const r = await api.decryptCapture(file.path, decryptKeys);
+        const r = await api.decryptCapture(selPath, decryptKeys);
         setResult(r);
         if (r.ok) onDone();
       }
@@ -145,7 +153,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = file.name.replace(/\.pcap$/i, "") + "_decrypted.txt";
+    a.download = selName.replace(/\.pcap$/i, "") + "_decrypted.txt";
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -163,9 +171,18 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
       <div className="panel w-full max-w-3xl max-h-[90vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center mb-3">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
-            {outMode === "organize" ? "Decrypt & Split per UE" : "Decrypt"}: <span className="text-slate-100 normal-case">{file.name}</span>
+            {outMode === "organize" ? "Decrypt & Split per UE" : "Decrypt"}
           </h2>
           <button className="btn !px-2 !py-0.5 !text-xs ml-auto" onClick={onClose}>✕ close</button>
+        </div>
+
+        {/* selected pcap + change-file. Defaults to the captures folder file; Browse can pick any pcap on the machine. */}
+        <div className="flex items-center gap-2 mb-3 text-xs bg-bg border border-border rounded px-2 py-1.5">
+          <span className="text-muted uppercase text-[10px] shrink-0">File</span>
+          {selName
+            ? <span className="font-mono text-slate-100 truncate" title={selPath}>{selName}<span className="text-muted"> — {selPath}</span></span>
+            : <span className="text-warn">no file selected</span>}
+          <button className="btn !px-2 !py-0.5 !text-xs ml-auto shrink-0" onClick={() => setBrowsing(true)}>📁 Browse…</button>
         </div>
 
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 text-xs">
@@ -344,13 +361,21 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile; onC
 
         <div className="flex items-center gap-2 mt-3 pt-2 border-t border-border">
           <span className="text-[11px] text-muted">Runs via tshark. Keys are remembered locally in this browser.</span>
-          <button className="btn btn-primary !px-3 !py-1 !text-xs ml-auto" disabled={running} onClick={run}>
+          <button className="btn btn-primary !px-3 !py-1 !text-xs ml-auto" disabled={running || !selPath} onClick={run}>
             {running
-              ? (outMode === "organize" ? "Decrypting…" : "Decrypting…")
+              ? "Decrypting…"
               : (outMode === "organize" ? "Decrypt & Split" : "Run Decrypt")}
           </button>
         </div>
       </div>
+
+      {browsing && (
+        <FileBrowser
+          startPath={selPath || null}
+          onClose={() => setBrowsing(false)}
+          onPick={(p, n) => { setSelPath(p); setSelName(n); setBrowsing(false); setResult(null); setOrganized(null); }}
+        />
+      )}
     </div>
   );
 }
