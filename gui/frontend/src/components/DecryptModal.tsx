@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { CaptureFile, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse } from "../lib/types";
+import type { CaptureFile, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse } from "../lib/types";
 import { FileBrowser } from "./FileBrowser";
 
 const LS_KEY = "ltesniffer-decrypt-entries";
@@ -55,6 +55,9 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
   const [clientErr, setClientErr] = useState<string | null>(null);
   const [outMode, setOutMode] = useState<OutMode>("organize");
   const [keyMatch, setKeyMatch] = useState<KeyMatch>("auto");
+  // Full derived-key set per row (K_eNB + RRC/UP enc/int), shown for copying.
+  const [derived, setDerived] = useState<Record<number, DeriveResponse>>({});
+  const [copied, setCopied] = useState<string | null>(null);
   // In organize+auto, RNTI is optional and keys may be empty (split-only run).
   const rntiRequired = outMode === "decrypt" || keyMatch === "per-rnti";
   const keysRequired = outMode === "decrypt";
@@ -70,8 +73,9 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
   const addEntry = () => setEntries((es) => [...es, blank()]);
   const removeEntry = (i: number) => setEntries((es) => (es.length > 1 ? es.filter((_, j) => j !== i) : es));
 
-  // Derive K_RRCenc/K_UPenc from a row's K_ASME + NAS count and drop them into
-  // the key fields, so the user sees exactly what will be used.
+  // Derive the full key set from a row's K_ASME + NAS count: fill K_RRCenc/
+  // K_UPenc into the row (used for the actual decrypt) AND surface every derived
+  // key (K_eNB, RRC/UP enc/int) for the operator to copy.
   async function deriveRow(i: number) {
     setClientErr(null);
     const e = entries[i];
@@ -81,9 +85,18 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
       const r = await api.deriveKeys({ kasme: e.kasme.trim(), nas_count: parseInt(e.nas_count.trim(), 10), cipher_algo: e.cipher_algo, integ_algo: e.integ_algo });
       if (!r.ok) { setClientErr(r.error || "derivation failed"); return; }
       update(i, { rrcenc_key: r.rrcenc_key ?? "", upenc_key: r.upenc_key ?? "" });
+      setDerived((d) => ({ ...d, [i]: r }));
     } catch (err) {
       setClientErr(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function copyKey(label: string, value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(label);
+      setTimeout(() => setCopied((c) => (c === label ? null : c)), 1200);
+    } catch { /* clipboard unavailable (non-https / denied) — user can select manually */ }
   }
 
   async function run() {
@@ -256,9 +269,41 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                           <label className="flex flex-col text-[10px] text-muted">NAS UL count
                             <input className="input !text-xs font-mono !w-28" placeholder="e.g. 0" value={e.nas_count} onChange={(ev) => update(i, { nas_count: ev.target.value })} />
                           </label>
-                          <button className="btn btn-primary !px-2 !py-0.5 !text-xs" onClick={() => deriveRow(i)}>Derive → keys</button>
+                          <button className="btn btn-primary !px-2 !py-0.5 !text-xs" onClick={() => deriveRow(i)}>Derive keys</button>
                           <span className="text-[10px] text-muted">cipher/integ come from this row's dropdowns. You can also just submit — the server derives.</span>
                         </div>
+                        {derived[i] && (
+                          <div className="mt-2 border border-border rounded p-2 bg-bg">
+                            <div className="text-[10px] uppercase text-muted mb-1">
+                              Derived keys ({derived[i].cipher_algo}/{derived[i].integ_algo}) — click to copy
+                            </div>
+                            <table className="text-[11px] font-mono">
+                              <tbody>
+                                {([
+                                  ["K_eNB", derived[i].k_enb],
+                                  ["K_RRCenc", derived[i].rrcenc_key],
+                                  ["K_RRCint", derived[i].rrcint_key],
+                                  ["K_UPenc", derived[i].upenc_key],
+                                  ["K_UPint", derived[i].upint_key],
+                                ] as [string, string | undefined][]).map(([lbl, val]) => (
+                                  <tr key={lbl}>
+                                    <td className="text-muted pr-3 align-top">{lbl}</td>
+                                    <td className="text-slate-100 break-all cursor-pointer select-all hover:text-primary"
+                                        title="click to copy" onClick={() => val && copyKey(`${i}:${lbl}`, val)}>{val}</td>
+                                    <td className="pl-2 align-top">
+                                      <button className="btn !px-1.5 !py-0 !text-[10px]" onClick={() => val && copyKey(`${i}:${lbl}`, val)}>
+                                        {copied === `${i}:${lbl}` ? "✓" : "copy"}
+                                      </button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                            <div className="text-[10px] text-muted mt-1">
+                              128-bit keys (the low 128 bits used by EEA/EIA) — paste K_RRCenc/K_UPenc above, or into Wireshark's pdcp_lte_ue_keys.
+                            </div>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   )}
