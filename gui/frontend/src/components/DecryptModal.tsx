@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { CaptureFile, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse } from "../lib/types";
+import type { CaptureFile, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, SplitDim, SplitResponse } from "../lib/types";
 import { FileBrowser } from "./FileBrowser";
 
 const LS_KEY = "ltesniffer-decrypt-entries";
@@ -38,7 +38,7 @@ function parseRnti(s: string): number | null {
   return Number.isFinite(n) && n >= 0 && n <= 0xffff ? n : null;
 }
 
-type OutMode = "decrypt" | "organize";
+type OutMode = "decrypt" | "organize" | "split";
 type KeyMatch = "auto" | "per-rnti";
 
 export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | null; onClose: () => void; onDone: () => void }) {
@@ -60,6 +60,15 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
   const [copied, setCopied] = useState<string | null>(null);
   const [bruteBusy, setBruteBusy] = useState<number | null>(null);
   const [bruteMsg, setBruteMsg] = useState<Record<number, string>>({});
+  // Split mode: catalog of dimensions, the ordered selection, decrypt toggle,
+  // "also auto-split future captures", and the result.
+  const [availDims, setAvailDims] = useState<SplitDim[]>([]);
+  const [splitDims, setSplitDims] = useState<string[]>([]);
+  const [splitDecrypt, setSplitDecrypt] = useState(false);
+  const [splitAuto, setSplitAuto] = useState(false);
+  const [splitRes, setSplitRes] = useState<SplitResponse | null>(null);
+
+  useEffect(() => { api.splitDims().then((r) => setAvailDims(r.dimensions)).catch(() => {}); }, []);
   // In organize+auto, RNTI is optional and keys may be empty (split-only run).
   const rntiRequired = outMode === "decrypt" || keyMatch === "per-rnti";
   const keysRequired = outMode === "decrypt";
@@ -139,7 +148,9 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
     setClientErr(null);
     setResult(null);
     setOrganized(null);
+    setSplitRes(null);
     if (!selPath) { setClientErr("Select a pcap to decrypt (Browse…)."); setBrowsing(true); return; }
+    if (outMode === "split" && splitDims.length === 0) { setClientErr("Pick at least one split dimension."); return; }
 
     // A row provides keys EITHER directly (K_RRCenc/K_UPenc) OR via a K_ASME +
     // NAS uplink count that the backend derives. A row counts as "filled" if it
@@ -180,7 +191,19 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
     try { localStorage.setItem(LS_KEY, JSON.stringify(entries)); } catch { /* ignore */ }
     setRunning(true);
     try {
-      if (outMode === "organize") {
+      if (outMode === "split") {
+        const r = await api.splitCapture(selPath, splitDims, splitDecrypt ? decryptKeys : [], splitDecrypt);
+        setSplitRes(r);
+        if (r.ok) {
+          onDone();
+          if (splitAuto) {
+            try {
+              const cfg = await api.getConfig();
+              await api.putConfig({ ...cfg, auto_split_enabled: true, auto_split_dims: splitDims });
+            } catch { /* non-fatal */ }
+          }
+        }
+      } else if (outMode === "organize") {
         const r = await api.organizeSession(selPath, organizeKeys, keyMatch);
         setOrganized(r);
         if (r.ok) onDone();
@@ -220,7 +243,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
       <div className="panel w-full max-w-3xl max-h-[90vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center mb-3">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
-            {outMode === "organize" ? "Decrypt & Split per UE" : "Decrypt"}
+            {outMode === "organize" ? "Decrypt & Split per UE" : outMode === "split" ? "Split capture" : "Decrypt"}
           </h2>
           <button className="btn !px-2 !py-0.5 !text-xs ml-auto" onClick={onClose}>✕ close</button>
         </div>
@@ -245,6 +268,10 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
               <input type="radio" name="outmode" checked={outMode === "decrypt"} onChange={() => setOutMode("decrypt")} />
               <span>Decrypt to single file</span>
             </label>
+            <label className="flex items-center gap-1 cursor-pointer">
+              <input type="radio" name="outmode" checked={outMode === "split"} onChange={() => setOutMode("split")} />
+              <span>Split (custom)</span>
+            </label>
           </div>
           {outMode === "organize" && (
             <div className="flex items-center gap-2">
@@ -260,8 +287,46 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
             </div>
           )}
         </div>
+
+        {outMode === "split" && (
+          <div className="mb-3 border border-border rounded p-2 bg-bg">
+            <div className="text-[10px] uppercase text-muted mb-1">Split dimensions — click to add (order = folder nesting)</div>
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {availDims.map((d) => {
+                const idx = splitDims.indexOf(d.id);
+                const sel = idx >= 0;
+                return (
+                  <button key={d.id}
+                    className={`btn !px-2 !py-0.5 !text-[11px] ${sel ? "btn-primary" : ""}`}
+                    title={d.id}
+                    onClick={() => setSplitDims((s) => sel ? s.filter((x) => x !== d.id) : [...s, d.id])}>
+                    {sel ? `${idx + 1}. ` : "+ "}{d.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="text-[11px] text-muted mb-1">
+              {splitDims.length
+                ? <>Order: <span className="font-mono text-slate-200">{splitDims.join(" → ")}</span> <button className="text-muted underline ml-2" onClick={() => setSplitDims([])}>clear</button></>
+                : "No dimensions selected."}
+            </div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <label className="flex items-center gap-1 cursor-pointer text-[11px]">
+                <input type="checkbox" checked={splitDecrypt} onChange={(e) => setSplitDecrypt(e.target.checked)} />
+                <span>Decrypt buckets using the keys below (per-RNTI)</span>
+              </label>
+              <label className="flex items-center gap-1 cursor-pointer text-[11px]">
+                <input type="checkbox" checked={splitAuto} onChange={(e) => setSplitAuto(e.target.checked)} />
+                <span>Also auto-split every future capture this way</span>
+              </label>
+            </div>
+          </div>
+        )}
+
         <p className="text-[11px] text-muted mb-2">
-          {outMode === "organize"
+          {outMode === "split"
+            ? "Divides the capture into nested sub-pcaps along the dimensions above (empty buckets skipped). Output lands in a <name>_split/ folder, visible in the Captures tree."
+            : outMode === "organize"
             ? (keyMatch === "auto"
                 ? "Splits the capture into one pcap per UE (named by TMSI/IMSI when known). Keys below are optional — each is auto-matched to whichever UE it cleanly decrypts. Leave keys empty to just split."
                 : "Splits per UE and decrypts each using the key whose RNTI matches that UE.")
@@ -448,14 +513,43 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
               )}
             </div>
           )}
+
+          {splitRes && (
+            <div className="mt-3 text-xs">
+              {splitRes.ok ? (
+                <div className="border border-ok/40 rounded p-2">
+                  <div className="text-ok">✓ Split complete — {splitRes.leaves} pcap{splitRes.leaves === 1 ? "" : "s"}.</div>
+                  <div className="text-muted mt-1">Folder: <span className="font-mono text-slate-200 break-all">{splitRes.folder}</span></div>
+                </div>
+              ) : (
+                <div className="border border-bad/40 rounded p-2 text-bad">✗ {splitRes.error}</div>
+              )}
+              {splitRes.note && <div className="text-warn mt-2">⚠ {splitRes.note}</div>}
+              {splitRes.ok && splitRes.files.length > 0 && (
+                <table className="w-full mt-2 text-[11px] font-mono">
+                  <thead className="text-[10px] uppercase text-muted">
+                    <tr className="border-b border-border"><th className="text-left px-1 py-1">Sub-pcap</th><th className="text-right px-1 py-1">Frames</th></tr>
+                  </thead>
+                  <tbody>
+                    {splitRes.files.slice(0, 200).map((f) => (
+                      <tr key={f.path} className="border-b border-border/30">
+                        <td className="px-1 py-1 text-slate-100">{f.path.split("_split/").pop()}</td>
+                        <td className="px-1 py-1 text-right">{f.frames}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-2 mt-3 pt-2 border-t border-border">
           <span className="text-[11px] text-muted">Runs via tshark. Keys are remembered locally in this browser.</span>
           <button className="btn btn-primary !px-3 !py-1 !text-xs ml-auto" disabled={running || !selPath} onClick={run}>
             {running
-              ? "Decrypting…"
-              : (outMode === "organize" ? "Decrypt & Split" : "Run Decrypt")}
+              ? (outMode === "split" ? "Splitting…" : "Decrypting…")
+              : (outMode === "split" ? "Split" : outMode === "organize" ? "Decrypt & Split" : "Run Decrypt")}
           </button>
         </div>
       </div>

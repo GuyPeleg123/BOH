@@ -102,6 +102,8 @@ export interface SnifferConfig {
   binary_path: string;
   captures_dir: string;
   sudo: boolean;
+  auto_split_enabled?: boolean;
+  auto_split_dims?: string[];
 }
 
 export interface CaptureFile {
@@ -136,6 +138,19 @@ export interface DeriveResponse {
   rrcint_key?: string;
   upenc_key?: string;
   upint_key?: string;
+}
+
+export interface SplitDim { id: string; label: string; }
+
+export interface SplitFile { path: string; frames: number; filter: string; }
+
+export interface SplitResponse {
+  ok: boolean;
+  error: string | null;
+  note: string | null;
+  folder: string | null;
+  leaves: number;
+  files: SplitFile[];
 }
 
 export interface BruteforceResponse {

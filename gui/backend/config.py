@@ -105,6 +105,11 @@ class SnifferConfig(BaseModel):
     )
     sudo: bool = Field(True, description="Wrap invocation in sudo (USRP usually needs it).")
 
+    # Auto-split: when a capture finishes, divide its pcap along these dimensions
+    # (see captures.split_dimensions). Empty list / disabled = no auto-split.
+    auto_split_enabled: bool = Field(False, description="Split each finished capture automatically.")
+    auto_split_dims: list[str] = Field(default_factory=list, description="Ordered split dimensions, e.g. ['identity','packet_type'].")
+
     def to_argv(self, json_output_path: str) -> list[str]:
         """Render to argv for subprocess.Popen.
 

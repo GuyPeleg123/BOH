@@ -721,6 +721,31 @@ async def bruteforce_nas(body: _BruteforceBody) -> dict[str, Any]:
     )
 
 
+@app.get("/api/captures/split-dims")
+async def split_dims() -> dict[str, Any]:
+    """Catalog of available split dimensions for the GUI."""
+    return {"dimensions": captures_mod.split_dimensions()}
+
+
+class _SplitBody(BaseModel):
+    path: str
+    dims: list[str]
+    entries: list[_DecryptEntryBody] = []
+    decrypt: bool = False
+
+
+@app.post("/api/captures/split")
+async def split_capture(body: _SplitBody) -> dict[str, Any]:
+    """Partition a capture into nested sub-pcaps along the chosen dimensions
+    (RNTI / UE identity / direction / RNTI class / packet type / security).
+    Blocking tshark work → off the event loop; failures return ok=False."""
+    cfg = config_mod.load()
+    entries = [e.model_dump() for e in body.entries]
+    return await asyncio.to_thread(
+        captures_mod.split_capture, cfg, body.path, body.dims, entries, body.decrypt
+    )
+
+
 @app.get("/api/fs/browse")
 async def fs_browse(path: str | None = None) -> dict[str, Any]:
     """Directory listing for the decrypt file picker. Defaults to captures_dir;

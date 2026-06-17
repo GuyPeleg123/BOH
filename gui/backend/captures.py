@@ -487,7 +487,7 @@ def _decode_count(pcap: Path, rnti: int, key: dict | None) -> int:
             "-o", f"pdcp-lte.default_integrity_algorithm:{key['integ']}",
             "-o", f'uat:pdcp_lte_ue_keys:"{rnti}","{key["rrc"]}","{key["up"]}",""',
         ]
-    cmd = ["tshark", "-r", str(pcap), "-Y", f"mac-lte.rnti=={rnti} and (lte-rrc or ip)", *oargs, "-T", "fields", "-e", "frame.number"]
+    cmd = ["tshark", "-r", str(pcap), "-Y", f"mac-lte.rnti=={rnti} and (lte_rrc or ip)", *oargs, "-T", "fields", "-e", "frame.number"]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     return len([x for x in out.stdout.splitlines() if x.strip()])
 
@@ -705,3 +705,194 @@ def bruteforce_nas(cfg: SnifferConfig, input_path: str, kasme: str,
                     t.unlink()
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Modular capture splitting
+#
+# Partition a capture into sub-pcaps along one or more ordered "dimensions".
+# Each dimension yields a list of (bucket_label, tshark_filter); nesting ANDs
+# the filters down a folder tree. Adding a new way to split = one entry in
+# _SPLIT_DIMS. Decryption is orthogonal: when keys are supplied the filters run
+# against the deciphered view and a .uat sidecar is written alongside.
+# ---------------------------------------------------------------------------
+_SPLIT_MAX_LEAVES = 300          # hard cap on output pcaps to avoid blow-ups
+_SPLIT_RNTI_CAP = 64             # most-active C-RNTIs to keep for rnti/identity
+
+
+def _dim_rnti(ctx) -> list[tuple[str, str]]:
+    counts = ctx["rnti_counts"]
+    rntis = sorted(counts, key=lambda r: counts[r], reverse=True)[:_SPLIT_RNTI_CAP]
+    return [(f"rnti-{r:04x}", f"mac-lte.rnti=={r}") for r in rntis]
+
+
+def _dim_identity(ctx) -> list[tuple[str, str]]:
+    idmap, counts = ctx["idmap"], ctx["rnti_counts"]
+    groups: dict[str, list[int]] = {}
+    for r in sorted(counts, key=lambda r: counts[r], reverse=True)[:_SPLIT_RNTI_CAP]:
+        ident = idmap.get(r)
+        label = _safe_label(ident) if ident else f"rnti-{r:04x}"
+        groups.setdefault(label, []).append(r)
+    out = []
+    for label, rs in groups.items():
+        filt = " or ".join(f"mac-lte.rnti=={r}" for r in rs)
+        out.append((label, f"({filt})"))
+    return out
+
+
+def _dim_direction(ctx) -> list[tuple[str, str]]:
+    return [("DL", "mac-lte.direction==1"), ("UL", "mac-lte.direction==0")]
+
+
+def _dim_rnti_class(ctx) -> list[tuple[str, str]]:
+    return [("broadcast-SI", "mac-lte.rnti-type==4"),
+            ("paging-P", "mac-lte.rnti-type==1"),
+            ("rach-RA", "mac-lte.rnti-type==2"),
+            ("ue-C", "mac-lte.rnti-type==3")]
+
+
+def _dim_packet_type(ctx) -> list[tuple[str, str]]:
+    # Buckets may overlap (NAS rides inside RRC) — a frame lands in each it matches.
+    return [("rrc", "lte_rrc"), ("nas", "nas-eps"), ("ip", "ip"),
+            ("rar", "mac-lte.rar"), ("mac-control", "mac-lte.control")]
+
+
+def _dim_security(ctx) -> list[tuple[str, str]]:
+    decoded = "(lte_rrc or nas-eps or ip)"
+    return [("cleartext", f"pdcp-lte and {decoded}"),
+            ("ciphered", f"pdcp-lte and not {decoded}")]
+
+
+_SPLIT_DIMS = {
+    "rnti":        {"label": "RNTI (per connection)",      "fn": _dim_rnti},
+    "identity":    {"label": "UE identity (TMSI/IMSI)",    "fn": _dim_identity},
+    "direction":   {"label": "Direction (UL/DL)",          "fn": _dim_direction},
+    "rnti_class":  {"label": "RNTI class (SI/P/RA/UE)",    "fn": _dim_rnti_class},
+    "packet_type": {"label": "Packet type (RRC/NAS/IP/…)", "fn": _dim_packet_type},
+    "security":    {"label": "Cleartext vs ciphered",      "fn": _dim_security},
+}
+
+
+def split_dimensions() -> list[dict]:
+    """Public catalog of split dimensions, for the GUI."""
+    return [{"id": k, "label": v["label"]} for k, v in _SPLIT_DIMS.items()]
+
+
+def _build_split_ctx(full: Path) -> dict:
+    counts: dict = {}
+    for r in _tshark_fields(full, "mac-lte", ["mac-lte.rnti", "mac-lte.rnti-type"]):
+        if len(r) >= 2 and r[0] and r[1] == "3":
+            rn = int(r[0]); counts[rn] = counts.get(rn, 0) + 1
+    idmap = _rnti_identity_map(full)
+    keep = {rn for rn, c in counts.items() if c >= _MIN_FRAMES_PER_UE} | {rn for rn in idmap if rn in counts}
+    return {"rnti_counts": {rn: counts[rn] for rn in keep}, "idmap": idmap}
+
+
+def _split_oargs(keys: list[dict]) -> list[str]:
+    o = ["-o", "pdcp-lte.decipher_signalling:TRUE", "-o", "pdcp-lte.decipher_userplane:TRUE",
+         "-o", "pdcp-lte.show_user_plane_as_ip:TRUE", "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE"]
+    if keys:
+        o += ["-o", f"pdcp-lte.default_ciphering_algorithm:{keys[0]['cipher']}",
+              "-o", f"pdcp-lte.default_integrity_algorithm:{keys[0]['integ']}"]
+        for k in keys:
+            if k["rnti"] is not None:
+                o += ["-o", f'uat:pdcp_lte_ue_keys:"{k["rnti"]}","{k["rrc"]}","{k["up"]}",""']
+    return o
+
+
+def _count_pcap(p: Path) -> int:
+    out = subprocess.run(["tshark", "-r", str(p), "-T", "fields", "-e", "frame.number"],
+                         capture_output=True, text=True, timeout=180)
+    return len([x for x in out.stdout.splitlines() if x.strip()])
+
+
+def _split_partition(full: Path, parent: Path, dims: list[str], depth: int, acc: str,
+                     ctx: dict, oargs: list[str], res: dict, budget: list[int]) -> None:
+    last = depth == len(dims) - 1
+    for label, filt in _SPLIT_DIMS[dims[depth]]["fn"](ctx):
+        if budget[0] <= 0:
+            return
+        combined = filt if not acc else f"({acc}) and ({filt})"
+        if last:
+            out = parent / f"{_safe_label(label)}.pcap"
+            subprocess.run(["tshark", "-r", str(full), *oargs, "-Y", combined, "-w", str(out)],
+                           capture_output=True, text=True, timeout=300)
+            n = _count_pcap(out)
+            if n > 0:
+                res["files"].append({"path": str(out), "frames": n, "filter": combined})
+                budget[0] -= 1
+            else:
+                try: out.unlink()
+                except OSError: pass
+        else:
+            sub = parent / _safe_label(label)
+            sub.mkdir(exist_ok=True)
+            before = len(res["files"])
+            _split_partition(full, sub, dims, depth + 1, combined, ctx, oargs, res, budget)
+            if len(res["files"]) == before:
+                try: sub.rmdir()
+                except OSError: pass
+
+
+def split_capture(cfg: SnifferConfig, input_path: str, dims: list[str],
+                  entries: list[dict] | None = None, decrypt: bool = False) -> dict:
+    """Partition a capture into nested sub-pcaps along the ordered `dims`.
+    Returns a manifest (never raises to the caller)."""
+    res: dict = {"ok": False, "error": None, "folder": None, "note": None, "files": [], "leaves": 0}
+    dims = [d for d in (dims or [])]
+    if not dims:
+        res["error"] = "choose at least one split dimension"; return res
+    bad = [d for d in dims if d not in _SPLIT_DIMS]
+    if bad:
+        res["error"] = f"unknown dimension(s): {', '.join(bad)}"; return res
+    try:
+        src = resolve_input_pcap(cfg, input_path)
+    except FileNotFoundError:
+        res["error"] = "input pcap not found"; return res
+    except PermissionError as e:
+        res["error"] = str(e); return res
+    if not shutil.which("tshark"):
+        res["error"] = "tshark not found on PATH"; return res
+
+    keys: list[dict] = []
+    for e in (entries or []):
+        try:
+            rrc, up = _resolve_entry_keys(e)
+        except ValueError as ke:
+            res["error"] = str(ke); return res
+        rn = str(e.get("rnti", "")).strip()
+        keys.append({"rnti": int(rn) if rn not in ("", "None") else None,
+                     "rrc": rrc, "up": up,
+                     "cipher": str(e.get("cipher_algo", "EEA2")), "integ": str(e.get("integ_algo", "EIA2"))})
+    do_decrypt = decrypt and bool(keys)
+
+    stem, d = src.stem, src.parent
+    folder = d / f"{stem}_split"
+    try:
+        folder.mkdir(exist_ok=True)
+        full = folder / f"{stem}_full.pcap"
+        _rewrite_ueid_eq_rnti(src, full)
+        ctx = _build_split_ctx(full)
+        # Always enable MAC→PDCP dissection so packet_type/security classify even
+        # without keys (ciphered frames stay ciphered → "ciphered" bucket). Key
+        # UAT rows are only added when decrypting.
+        oargs = _split_oargs(keys)
+        if do_decrypt:
+            rows = [f'"{k["rnti"]}","{k["rrc"]}","{k["up"]}",""' for k in keys if k["rnti"] is not None]
+            (folder / f"{stem}.pdcp_lte_ue_keys.uat").write_text("\n".join(rows) + "\n")
+        budget = [_SPLIT_MAX_LEAVES]
+        _split_partition(full, folder, dims, 0, "", ctx, oargs, res, budget)
+        if budget[0] <= 0:
+            res["note"] = (f"Hit the {_SPLIT_MAX_LEAVES}-pcap cap — some buckets weren't written. "
+                           f"Use fewer/narrower dimensions.")
+        if not res["files"]:
+            res["note"] = (res["note"] or "") + " No non-empty buckets produced for these dimensions."
+        import json as _json
+        (folder / "split.json").write_text(_json.dumps(
+            {"source": str(src), "dims": dims, "decrypt": do_decrypt, "files": res["files"]}, indent=2))
+        res["folder"] = str(folder); res["leaves"] = len(res["files"]); res["ok"] = True
+        return res
+    except subprocess.TimeoutExpired:
+        res["error"] = "tshark timed out"; return res
+    except Exception as ex:  # noqa: BLE001
+        res["error"] = f"{type(ex).__name__}: {ex}"; return res

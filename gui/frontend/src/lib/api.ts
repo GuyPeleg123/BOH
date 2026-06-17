@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse, BruteforceResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse, BruteforceResponse, SplitDim, SplitResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -119,6 +119,12 @@ export const api = {
     req<BruteforceResponse>("/api/keys/bruteforce-nas", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  splitDims: () => req<{ dimensions: SplitDim[] }>("/api/captures/split-dims"),
+  splitCapture: (path: string, dims: string[], entries: DecryptEntry[], decrypt: boolean) =>
+    req<SplitResponse>("/api/captures/split", {
+      method: "POST",
+      body: JSON.stringify({ path, dims, entries, decrypt }),
     }),
   logHistory: () =>
     req<{ runs: RunLog[] }>("/api/logs/history"),

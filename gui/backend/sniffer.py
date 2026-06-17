@@ -413,11 +413,43 @@ class SnifferRunner:
                 self._reader_task.cancel()
             if self._stderr_task:
                 self._stderr_task.cancel()
+            self._maybe_autosplit()
         finally:
             # Always release the FIFO/temp dir even if broadcast/cancel raised,
             # so an exit can never leak the pipe or strand the UI's state.
             self._cleanup_fifo()
             self._close_log()
+
+    def _maybe_autosplit(self) -> None:
+        """If configured, split the just-finished capture in the background."""
+        run_dir = self._run_dir
+        if run_dir is None:
+            return
+        try:
+            import config as config_mod
+            cfg = config_mod.load()
+        except Exception:
+            return
+        if not getattr(cfg, "auto_split_enabled", False) or not getattr(cfg, "auto_split_dims", None):
+            return
+        dims = list(cfg.auto_split_dims)
+
+        def _job() -> None:
+            try:
+                import captures as captures_mod
+                pcaps = sorted(
+                    (p for p in run_dir.glob("ltesniffer_*mode.pcap") if p.is_file()),
+                    key=lambda p: p.stat().st_size, reverse=True,
+                )
+                if pcaps and pcaps[0].stat().st_size > 24:
+                    captures_mod.split_capture(cfg, str(pcaps[0]), dims)
+            except Exception:
+                pass
+
+        try:
+            asyncio.create_task(asyncio.to_thread(_job))
+        except RuntimeError:
+            pass  # no running loop (shouldn't happen here)
 
     def _close_log(self) -> None:
         if self._log_fp is not None:
