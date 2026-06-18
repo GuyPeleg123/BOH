@@ -143,13 +143,28 @@ bool KeyStore::parse_hex(const std::string& hex, uint8_t* out, size_t n)
 
 bool KeyStore::is_valid_ip(const uint8_t* p, uint32_t len)
 {
+    // DRB accept oracle. This is a HEURISTIC (no MAC-I on the user plane), so
+    // the goal is to make a wrong-key keystream that happens to start with a
+    // 0x4./0x6. nibble much less likely to be mistaken for a real packet —
+    // WITHOUT ever rejecting a well-formed IPv4/IPv6 SDU. Every constraint
+    // below is mandated by RFC 791 / RFC 8200 for a valid header, so a genuine
+    // packet always passes; only random keystream is filtered harder.
     if (len < 20) return false;
     uint8_t ver = p[0] >> 4;
     if (ver == 4) {
+        // IHL (RFC 791): header length in 32-bit words, always in [5,15].
+        uint8_t  ihl  = p[0] & 0x0F;
+        if (ihl < 5 || ihl > 15) return false;
+        uint32_t hdr  = (uint32_t)ihl * 4;          // header length in bytes (>=20 since ihl>=5)
+        if (len < hdr) return false;                 // SDU must contain the header
+        // total_length >= header length and within the captured SDU.
+        // (<= len, not ==, because RLC/MAC padding can leave trailing bytes.)
         uint16_t total = (uint16_t(p[2]) << 8) | p[3];
-        return total >= 20 && total <= len;
+        return total >= hdr && total <= len;
     }
     if (ver == 6) {
+        // payload_length (RFC 8200): bytes after the fixed 40-byte header.
+        // 40 + payload must fit within the captured SDU (allow trailing bytes).
         uint16_t payload = (uint16_t(p[4]) << 8) | p[5];
         return (uint32_t)(40 + payload) <= len;
     }
@@ -453,17 +468,37 @@ bool KeyStore::do_decrypt(uint8_t* key16, uint8_t* int_key16,
     uint32_t sn       = bs.last_sn;
     uint32_t sn_mask  = (1u << bs.sn_bits) - 1u;
 
-    // Determine HFN: if first packet, start at hfn_hint.
-    // Otherwise, advance if SN wrapped backwards.
+    // Determine HFN search base: if first packet, start at hfn_hint.
     uint32_t hfn = bs.hfn;
     if (bs.hfn == 0 && bs.last_sn == UINT32_MAX) {
         hfn = hfn_hint;
     }
 
-    const uint32_t max_hfn_search = 64; // max HFN values to brute-force
+    // HFN is only ever committed below on a VERIFIED decrypt (SRB: MAC-I match;
+    // DRB: is_valid_ip). The callers must NOT speculatively advance bs.hfn on a
+    // bare backward-SN jump — a dropped/reordered packet (routine for a passive
+    // sniffer) would otherwise permanently poison the bearer's HFN. A genuine
+    // SN wrap is still handled here by the forward search (try_hfn = hfn+1).
+    //
+    // Search window:
+    //   DRB (mac_i == nullptr): forward only [hfn .. hfn+N]. The DRB oracle is
+    //     heuristic, so widening backward would raise garbage-accept risk —
+    //     keep it conservative (unchanged from before).
+    //   SRB (mac_i != nullptr) with a REAL integrity algo (EIA1/2/3): allow one
+    //     HFN step backward [hfn-1 .. hfn+N]. Every candidate is MAC-I gated, so
+    //     a wrong HFN is rejected cryptographically (no false-accept risk). This
+    //     lets a late/reordered SRB PDU belonging to the previous HFN still
+    //     decrypt instead of being lost. (Bounded to hfn-1, only when hfn > 0.)
+    //     EIA0 (null integrity) is excluded: its MAC is all-zero and gates
+    //     nothing, so a backward step there could walk HFN backward unchecked.
+    const uint32_t max_hfn_search = 64; // max forward HFN offset (search reaches hfn+max_hfn_search; SRB also tries hfn-1)
     static uint8_t tmp[8192];
 
-    for (uint32_t try_hfn = hfn; try_hfn <= hfn + max_hfn_search; try_hfn++) {
+    uint32_t start_hfn = hfn;
+    if (mac_i != nullptr && hfn > 0 && integ != INTEGRITY_ALGORITHM_ID_EIA0)
+        start_hfn = hfn - 1;
+
+    for (uint32_t try_hfn = start_hfn; try_hfn <= hfn + max_hfn_search; try_hfn++) {
         uint32_t count = (try_hfn << bs.sn_bits) | sn;
         if (!cipher_block(key16, cipher, count, bearer_param, direction,
                           ct, ct_len, tmp))
@@ -530,11 +565,11 @@ uint32_t KeyStore::decrypt_srb(UESecurityState& ue, uint8_t lcid,
         bs.hfn     = ue.hfn_hint;
     }
 
-    // Handle SN wrap: if new SN < last SN and gap is large, increment HFN
-    if (bs.last_sn != UINT32_MAX && sn < bs.last_sn &&
-        (bs.last_sn - sn) > (1u << (bs.sn_bits - 1)))
-        bs.hfn++;
-
+    // NOTE: HFN is advanced only inside do_decrypt() on a verified decrypt
+    // (MAC-I match here). We deliberately do NOT speculatively bump bs.hfn on a
+    // backward-SN jump: a dropped/reordered SRB PDU would otherwise poison the
+    // bearer permanently. A real SN wrap is recovered by do_decrypt's forward
+    // HFN search; a late PDU from the previous HFN by its SRB backward step.
     bs.last_sn = sn;  // temp — do_decrypt will re-read it
 
     // Temporarily set last_sn so do_decrypt can read the SN
@@ -563,6 +598,13 @@ void KeyStore::decrypt_drb(UESecurityState& ue, uint8_t lcid,
     // Need at least 2 (RLC) + 2 (PDCP) + 20 (min IP) = 24 bytes
     if (sdu_len < 24) return;
 
+    // LIMITATION: this path assumes one whole PDCP SDU per RLC PDU with a fixed
+    // header offset (2 or 1 bytes). It does NOT reassemble segmented RLC PDUs
+    // (RLC-AM RF=1 / segmentation offset) nor walk RLC concatenation/extension
+    // (LI) fields for multiple SDUs in one PDU. Such PDUs decrypt against a
+    // mis-parsed boundary and are simply dropped by the is_valid_ip oracle —
+    // they are skipped, never reassembled. (Matches the SRB E-bit skip above.)
+
     // Try two RLC header lengths: 2 bytes (AM/UM-10bit) and 1 byte (UM-5bit)
     static const int rlc_offsets[] = { 2, 1 };
 
@@ -587,11 +629,12 @@ void KeyStore::decrypt_drb(UESecurityState& ue, uint8_t lcid,
             bs.hfn     = ue.hfn_hint;
         }
 
-        // Handle SN wrap
-        if (bs.last_sn != UINT32_MAX && sn < bs.last_sn &&
-            (bs.last_sn - sn) > (1u << (bs.sn_bits - 1)))
-            bs.hfn++;
-
+        // HFN is advanced only inside do_decrypt() on a verified decrypt
+        // (is_valid_ip here). We deliberately do NOT speculatively bump bs.hfn
+        // on a backward-SN jump: a dropped/reordered DRB PDU would otherwise
+        // poison the bearer permanently and stall decryption. A real SN wrap is
+        // recovered by do_decrypt's forward HFN search (try_hfn = hfn+1). The
+        // DRB search stays forward-only (heuristic oracle → no backward step).
         bs.last_sn = sn;
 
         // bearer_param = LCID - 3 → DRB1(lcid=3)→0, DRB2(lcid=4)→1
