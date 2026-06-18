@@ -70,7 +70,7 @@ SubframeWorker::SubframeWorker(uint32_t idx,
                                      ul_sf,
                                      ulsche,
                                      sfb.sf_buffer_b,
-                                     sfb.sf_buffer_offset,
+                                     sfb.sf_buffer_offset[0], // decoder_a's own offset scratch pair
                                      ul_cfg,
                                      pcapwriter,
                                      mcs_tracking,
@@ -86,12 +86,14 @@ SubframeWorker::SubframeWorker(uint32_t idx,
                                      ul_sf,
                                      ulsche,
                                      sfb.sf_buffer_b,
-                                     sfb.sf_buffer_offset,
+                                     sfb.sf_buffer_offset[1], // decoder_b's own offset scratch pair
                                      ul_cfg,
                                      pcapwriter,
                                      mcs_tracking,
                                      mcs_tracking->get_debug_mode());
     puschdecoder_b->set_decoder("b"); // b means decoder b
+    /*Antenna B runs as a per-grant fallback inside decoder_a's grant loop*/
+    puschdecoder->set_fallback_decoder(puschdecoder_b);
     /*Uplink enb init*/
     if (srsran_enb_ul_init(&enb_ul_b, sfb.sf_buffer_b[1], 110))
     { // 110 = max PRB
@@ -114,7 +116,7 @@ SubframeWorker::SubframeWorker(uint32_t idx,
                                      ul_sf,
                                      ulsche,
                                      sfb.sf_buffer_b,
-                                     sfb.sf_buffer_offset,
+                                     sfb.sf_buffer_offset[0], // decoder_a's own offset scratch pair
                                      ul_cfg,
                                      pcapwriter,
                                      mcs_tracking,
@@ -128,12 +130,14 @@ SubframeWorker::SubframeWorker(uint32_t idx,
                                        ul_sf,
                                        ulsche,
                                        sfb.sf_buffer_b,
-                                       sfb.sf_buffer_offset,
+                                       sfb.sf_buffer_offset[1], // decoder_b's own offset scratch pair
                                        ul_cfg,
                                        pcapwriter,
                                        mcs_tracking,
                                        mcs_tracking->get_debug_mode());
     puschdecoder_b->set_decoder("b");
+    /*Antenna B runs as a per-grant fallback inside decoder_a's grant loop*/
+    puschdecoder->set_fallback_decoder(puschdecoder_b);
     if (srsran_enb_ul_init(&enb_ul_b, sfb.sf_buffer_b[1], 110)) {
       ERROR("Error initiating ENB UL");
       return;
@@ -432,14 +436,17 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
                                        ulsche->get_rar_ULSche(tti),
                                        ul_sf,
                                        &subframeInfo.getSubframePower());
-      // puschdecoder_b->init_pusch_decoder(ulsche->getULSche(tti),
-      //                                  ulsche->get_rar_ULSche(tti),
-      //                                  ul_sf,
-      //                                  &subframeInfo.getSubframePower());
-      puschdecoder->decode();         // decode PUSCH
+      // decoder_b is driven as a per-grant fallback from inside decoder_a's
+      // grant loop (see PUSCH_Decoder::decode / try_grant_fallback). It still
+      // needs its ul_sf + SubframePower for chest/debug, so init it here, but
+      // we must NOT call its decode() — that would re-loop the whole grant list
+      // and double-count. The grant list itself is owned/iterated by decoder_a.
+      puschdecoder_b->init_pusch_decoder(ulsche->getULSche(tti),
+                                         ulsche->get_rar_ULSche(tti),
+                                         ul_sf,
+                                         &subframeInfo.getSubframePower());
+      puschdecoder->decode();         // decode PUSCH (antenna A, with antenna B fallback)
       puschdecoder->work_prach();     // decode PRACH
-      // puschdecoder_b->decode();         // decode PUSCH
-      // puschdecoder_b->work_prach();     // decode PRACH
       ulsche->deleteULSche(tti);      // delete current DCI0 list and uplink grant in the database after decoding
       ulsche->delete_rar_ULSche(tti); // also for RAR grant
     }

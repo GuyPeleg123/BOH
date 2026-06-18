@@ -36,7 +36,7 @@ public:
   cf_t*                 getBuffer(uint32_t antenna_idx);
   cf_t**                getBuffers_a() {return sfb.sf_buffer_a;}
   cf_t**                getBuffers_b() {return sfb.sf_buffer_b;}
-  cf_t**                getBuffers_offset() {return sfb.sf_buffer_offset;}
+  cf_t**                getBuffers_offset(uint32_t decoder_idx) {return sfb.sf_buffer_offset[decoder_idx];}
   uint32_t              getSfidx() const {return sf_idx;}
   uint32_t              getSfn() const {return sfn;}
   void                  set_config() {config = true;}

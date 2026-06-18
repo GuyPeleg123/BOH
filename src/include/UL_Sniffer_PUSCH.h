@@ -107,6 +107,19 @@ public:
             debug_str = "B";
         }
     }
+
+    /* Register the second-antenna decoder (decoder_b) as a per-grant fallback.
+       decoder_a calls into it for grants that fail CRC on antenna A. */
+    void set_fallback_decoder(PUSCH_Decoder* fb) { fallback_decoder = fb; }
+
+    /* Run THIS decoder's antenna for a single grant: prepare its FFT once per
+       subframe (lazily, on first call), then run the nominal + offset-retry
+       decode for the given grant. On CRC success the side effects (pcap write,
+       key store, MCS update) fire inside decode_run exactly once — the caller
+       (decoder_a) is responsible for the count-once statistics. Used by
+       decoder_a to drive decoder_b as a fallback. Returns the final CRC; the
+       winning channel estimate is reported via out_snr / out_ta. */
+    bool try_grant_fallback(DCI_UL &decoding_mem, float &out_snr, float &out_ta);
 private:
     /* Run the full per-grant MCS-table decode sequence on whatever symbols are
        currently in enb_ul.sf_symbols. Returns true if CRC passed. Used by both
@@ -119,6 +132,29 @@ private:
        clean pre-FFT snapshot in sf_buffer_offset[0]. Returns false if the offset
        would read outside the available buffer. */
     bool refft_at_offset(int sample_offset);
+
+    /* Prepare this decoder's antenna for the current subframe: snapshot the raw
+       samples (for the offset-retry pass), run the nominal FFT, compute power,
+       and save the nominal symbols. Idempotent within a subframe — the very
+       first call does the work, later calls are no-ops until reset_fft_prepared.
+       Factored out of decode() so decoder_b can prepare lazily, only when its
+       fallback is actually needed for some grant. */
+    void prepare_fft();
+    void reset_fft_prepared() { fft_prepared = false; }
+
+    /* Nominal pass + FFT-window-offset retry pass for ONE grant, on the symbols
+       this decoder's antenna currently holds. Restores the nominal symbols
+       afterwards so the next grant's nominal pass is correct. Returns the final
+       CRC and reports the winning channel estimate via out_snr / out_ta. This is
+       the per-antenna unit shared by both decoder_a's loop and the fallback. */
+    bool decode_grant_with_retry(DCI_UL &decoding_mem, float &out_snr, float &out_ta);
+
+    /* The second-antenna decoder, used as a per-grant fallback (only set on
+       decoder_a). nullptr means single-antenna behaviour (unchanged). */
+    PUSCH_Decoder*          fallback_decoder    = nullptr;
+    /* Whether this decoder's nominal FFT has been run for the current subframe.
+       Lets decoder_b defer its FFT until a grant actually fails on antenna A. */
+    bool                    fft_prepared        = false;
 
     bool        decoder_a = false;
     bool        decoder_b = false;
@@ -140,6 +176,9 @@ private:
     srsran_ul_sf_cfg_t      &ul_sf;
     LTESniffer_pcap_writer  *pcapwriter;
     srsran_pusch_res_t      pusch_res           = {};
+    /* Per-instance PUSCH softbuffer. Owned here (not via the shared ul_cfg ref)
+       so the two decoders don't alias/double-free one buffer. */
+    srsran_softbuffer_rx_t* own_softbuf         = nullptr;
     srsran_ul_cfg_t         &ul_cfg;
 
     /*variables for prach*/
