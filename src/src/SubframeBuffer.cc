@@ -27,8 +27,12 @@ SubframeBuffer::SubframeBuffer(uint32_t rf_nof_rx_ant) : rf_nof_rx_ant(rf_nof_rx
   for (uint32_t i = 0; i < 4; i++) {
     sf_buffer_b[i] = static_cast<cf_t*>(srsran_vec_malloc(3*static_cast<uint32_t>(sizeof(cf_t))*static_cast<uint32_t>(SRSRAN_SF_LEN_PRB(100))));
   }
-  for (uint32_t i = 0; i < UL_SNIFFER_MAX_NOF_OFFSET; i++) {
-    sf_buffer_offset[i] = static_cast<cf_t*>(srsran_vec_malloc(3*static_cast<uint32_t>(sizeof(cf_t))*static_cast<uint32_t>(SRSRAN_SF_LEN_PRB(100))));
+  // Two offset-scratch pairs: one per UL decoder instance (A and B), so the two
+  // decoders never share the snapshot/working buffers when both run.
+  for (uint32_t d = 0; d < 2; d++) {
+    for (uint32_t i = 0; i < UL_SNIFFER_MAX_NOF_OFFSET; i++) {
+      sf_buffer_offset[d][i] = static_cast<cf_t*>(srsran_vec_malloc(3*static_cast<uint32_t>(sizeof(cf_t))*static_cast<uint32_t>(SRSRAN_SF_LEN_PRB(100))));
+    }
   }
 }
 
@@ -41,8 +45,10 @@ SubframeBuffer::~SubframeBuffer() {
     free(sf_buffer_b[i]);
     sf_buffer_b[i] = nullptr;
   }
-  for (uint32_t i = 0; i < UL_SNIFFER_MAX_NOF_OFFSET; i++) {
-    free(sf_buffer_offset[i]);
-    sf_buffer_offset[i] = nullptr;
+  for (uint32_t d = 0; d < 2; d++) {
+    for (uint32_t i = 0; i < UL_SNIFFER_MAX_NOF_OFFSET; i++) {
+      free(sf_buffer_offset[d][i]);
+      sf_buffer_offset[d][i] = nullptr;
+    }
   }
 }

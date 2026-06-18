@@ -35,8 +35,12 @@ PUSCH_Decoder::PUSCH_Decoder(srsran_enb_ul_t &enb_ul,
     set_api_mode(mcstracking->get_api_mode());
     multi_ul_offset = ulsche->get_multi_ul_offset_cfg();
     pusch_res.data = srsran_vec_u8_malloc(2000 * 8);
-    ul_cfg.pusch.softbuffers.rx = new srsran_softbuffer_rx_t;
-    srsran_softbuffer_rx_init(ul_cfg.pusch.softbuffers.rx, SRSRAN_MAX_PRB);
+    /* Each PUSCH_Decoder owns its softbuffer. decoder_a and decoder_b share the
+       same ul_cfg reference, so writing ul_cfg.pusch.softbuffers.rx here would
+       have both decoders alias (and double-free) one buffer. decode_run() points
+       ul_cfg at this instance's own_softbuf right before each decode. */
+    own_softbuf = new srsran_softbuffer_rx_t;
+    srsran_softbuffer_rx_init(own_softbuf, SRSRAN_MAX_PRB);
 
     /* Scratch for the nominal-window symbols (used by the offset-retry pass).
        enb_ul.sf_symbols is allocated for max_prb=110, CP normal. */
@@ -47,7 +51,7 @@ PUSCH_Decoder::PUSCH_Decoder(srsran_enb_ul_t &enb_ul,
 PUSCH_Decoder::~PUSCH_Decoder()
 {
     srsran_vec_u8_zero(pusch_res.data, 2000 * 8);
-    srsran_softbuffer_rx_free(ul_cfg.pusch.softbuffers.rx);
+    if (own_softbuf) { srsran_softbuffer_rx_free(own_softbuf); delete own_softbuf; own_softbuf = nullptr; }
     if (sf_symbols_nominal) { free(sf_symbols_nominal); sf_symbols_nominal = nullptr; }
 }
 
@@ -257,6 +261,10 @@ int PUSCH_Decoder::decode_nas_ul(DCI_UL &decoding_mem, uint8_t *sdu_ptr, int len
 void PUSCH_Decoder::decode_run(std::string info, DCI_UL &decoding_mem, std::string modulation_mode, float falcon_signal_power)
 {
     int mcs_idx = ul_cfg.pusch.grant.tb.mcs_idx;
+    /* Point the shared ul_cfg at THIS decoder's own softbuffer before resetting/
+       decoding, so decoder_a and decoder_b never reset or decode into each
+       other's scratch (sequential A-then-B-fallback per grant). */
+    ul_cfg.pusch.softbuffers.rx = own_softbuf;
     srsran_softbuffer_rx_reset_tbs(ul_cfg.pusch.softbuffers.rx, ul_cfg.pusch.grant.tb.tbs);
 
     /*Do channel estimation to calculate timing difference between UL & DL subframes, because of diffrent propagation times*/
@@ -616,8 +624,14 @@ bool PUSCH_Decoder::decode_grant(DCI_UL &decoding_mem)
     return pusch_res.crc;
 }
 
-void PUSCH_Decoder::decode()
+/* Prepare this decoder's antenna for the current subframe: point the FFT at the
+   right raw buffer, snapshot the raw samples for the offset-retry pass, run the
+   nominal FFT, compute power and save the nominal symbols. Idempotent within a
+   subframe (guarded by fft_prepared) so decoder_b can prepare lazily. */
+void PUSCH_Decoder::prepare_fft()
 {
+    if (fft_prepared) return;
+
     if (decoder_a){
         enb_ul.in_buffer = original_buffer[0]; // 0 for downlink, 1 for uplink, now 0 because there are 2 separate buffers
     }else if (decoder_b){
@@ -625,22 +639,18 @@ void PUSCH_Decoder::decode()
     }
 
     /* Snapshot the raw subframe BEFORE the FFT. srsran_enb_ul_fft applies its
-       frequency shift in place on original_buffer[0], so once the nominal FFT
-       runs the raw samples are destroyed. We need a clean copy to re-FFT at
-       alternate window offsets in the retry pass. Only needed when offset retry
-       is enabled (UL/DUAL mode). */
+       frequency shift in place on the in_buffer, so once the nominal FFT runs
+       the raw samples are destroyed. We need a clean copy to re-FFT at alternate
+       window offsets in the retry pass. Only needed when offset retry is enabled
+       (UL/DUAL mode). buffer_offset[] is this decoder's OWN scratch pair
+       (sf_buffer_offset[0] for A, sf_buffer_offset[1] for B), so the two
+       decoders never race on it. */
     const bool offset_retry_enabled = (multi_ul_offset != 0);
     if (offset_retry_enabled)
     {
         const uint32_t snap_len = 3 * SRSRAN_SF_LEN_PRB(100);
         /* Snapshot the SAME window the nominal FFT consumes: decoder_a runs on
-           original_buffer[0] (USRP A), decoder_b on original_buffer[1] (USRP B).
-           Hardcoding [0] here would feed decoder_b USRP-A samples on every retry.
-           NOTE: buffer_offset[] scratch is shared between the two decoder
-           instances (both are constructed with sfb.sf_buffer_offset), so
-           decoder_b must NOT run concurrently with decoder_a until it is given
-           its own scratch pair — decoder_b's decode() is currently disabled in
-           SubframeWorker, so this is latent today. */
+           original_buffer[0] (USRP A), decoder_b on original_buffer[1] (USRP B). */
         cf_t* raw_src = decoder_b ? original_buffer[1] : original_buffer[0];
         memcpy(buffer_offset[0], raw_src, sizeof(cf_t) * snap_len);
     }
@@ -649,12 +659,115 @@ void PUSCH_Decoder::decode()
     sf_power->computePower(enb_ul.sf_symbols);
 
     /* Save the nominal-window symbols. The FFT applies its frequency shift in
-       place on original_buffer[0], so it cannot be re-run to regenerate these;
-       the offset-retry pass restores from this copy instead. */
+       place on the raw buffer, so it cannot be re-run to regenerate these; the
+       offset-retry pass restores from this copy instead. */
     if (offset_retry_enabled && sf_symbols_nominal)
     {
         memcpy(sf_symbols_nominal, enb_ul.sf_symbols, sizeof(cf_t) * sf_symbols_len);
     }
+
+    fft_prepared = true;
+}
+
+/* Nominal pass + FFT-window-offset retry pass for ONE grant, on the symbols this
+   decoder's antenna currently holds. Side effects (pcap write, key store, MCS
+   update) happen inside decode_run on CRC success exactly once. Restores the
+   nominal symbols afterwards so the next grant's nominal pass is correct.
+   Reports the winning channel estimate via out_snr / out_ta. */
+bool PUSCH_Decoder::decode_grant_with_retry(DCI_UL &decoding_mem, float &out_snr, float &out_ta)
+{
+    const bool offset_retry_enabled = (multi_ul_offset != 0);
+
+    /* PASS 1: nominal FFT window (sf_symbols already holds the nominal FFT). */
+    bool crc = decode_grant(decoding_mem);
+
+    /* Capture the nominal channel-estimate outcome for statistics and for
+       steering the retry. ta_us gives the signed residual timing in
+       microseconds; snr tells us whether the signal was even present. */
+    out_snr = enb_ul.chest_res.snr_db;
+    out_ta  = enb_ul.chest_res.ta_us;
+
+    /* PASS 2: FFT-window-offset retry. Only for grants that FAILED CRC at the
+       nominal window AND only when offset retry is enabled (UL/DUAL mode). A
+       passive sniffer sees the UE's TA-precompensated UL with a geometry-
+       dependent residual; when that residual pushes symbols past the CP
+       tolerance, a strong signal still fails CRC. We re-FFT on a shifted window
+       to re-centre it. */
+    if (!crc && offset_retry_enabled)
+    {
+        const uint32_t sf_len = SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb);
+
+        /* Build candidate sample offsets, most-likely first:
+           1) the measured residual ta_us -> samples (and its negation, to be
+              robust to sign convention) when the nominal estimate was usable
+              (snr >= ~0 dB);
+           2) a small fixed fallback set spanning roughly +/- one CP for grants
+              whose DMRS was too misaligned to give a reliable ta. */
+        int  cand[8];
+        int  ncand = 0;
+        if (out_snr >= 0.0f && out_ta != 0.0f)
+        {
+            // samples = ta_us * 1e-6 * srate; srate = sf_len * 1000
+            int meas = (int)lroundf(out_ta * (float)sf_len / 1000.0f);
+            if (meas != 0) { cand[ncand++] = meas; cand[ncand++] = -meas; }
+        }
+        // Fixed fallback offsets (samples). At 15.36 Msps: 16->~1us, 32->~2us,
+        // 64->~4us (~ one normal CP). Skip any that already equal the measured
+        // candidate so we don't re-FFT+decode an identical window for nothing.
+        static const int fixed_off[] = {32, -32, 64, -64, 16, -16};
+        for (uint32_t i = 0; i < sizeof(fixed_off)/sizeof(fixed_off[0]) &&
+                             ncand < (int)(sizeof(cand)/sizeof(cand[0])); i++)
+        {
+            bool dup = false;
+            for (int j = 0; j < ncand; j++) { if (cand[j] == fixed_off[i]) { dup = true; break; } }
+            if (!dup) cand[ncand++] = fixed_off[i];
+        }
+
+        for (int i = 0; i < ncand && !crc; i++)
+        {
+            if (!refft_at_offset(cand[i])) continue; // out-of-range guard
+            crc = decode_grant(decoding_mem);
+            if (crc)
+            {
+                // Keep the successful estimate for statistics.
+                out_snr = enb_ul.chest_res.snr_db;
+                out_ta  = enb_ul.chest_res.ta_us;
+            }
+        }
+
+        /* Restore sf_symbols to the nominal window so the next grant's pass-1
+           decode sees the correct (nominal) symbols. We cannot re-run
+           srsran_enb_ul_fft (it shifts the raw buffer in place and is not
+           idempotent), so restore from the saved copy. */
+        if (sf_symbols_nominal)
+        {
+            memcpy(enb_ul.sf_symbols, sf_symbols_nominal, sizeof(cf_t) * sf_symbols_len);
+        }
+    }
+
+    return crc;
+}
+
+/* Fallback entry point: decoder_a calls this on decoder_b for a grant that
+   failed on antenna A. We lazily prepare antenna B's FFT (once per subframe) and
+   then run the same per-antenna decode unit. No statistics here — decoder_a owns
+   the count-once update_statistic_ul for the grant. */
+bool PUSCH_Decoder::try_grant_fallback(DCI_UL &decoding_mem, float &out_snr, float &out_ta)
+{
+    out_snr = 0.0f;
+    out_ta  = 0.0f;
+    prepare_fft();                       // no-op after the first fallback this subframe
+    return decode_grant_with_retry(decoding_mem, out_snr, out_ta);
+}
+
+void PUSCH_Decoder::decode()
+{
+    /* Always (re)prepare antenna A's FFT for this subframe. Reset the fallback
+       decoder's per-subframe FFT flag so antenna B re-prepares lazily on its
+       first use this subframe. */
+    fft_prepared = false;
+    prepare_fft();
+    if (fallback_decoder) fallback_decoder->reset_fft_prepared();
 
     /*combine Uplink grant detected from RAR response (msg 2) and Uplink grant detected from DCI0*/
     if (!dci_ul.empty() || !rar_dci_ul.empty())
@@ -678,85 +791,42 @@ void PUSCH_Decoder::decode()
             /*Only decode member with valid UL grant*/
             if (((decoding_mem.rnti == target_rnti) || (valid_ul_grant == SRSRAN_SUCCESS))&&decoding_mem.rnti != 0)
             {
-                /* PASS 1: nominal FFT window (sf_symbols already holds the
-                   nominal FFT). Behaves exactly as before. */
-                bool crc = decode_grant(decoding_mem);
+                /* Antenna A: nominal pass + offset retry for this grant. */
+                float win_snr = 0.0f, win_ta = 0.0f;
+                bool crc = decode_grant_with_retry(decoding_mem, win_snr, win_ta);
 
-                /* Capture the nominal channel-estimate outcome for statistics and
-                   for steering the retry. ta_us gives the signed residual timing
-                   in microseconds; snr tells us whether the signal was even
-                   present. */
-                float nominal_snr   = enb_ul.chest_res.snr_db;
-                float nominal_ta_us = enb_ul.chest_res.ta_us;
-
-                /* PASS 2: FFT-window-offset retry. Only for grants that FAILED
-                   CRC at the nominal window AND only when offset retry is enabled
-                   (UL/DUAL mode). A passive sniffer sees the UE's TA-precompensated
-                   UL with a geometry-dependent residual; when that residual pushes
-                   symbols past the CP tolerance, a strong signal still fails CRC.
-                   We re-FFT on a shifted window to re-centre it. */
-                if (!crc && offset_retry_enabled)
+                /* Antenna B fallback: only for grants that A could not decode.
+                   This preserves the count-once invariant — at most one of A/B
+                   produces a CRC success for a given grant, so decode_run fires
+                   the pcap write / key store / MCS update at most once. With a
+                   single UL antenna (no fallback registered) this is skipped and
+                   behaviour is identical to before. */
+                if (!crc && fallback_decoder)
                 {
-                    const uint32_t sf_len = SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb);
-
-                    /* Build candidate sample offsets, most-likely first:
-                       1) the measured residual ta_us -> samples (and its
-                          negation, to be robust to sign convention) when the
-                          nominal estimate was usable (snr >= ~0 dB);
-                       2) a small fixed fallback set spanning roughly +/- one CP
-                          for grants whose DMRS was too misaligned to give a
-                          reliable ta. */
-                    int  cand[8];
-                    int  ncand = 0;
-                    if (nominal_snr >= 0.0f && nominal_ta_us != 0.0f)
+                    float b_snr = 0.0f, b_ta = 0.0f;
+                    bool b_crc = fallback_decoder->try_grant_fallback(decoding_mem, b_snr, b_ta);
+                    if (b_crc)
                     {
-                        // samples = ta_us * 1e-6 * srate; srate = sf_len * 1000
-                        int meas = (int)lroundf(nominal_ta_us * (float)sf_len / 1000.0f);
-                        if (meas != 0) { cand[ncand++] = meas; cand[ncand++] = -meas; }
+                        crc     = true;
+                        win_snr = b_snr;   // report the antenna that actually decoded
+                        win_ta  = b_ta;
                     }
-                    // Fixed fallback offsets (samples). At 15.36 Msps: 16->~1us,
-                    // 32->~2us, 64->~4us (~ one normal CP). Skip any that already
-                    // equal the measured candidate so we don't re-FFT+decode an
-                    // identical window for nothing.
-                    static const int fixed_off[] = {32, -32, 64, -64, 16, -16};
-                    for (uint32_t i = 0; i < sizeof(fixed_off)/sizeof(fixed_off[0]) &&
-                                         ncand < (int)(sizeof(cand)/sizeof(cand[0])); i++)
+                    else if (b_snr > win_snr)
                     {
-                        bool dup = false;
-                        for (int j = 0; j < ncand; j++) { if (cand[j] == fixed_off[i]) { dup = true; break; } }
-                        if (!dup) cand[ncand++] = fixed_off[i];
-                    }
-
-                    for (int i = 0; i < ncand && !crc; i++)
-                    {
-                        if (!refft_at_offset(cand[i])) continue; // out-of-range guard
-                        crc = decode_grant(decoding_mem);
-                        if (crc)
-                        {
-                            // Keep the successful estimate for statistics below.
-                            nominal_snr   = enb_ul.chest_res.snr_db;
-                            nominal_ta_us = enb_ul.chest_res.ta_us;
-                        }
-                    }
-
-                    /* Restore sf_symbols to the nominal window so the next
-                       grant's pass-1 decode sees the correct (nominal) symbols.
-                       We cannot re-run srsran_enb_ul_fft (it shifts the raw
-                       buffer in place and is not idempotent), so restore from the
-                       saved copy. Skip the restore only if the last attempted
-                       offset was 0 (it never is here). */
-                    if (sf_symbols_nominal)
-                    {
-                        memcpy(enb_ul.sf_symbols, sf_symbols_nominal, sizeof(cf_t) * sf_symbols_len);
+                        // Both failed: keep the better-SNR estimate so the failure
+                        // statistic reflects the stronger antenna's view.
+                        win_snr = b_snr;
+                        win_ta  = b_ta;
                     }
                 }
 
                 /*Update statistic when SNR is higher than 1, the statistic showed on terminal is only for RNTIs with SNR >=1*/
-                /* Count each grant exactly once with its FINAL outcome (crc),
-                   using the channel estimate from the attempt that produced it. */
-                if (nominal_snr >= 1)
-                { // enb_ul.chest_res.snr_db >= 1
-                    mcstracking->update_statistic_ul(decoding_mem.rnti, crc, decoding_mem, nominal_snr, nominal_ta_us);
+                /* Count each grant EXACTLY ONCE with its FINAL outcome (crc),
+                   regardless of how many antennas/offsets were tried, using the
+                   channel estimate from the attempt that produced it. */
+                if (win_snr >= 1)
+                { // chest_res.snr_db >= 1
+                    mcstracking->update_statistic_ul(decoding_mem.rnti, crc, decoding_mem, win_snr, win_ta);
                 }
             }
             else

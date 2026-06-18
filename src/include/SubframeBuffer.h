@@ -33,5 +33,11 @@ struct SubframeBuffer {
   const uint32_t rf_nof_rx_ant;
   cf_t *sf_buffer_a[SRSRAN_MAX_PORTS] = {nullptr};
   cf_t *sf_buffer_b[SRSRAN_MAX_PORTS] = {nullptr};
-  cf_t *sf_buffer_offset[UL_SNIFFER_MAX_NOF_OFFSET] = {nullptr}; // idx 0 for 32, idx 1 for 64
+  // Offset-retry scratch for the FFT-window re-FFT pass (PR #4). Each UL decoder
+  // instance needs its OWN snapshot/working pair, otherwise the two decoders
+  // (antenna A = enb_ul, antenna B = enb_ul_b) race on these buffers when both
+  // run in the same subframe. Index [0] = decoder_a's pair, [1] = decoder_b's
+  // pair; within each pair, [...][0] is the clean pre-FFT snapshot and [...][1]
+  // is the freq-shifted working copy fed to the FFT.
+  cf_t *sf_buffer_offset[2][UL_SNIFFER_MAX_NOF_OFFSET] = {{nullptr}};
 };
