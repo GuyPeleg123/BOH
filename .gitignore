@@ -21,3 +21,6 @@ ul_sample.raw
 
 # Editor
 .vscode/
+.claude/settings.local.json
+.claude/worktrees/
+.claude/agent-memory/
