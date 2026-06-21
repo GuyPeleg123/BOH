@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import signal
+import struct
 import tempfile
 import time
 from collections import deque
@@ -35,6 +36,50 @@ def _redact_keys(msg: str) -> str:
     msg = _HEX_KEY_RE.sub("<redacted-256>", msg)
     msg = _HEX_KEY_RE_128.sub("<redacted-128>", msg)
     return msg
+
+
+# libpcap magic numbers (us-resolution and ns-resolution, both byte orders).
+_PCAP_MAGIC_LE = (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1")
+_PCAP_MAGIC_BE = (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d")
+
+
+def count_pcap_records(path: Path) -> int:
+    """Count MAC records in a libpcap file by walking the record headers.
+
+    Pure-Python, no tshark: skip the 24-byte global header, then for each
+    16-byte record header read the 32-bit caplen and seek past the payload.
+    This counts the *actual frames written to disk* — unlike decoded-grant
+    (DCI) tallies, which overcount because grants can be found yet fail PDSCH
+    (e.g. 4-port cells) and so never get written. Verified byte-exact against
+    `tshark -r ... | wc -l` on real DL/UL/dual captures.
+
+    Returns 0 on any error (file not yet created, partial header, bad magic),
+    so a mid-run read of a freshly-opened pcap is harmless.
+    """
+    try:
+        with open(path, "rb") as f:
+            gh = f.read(24)
+            if len(gh) < 24:
+                return 0
+            magic = gh[:4]
+            if magic in _PCAP_MAGIC_LE:
+                endian = "<"
+            elif magic in _PCAP_MAGIC_BE:
+                endian = ">"
+            else:
+                return 0
+            n = 0
+            while True:
+                rh = f.read(16)
+                if len(rh) < 16:
+                    break
+                # record header: ts_sec, ts_frac, caplen, origlen (all u32)
+                caplen = struct.unpack(endian + "IIII", rh)[2]
+                f.seek(caplen, os.SEEK_CUR)
+                n += 1
+            return n
+    except OSError:
+        return 0
 
 
 # Hard allowlist of LTESniffer binaries the backend will spawn. Anything else
@@ -112,6 +157,7 @@ class SnifferRunner:
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._wait_task: Optional[asyncio.Task] = None  # tracked so we can cancel on restart
+        self._frames_task: Optional[asyncio.Task] = None  # periodic live-pcap frame count
         self._run_dir: Optional[Path] = None            # timestamped subdir for this run's pcaps
         self._log_fp = None                             # per-run sniffer.log for the history browser
         self._subscribers: set[asyncio.Queue] = set()
@@ -152,7 +198,7 @@ class SnifferRunner:
         # lifecycle must be first: the frontend reducer treats lifecycle:started
         # as a hard reset for the rest of the state, so it has to be applied
         # before the cell/hello/mib events from the same capture.
-        sticky_keys = ("lifecycle", "hello", "cell", "mib", "stats")
+        sticky_keys = ("lifecycle", "hello", "cell", "mib", "stats", "frames")
         return [self._sticky[k] for k in sticky_keys if k in self._sticky] + list(self._last_events)
 
     def state(self) -> dict[str, Any]:
@@ -160,7 +206,7 @@ class SnifferRunner:
 
     def _broadcast(self, event: dict[str, Any]) -> None:
         t = event.get("t")
-        if t in ("hello", "cell", "mib", "lifecycle", "stats"):
+        if t in ("hello", "cell", "mib", "lifecycle", "stats", "frames"):
             self._sticky[t] = event
         self._last_events.append(event)
 
@@ -306,6 +352,7 @@ class SnifferRunner:
 
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._wait_task = asyncio.create_task(self._wait_exit())
+        self._frames_task = asyncio.create_task(self._poll_frames(run_dir))
 
     async def stop(self, graceful_timeout: float = 15.0) -> None:
         """Stop the running sniffer.
@@ -386,7 +433,7 @@ class SnifferRunner:
             pass
 
         # Cancel background tasks in case _wait_exit hasn't fired yet.
-        for task in (self._wait_task, self._reader_task, self._stderr_task):
+        for task in (self._wait_task, self._reader_task, self._stderr_task, self._frames_task):
             if task and not task.done():
                 task.cancel()
 
@@ -413,12 +460,99 @@ class SnifferRunner:
                 self._reader_task.cancel()
             if self._stderr_task:
                 self._stderr_task.cancel()
+            if self._frames_task:
+                # One last count so the final tally reflects everything flushed
+                # at shutdown, then stop the poller. Offloaded to a thread (await)
+                # so a large pcap can't block the loop / stall lifecycle:exited.
+                await self._emit_frame_count()
+                self._frames_task.cancel()
+            self._prune_empty_outputs()
             self._maybe_autosplit()
         finally:
             # Always release the FIFO/temp dir even if broadcast/cancel raised,
             # so an exit can never leak the pipe or strand the UI's state.
             self._cleanup_fifo()
             self._close_log()
+
+    # Hardcoded by the C++ core (relative to per-run CWD). The dual-mode pcap is
+    # the canonical run record; in DL-only / UL-only modes the matching name is
+    # written instead — we count whichever exists and is largest.
+    _LIVE_PCAP_NAMES = (
+        "ltesniffer_dual_mode.pcap",
+        "ltesniffer_dl_mode.pcap",
+        "ltesniffer_ul_mode.pcap",
+    )
+    _FRAMES_POLL_S = 2.0
+
+    def _live_pcap(self, run_dir: Path) -> Optional[Path]:
+        """Pick the run's live MAC pcap (largest of the known mode files)."""
+        best: Optional[Path] = None
+        best_sz = -1
+        for name in self._LIVE_PCAP_NAMES:
+            p = run_dir / name
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            if sz > best_sz:
+                best, best_sz = p, sz
+        return best
+
+    async def _emit_frame_count(self) -> None:
+        """Count the live pcap once and broadcast a `frames` event.
+
+        Used at shutdown for the final tally; the count walk is offloaded to a
+        thread (like the periodic poller) so the event loop never blocks."""
+        run_dir = self._run_dir
+        if run_dir is None:
+            return
+        p = self._live_pcap(run_dir)
+        if p is None:
+            return
+        count = await asyncio.get_running_loop().run_in_executor(None, count_pcap_records, p)
+        self._broadcast({"t": "frames", "ts": time.time(), "count": count})
+
+    async def _poll_frames(self, run_dir: Path) -> None:
+        """Every ~2 s, count MAC records in the live pcap and broadcast it.
+
+        Counting walks the file's record headers in a worker thread (cheap, but
+        still disk I/O), so the event loop is never blocked. Emits `frames`
+        events the frontend renders as a live "frames" tile."""
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                p = self._live_pcap(run_dir)
+                if p is not None:
+                    count = await loop.run_in_executor(None, count_pcap_records, p)
+                    self._broadcast({"t": "frames", "ts": time.time(), "count": count})
+                await asyncio.sleep(self._FRAMES_POLL_S)
+        except asyncio.CancelledError:
+            pass
+
+    _EMPTY_PCAP_HDR = 24  # a libpcap global header with zero packets
+
+    def _prune_empty_outputs(self) -> None:
+        """Delete output files LTESniffer always opens but only fills in specific
+        modes: api_collector.pcap (-z API/IMSI mode), iq_sample_dl.bin /
+        ul_sample.raw (IQ-dump mode), *_decrypted_ip.pcap (-K decrypt with a DRB
+        hit). When a run doesn't use that mode they stay empty (0 bytes, or a
+        24-byte pcap header), so the run folder keeps only real output. Strictly
+        conditional on emptiness — anything with real content is left untouched.
+        The main *_dual_mode.pcap is never touched (it's the run record)."""
+        run_dir = self._run_dir
+        if run_dir is None:
+            return
+        try:
+            for name in ("iq_sample_dl.bin", "ul_sample.raw"):
+                f = run_dir / name
+                if f.is_file() and f.stat().st_size == 0:
+                    f.unlink()
+            for f in run_dir.glob("*.pcap"):
+                if (f.name == "api_collector.pcap" or f.name.endswith("_decrypted_ip.pcap")) \
+                        and f.is_file() and f.stat().st_size <= self._EMPTY_PCAP_HDR:
+                    f.unlink()
+        except OSError:
+            pass
 
     def _maybe_autosplit(self) -> None:
         """If configured, split the just-finished capture in the background."""

@@ -75,6 +75,11 @@ export interface AppState {
   logs: { ts: number; level: string; msg: string; source?: string }[];
   recentDci: DCIRecord[];                // newest-first
   totals: { dci: number; dci_dl: number; dci_ul: number; tbs: number; rb: number; sf: number };
+  // Run-long MAC frame-type tallies, classified by RNTI from the `sf` stream
+  // (+ MIB from `mib` events). Accumulated here — NOT summed from the capped
+  // `rntis` map — so counts stay accurate across a multi-day capture.
+  frameTypes: { mib: number; sib: number; paging: number; rar: number; dl_data: number; ul_data: number };
+  pcapFrames: number;                    // live frame count of the final pcap (from backend `frames` events)
   rateSamples: RateSample[];             // for sliding-window rates
   monotonic: number;                     // last-seen event ts (sniffer side)
 }
@@ -97,6 +102,8 @@ const initial: AppState = {
   logs: [],
   recentDci: [],
   totals: { dci: 0, dci_dl: 0, dci_ul: 0, tbs: 0, rb: 0, sf: 0 },
+  frameTypes: { mib: 0, sib: 0, paging: 0, rar: 0, dl_data: 0, ul_data: 0 },
+  pcapFrames: 0,
   rateSamples: [],
   monotonic: 0,
 };
@@ -141,6 +148,8 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
   let sfHistory = s.sfHistory;
   let recentDci = s.recentDci;
   let totals = s.totals;
+  let frameTypes = s.frameTypes;
+  let pcapFrames = s.pcapFrames;
   let rateSamples = s.rateSamples;
   let cell = s.cell;
   let hello = s.hello;
@@ -172,6 +181,13 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
         break;
       case "mib":
         mib = ev;
+        frameTypes = frameTypes === s.frameTypes ? { ...frameTypes } : frameTypes;
+        frameTypes.mib += 1;
+        break;
+      case "frames":
+        // Live count of MAC records in the final pcap (backend polls the file
+        // on disk every ~2 s). Authoritative frame count — DCIs overcount.
+        pcapFrames = ev.count;
         break;
       case "stats":
         stats = ev;
@@ -185,6 +201,7 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
 
         if (!rntis) rntis = new Map(s.rntis);
         let batchDci = 0, batchTbs = 0, batchRb = 0, batchDl = 0, batchUl = 0;
+        let fSib = 0, fPaging = 0, fRar = 0, fDlData = 0, fUlData = 0;
         for (const d of ev.dl) {
           let r = rntis.get(d.rnti);
           if (!r) { r = newRntiStats(d.rnti, ev.ts); rntis.set(d.rnti, r); addedRntis = true; }
@@ -195,6 +212,14 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
           r.last_mcs_dl = d.mcs;
           r.last_fmt = d.fmt;
           batchDci++; batchDl++; batchTbs += d.tbs; batchRb += d.nprb;
+          // Classify the DL grant's MAC frame type by RNTI (TS 36.321 Table 7.1-1).
+          // Note: RA-RNTI (1..0x3C) overlaps the C-RNTI range, so a C-RNTI that
+          // happens to land in 1..0x3C is counted as RAR. Spec ambiguity from
+          // RNTI alone, not a bug — harmless for a coarse traffic-type tally.
+          if (d.rnti === 0xffff) fSib++;
+          else if (d.rnti === 0xfffe) fPaging++;
+          else if (d.rnti >= 0x0001 && d.rnti <= 0x003c) fRar++;
+          else fDlData++;   // C-RNTI (or any other) DL data
           newDcis.push({
             ts: ev.ts, sfn: ev.sfn, sf: ev.sf, dir: "dl",
             rnti: d.rnti, fmt: d.fmt, mcs: d.mcs, nprb: d.nprb, tbs: d.tbs,
@@ -211,6 +236,8 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
           r.ul_tbs_total += d.tbs;
           r.last_mcs_ul = d.mcs;
           batchDci++; batchUl++; batchTbs += d.tbs; batchRb += d.nprb;
+          // UL grants are addressed to a C-RNTI → UL user data.
+          fUlData++;
           newDcis.push({
             ts: ev.ts, sfn: ev.sfn, sf: ev.sf, dir: "ul",
             rnti: d.rnti, fmt: d.fmt, mcs: d.mcs, nprb: d.nprb, tbs: d.tbs,
@@ -225,6 +252,15 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
         totals.tbs += batchTbs;
         totals.rb += batchRb;
         totals.sf += 1;
+
+        if (fSib || fPaging || fRar || fDlData || fUlData) {
+          frameTypes = frameTypes === s.frameTypes ? { ...frameTypes } : frameTypes;
+          frameTypes.sib += fSib;
+          frameTypes.paging += fPaging;
+          frameTypes.rar += fRar;
+          frameTypes.dl_data += fDlData;
+          frameTypes.ul_data += fUlData;
+        }
 
         if (batchDci || batchRb) {
           rateSamples = rateSamples === s.rateSamples ? rateSamples.slice() : rateSamples;
@@ -276,6 +312,8 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
           recentDci = [];
           logs = [];   // clear the live log panel — each run starts fresh
           totals = { dci: 0, dci_dl: 0, dci_ul: 0, tbs: 0, rb: 0, sf: 0 };
+          frameTypes = { mib: 0, sib: 0, paging: 0, rar: 0, dl_data: 0, ul_data: 0 };
+          pcapFrames = 0;
           rateSamples = [];
           cell = null;
           hello = null;
@@ -328,7 +366,7 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
   if (
     sfAppended === 0 && dciAppended === 0 && logsAppended === 0 && identitiesAppended === 0 &&
     !addedRntis && cell === s.cell && hello === s.hello && mib === s.mib && stats === s.stats &&
-    lifecycle === s.lifecycle
+    lifecycle === s.lifecycle && frameTypes === s.frameTypes && pcapFrames === s.pcapFrames
   ) {
     return s;
   }
@@ -339,7 +377,7 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
     latestSf, sfHistory,
     rntis: rntis ?? s.rntis,
     identities, logs, recentDci,
-    totals, rateSamples,
+    totals, frameTypes, pcapFrames, rateSamples,
     lifecycle, pid, argv,
     monotonic,
     startedAt: s.startedAt,

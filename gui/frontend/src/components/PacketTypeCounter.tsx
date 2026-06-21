@@ -19,6 +19,35 @@ const DEFAULTS = [
 
 const LS_KEY = "ltesniffer-packet-types";
 
+// MAC-level frame types decoded from the per-subframe `sf` stream (classified
+// by RNTI) plus MIB. These are always-present built-ins — they're radio-layer
+// frame types, not NAS/RRC messages, so they can't be removed from the table.
+const MAC_TYPES: { key: keyof AppFrameTypes; label: string }[] = [
+  { key: "mib", label: "MIB" },
+  { key: "sib", label: "SIB (system information)" },
+  { key: "paging", label: "Paging" },
+  { key: "rar", label: "RAR (random access)" },
+  { key: "dl_data", label: "DL data (C-RNTI)" },
+  { key: "ul_data", label: "UL data (C-RNTI)" },
+];
+
+// Local alias so the keys above are type-checked against the store shape.
+type AppFrameTypes = {
+  mib: number; sib: number; paging: number; rar: number; dl_data: number; ul_data: number;
+};
+
+type SortDir = "desc" | "asc";
+
+interface Row {
+  /** Display label */
+  name: string;
+  count: number;
+  /** Built-in MAC frame types can't be removed; NAS/RRC custom types can. */
+  builtin: boolean;
+  /** Removal key for custom types (the tracked `from` string). */
+  removeKey?: string;
+}
+
 function loadTypes(): string[] {
   try {
     const s = localStorage.getItem(LS_KEY);
@@ -33,13 +62,15 @@ function saveTypes(types: string[]) {
 
 export function PacketTypeCounter() {
   const identities = useStore((s) => s.identities);
+  const frameTypes = useStore((s) => s.frameTypes);
   const [types, setTypes] = useState<string[]>(loadTypes);
   const [input, setInput] = useState("");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
 
   useEffect(() => { saveTypes(types); }, [types]);
 
-  // Count occurrences of each tracked type from identity `from` field.
-  // Also track all unseen types observed at runtime so user can discover them.
+  // Count occurrences of each tracked NAS/RRC type from the identity `from`
+  // field. Also track all unseen types observed at runtime for discovery.
   const { counts, observed } = useMemo(() => {
     const counts = new Map<string, number>();
     const observed = new Set<string>();
@@ -57,6 +88,34 @@ export function PacketTypeCounter() {
     [observed, types],
   );
 
+  // Merge always-present MAC frame types (from the `sf`/`mib` stream) with the
+  // tracked NAS/RRC message types (from `identity` events) into one table,
+  // then sort by count in the chosen direction. MAC built-ins sort first only
+  // by their count like everything else — a stable secondary order keeps the
+  // table from jittering when counts tie.
+  const rows = useMemo<Row[]>(() => {
+    const macRows: Row[] = MAC_TYPES.map((m) => ({
+      name: m.label,
+      count: frameTypes[m.key] ?? 0,
+      builtin: true,
+    }));
+    const nasRows: Row[] = types.map((t) => ({
+      name: t,
+      count: counts.get(t) ?? 0,
+      builtin: false,
+      removeKey: t,
+    }));
+    const all = [...macRows, ...nasRows];
+    const dir = sortDir === "desc" ? -1 : 1;
+    all.sort((a, b) => {
+      if (a.count !== b.count) return dir * (a.count - b.count);
+      // Tie-break: built-ins before custom, then alphabetical — stable & readable.
+      if (a.builtin !== b.builtin) return a.builtin ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return all;
+  }, [frameTypes, types, counts, sortDir]);
+
   function remove(t: string) {
     setTypes((prev) => prev.filter((x) => x !== t));
   }
@@ -72,15 +131,17 @@ export function PacketTypeCounter() {
     setInput("");
   }
 
-  const totalTracked = types.reduce((s, t) => s + (counts.get(t) ?? 0), 0);
+  // Total counts only the tracked NAS/RRC message types — the MAC built-ins
+  // (esp. MIB/SIB at broadcast rates) would otherwise dominate and obscure it.
+  const total = rows.reduce((s, r) => (r.builtin ? s : s + r.count), 0);
 
   return (
     <div className="panel p-3 flex flex-col min-h-0" style={{ maxHeight: "280px" }}>
       <div className="flex items-center gap-2 mb-2 flex-wrap">
         <span className="label flex-1">
           Packet type counters
-          {totalTracked > 0 && (
-            <span className="ml-2 text-ok font-mono text-xs">{totalTracked.toLocaleString()} total</span>
+          {total > 0 && (
+            <span className="ml-2 text-ok font-mono text-xs">{total.toLocaleString()} total</span>
           )}
         </span>
         <div className="flex gap-1">
@@ -105,36 +166,39 @@ export function PacketTypeCounter() {
           <thead className="sticky top-0 bg-bg text-[10px] uppercase tracking-wide text-muted">
             <tr className="border-b border-border">
               <th className="px-2 py-1.5 text-left">Message type</th>
-              <th className="px-2 py-1.5 text-right">Count</th>
+              <th
+                className="px-2 py-1.5 text-right cursor-pointer select-none hover:text-slate-200"
+                onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}
+                title="Sort by count"
+              >
+                Count <span className="text-[8px]">{sortDir === "desc" ? "▼" : "▲"}</span>
+              </th>
               <th className="px-2 py-1.5 w-8"></th>
             </tr>
           </thead>
           <tbody>
-            {types.map((t) => {
-              const n = counts.get(t) ?? 0;
-              return (
-                <tr key={t} className="border-b border-border/30 hover:bg-panel/50">
-                  <td className="px-2 py-1 text-slate-100">{t}</td>
-                  <td className={`px-2 py-1 text-right font-semibold tabular-nums ${n > 0 ? "text-ok" : "text-muted"}`}>
-                    {n > 0 ? n.toLocaleString() : "—"}
-                  </td>
-                  <td className="px-2 py-1 text-center">
+            {rows.map((r) => (
+              <tr key={(r.builtin ? "mac:" : "nas:") + r.name} className="border-b border-border/30 hover:bg-panel/50">
+                <td className="px-2 py-1 text-slate-100">
+                  {r.name}
+                  {r.builtin && <span className="ml-1.5 text-[9px] uppercase text-muted">MAC</span>}
+                </td>
+                <td className={`px-2 py-1 text-right font-semibold tabular-nums ${r.count > 0 ? "text-ok" : "text-muted"}`}>
+                  {r.count > 0 ? r.count.toLocaleString() : "—"}
+                </td>
+                <td className="px-2 py-1 text-center">
+                  {r.builtin ? (
+                    <span className="text-muted/40 leading-none" title="Built-in MAC frame type">·</span>
+                  ) : (
                     <button
                       className="text-muted hover:text-bad transition-colors leading-none"
-                      onClick={() => remove(t)}
+                      onClick={() => remove(r.removeKey!)}
                       title="Remove from table"
                     >×</button>
-                  </td>
-                </tr>
-              );
-            })}
-            {types.length === 0 && (
-              <tr>
-                <td colSpan={3} className="text-center text-muted py-4">
-                  No types tracked — type a message name above and press +
+                  )}
                 </td>
               </tr>
-            )}
+            ))}
           </tbody>
         </table>
       </div>

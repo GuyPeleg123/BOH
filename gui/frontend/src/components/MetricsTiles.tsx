@@ -63,6 +63,10 @@ export function MetricsTiles() {
       totals: state.totals,
       bytes_s: rates.tbs / 8,
       elapsedSec,
+      // Authoritative MAC frame count of the final pcap (backend counts the
+      // file on disk every ~2 s). Distinct from totals.dci, which overcounts:
+      // grants can be decoded but fail PDSCH and never get written.
+      pcapFrames: state.pcapFrames,
       health: (() => {
         const s = state.stats;
         if (!s) return null;
@@ -75,7 +79,7 @@ export function MetricsTiles() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
 
-  const { totals, health, bytes_s, elapsedSec } = snap;
+  const { totals, health, bytes_s, elapsedSec, pcapFrames } = snap;
 
   function fmtElapsed(sec: number): string {
     const h = Math.floor(sec / 3600);
@@ -108,6 +112,12 @@ export function MetricsTiles() {
         value={health ? `${health.pct.toFixed(1)} %` : "—"}
         sub={health ? `${health.processed.toLocaleString()} ok · ${health.skipped.toLocaleString()} skipped` : "no stats yet"}
         accent={healthAccent}
+      />
+      <Tile
+        label="Frames"
+        value={pcapFrames.toLocaleString()}
+        sub="MAC frames in pcap (live)"
+        accent={pcapFrames > 0 ? "ok" : undefined}
       />
     </div>
   );

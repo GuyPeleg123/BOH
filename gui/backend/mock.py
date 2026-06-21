@@ -146,6 +146,10 @@ class MockRunner:
             sf_skipped = 0
             rb_dl_tot = 0
             rb_ul_tot = 0
+            # Synthetic "frames written to the final pcap" — grows with the run.
+            # Mirrors the real SnifferRunner `frames` event (which counts the
+            # live pcap on disk every ~2 s) so mock mode exercises the tile.
+            mac_frames = 0
 
             while True:
                 sf += 1
@@ -195,6 +199,12 @@ class MockRunner:
                     "pwr_min": round(min(pwr), 2), "pwr_max": round(max(pwr), 2),
                 })
                 sf_processed += 1
+                # Each decoded grant that "lands" becomes one MAC frame in the
+                # pcap. Drop ~20% to mimic grants that fail PDSCH and are never
+                # written (so frames < total DCIs, as on real cells).
+                for _ in dl_dcis + ul_dcis:
+                    if random.random() < 0.8:
+                        mac_frames += 1
 
                 # Periodic stats
                 if sf_processed % 100 == 0:
@@ -204,6 +214,10 @@ class MockRunner:
                         "nof_rnti": len(rntis), "rb_dl_total": rb_dl_tot,
                         "rb_ul_total": rb_ul_tot, "cfo_hz": round(random.gauss(-100, 30), 1),
                     })
+
+                # Periodic live frame count (~every 2 s of mock time at 50 sf/s).
+                if sf_processed % 100 == 0:
+                    self._broadcast({"t": "frames", "ts": ts(), "count": mac_frames})
 
                 # Rare identity discovery
                 if cfg.api_mode in (1, 3) and random.random() < 0.002:
