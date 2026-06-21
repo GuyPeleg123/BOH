@@ -546,7 +546,11 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
         for rnti in rntis:
             ident = idmap.get(rnti)
             label = _safe_label(ident) if ident else f"rnti-{rnti:04x}"
-            sub = folder / f"ue_{label}.pcap"
+            # Append the original-capture packet index range, e.g.
+            # ue_rnti-1a2b_packets_2034-2042.pcap.
+            _n, _lo, _hi = _frame_range(full, [], f"mac-lte.rnti=={rnti}")
+            rng = f"_packets_{_lo}-{_hi}" if _n > 0 else ""
+            sub = folder / f"ue_{label}{rng}.pcap"
             subprocess.run(["tshark", "-r", str(full), "-Y", f"mac-lte.rnti=={rnti}", "-w", str(sub)],
                            capture_output=True, text=True, timeout=180)
             ue = {"rnti": rnti, "rnti_hex": f"0x{rnti:04X}", "identity": ident,
@@ -806,6 +810,21 @@ def _count_pcap(p: Path) -> int:
     return len([x for x in out.stdout.splitlines() if x.strip()])
 
 
+def _frame_range(p: Path, oargs: list, filt: str):
+    """Original-capture packet indices matching `filt` in `p`. `p` is the
+    byte-identical <stem>_full.pcap, so its frame numbers are the same indices
+    as the original dual-sniff capture. Returns (count, first, last); tshark
+    emits frame.number in capture order so first<=last. (oargs must match the
+    write so content-based filters like lte_rrc resolve identically.)"""
+    out = subprocess.run(["tshark", "-r", str(p), *oargs, "-Y", filt,
+                          "-T", "fields", "-e", "frame.number"],
+                         capture_output=True, text=True, timeout=180)
+    nums = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+    if not nums:
+        return (0, None, None)
+    return (len(nums), nums[0], nums[-1])
+
+
 def _split_partition(full: Path, parent: Path, dims: list[str], depth: int, acc: str,
                      ctx: dict, oargs: list[str], res: dict, budget: list[int]) -> None:
     last = depth == len(dims) - 1
@@ -814,16 +833,17 @@ def _split_partition(full: Path, parent: Path, dims: list[str], depth: int, acc:
             return
         combined = filt if not acc else f"({acc}) and ({filt})"
         if last:
-            out = parent / f"{_safe_label(label)}.pcap"
-            subprocess.run(["tshark", "-r", str(full), *oargs, "-Y", combined, "-w", str(out)],
-                           capture_output=True, text=True, timeout=300)
-            n = _count_pcap(out)
+            # Original-capture packet index range for this bucket (frame numbers
+            # in <stem>_full.pcap == indices in the original dual-sniff pcap),
+            # appended to the filename, e.g. rnti-1a2b_packets_2034-2042.pcap.
+            n, lo, hi = _frame_range(full, oargs, combined)
             if n > 0:
-                res["files"].append({"path": str(out), "frames": n, "filter": combined})
+                out = parent / f"{_safe_label(label)}_packets_{lo}-{hi}.pcap"
+                subprocess.run(["tshark", "-r", str(full), *oargs, "-Y", combined, "-w", str(out)],
+                               capture_output=True, text=True, timeout=300)
+                res["files"].append({"path": str(out), "frames": n, "filter": combined,
+                                     "pkt_first": lo, "pkt_last": hi})
                 budget[0] -= 1
-            else:
-                try: out.unlink()
-                except OSError: pass
         else:
             sub = parent / _safe_label(label)
             sub.mkdir(exist_ok=True)
