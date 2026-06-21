@@ -283,16 +283,18 @@ export function KeysPage() {
               {draft.mode === "kenb" ? (
                 <label className="block">
                   <div className="label mb-1">K_eNB <span className="text-muted normal-case">(64 hex chars)</span></div>
-                  <input className="input font-mono" placeholder="aabb…" value={draft.kenb}
-                         onChange={(e) => set("kenb", e.target.value.trim())} />
+                  <textarea className="input font-mono break-all leading-snug resize-y" rows={2}
+                            placeholder="aabb…" value={draft.kenb}
+                            onChange={(e) => set("kenb", e.target.value.replace(/\s+/g, ""))} />
                   <div className="text-[10px] text-muted mt-0.5">{draft.kenb.length}/64</div>
                 </label>
               ) : (
                 <>
                   <label className="block">
                     <div className="label mb-1">KASME <span className="text-muted normal-case">(64 hex chars)</span></div>
-                    <input className="input font-mono" placeholder="aabb…" value={draft.kasme}
-                           onChange={(e) => set("kasme", e.target.value.trim())} />
+                    <textarea className="input font-mono break-all leading-snug resize-y" rows={2}
+                              placeholder="aabb…" value={draft.kasme}
+                              onChange={(e) => set("kasme", e.target.value.replace(/\s+/g, ""))} />
                     <div className="text-[10px] text-muted mt-0.5">{draft.kasme.length}/64</div>
                   </label>
                   <label className="block mt-2">

@@ -350,8 +350,8 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                 <Fragment key={i}>
                   <tr className="border-b border-border/30">
                     <td className="px-1 py-1"><input className="input !text-xs !w-24 font-mono" placeholder="0x4A01" value={e.rnti} onChange={(ev) => update(i, { rnti: ev.target.value })} /></td>
-                    <td className="px-1 py-1"><input className="input !text-xs font-mono" placeholder="32 hex chars" value={e.rrcenc_key} onChange={(ev) => update(i, { rrcenc_key: ev.target.value })} /></td>
-                    <td className="px-1 py-1"><input className="input !text-xs font-mono" placeholder="32 hex chars" value={e.upenc_key} onChange={(ev) => update(i, { upenc_key: ev.target.value })} /></td>
+                    <td className="px-1 py-1"><input className="input !text-xs font-mono !min-w-[17rem]" placeholder="32 hex chars" value={e.rrcenc_key} onChange={(ev) => update(i, { rrcenc_key: ev.target.value.replace(/\s+/g, "") })} /></td>
+                    <td className="px-1 py-1"><input className="input !text-xs font-mono !min-w-[17rem]" placeholder="32 hex chars" value={e.upenc_key} onChange={(ev) => update(i, { upenc_key: ev.target.value.replace(/\s+/g, "") })} /></td>
                     <td className="px-1 py-1"><select className="input !text-xs !w-auto" value={e.cipher_algo} onChange={(ev) => update(i, { cipher_algo: ev.target.value })}>{CIPHERS.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
                     <td className="px-1 py-1"><select className="input !text-xs !w-auto" value={e.integ_algo} onChange={(ev) => update(i, { integ_algo: ev.target.value })}>{INTEGS.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
                     <td className="px-1 py-1 text-right whitespace-nowrap">
@@ -365,7 +365,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                       <td colSpan={5} className="px-1 pb-2">
                         <div className="flex flex-wrap items-end gap-2">
                           <label className="flex flex-col text-[10px] text-muted">K_ASME (64 hex)
-                            <input className="input !text-xs font-mono !w-[34rem] max-w-full" placeholder="64 hex chars" value={e.kasme} onChange={(ev) => update(i, { kasme: ev.target.value })} />
+                            <input className="input !text-xs font-mono !w-[34rem] max-w-full break-all" placeholder="64 hex chars" value={e.kasme} onChange={(ev) => update(i, { kasme: ev.target.value.replace(/\s+/g, "") })} />
                           </label>
                           <label className="flex flex-col text-[10px] text-muted">NAS UL count <span className="text-muted/70">(or range 120-321)</span>
                             <input className="input !text-xs font-mono !w-36" placeholder="0  or  120-321" value={e.nas_count} onChange={(ev) => update(i, { nas_count: ev.target.value })} />
