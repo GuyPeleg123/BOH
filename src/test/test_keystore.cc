@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "srsran/srslog/srslog.h"
+#include "srsran/common/security.h"
 #include "include/KeyAttaching.h"
 #include "include/Sniffer_dependency.h"
 
@@ -471,6 +472,74 @@ static void test_kasme_different_nas_count_differs()
     printf("  [PASS] kasme path: different nas_count values both load correctly\n");
 }
 
+// ── Cipher known-answer tests (EEA1 / EEA2) ──────────────────────────────────
+//
+// The KeyStore decrypt path passes a BYTE length to security_128_eea1/2/3
+// (KeyAttaching.cc cipher_block() → security_128_eeaX(..., ct_len, ...)), and
+// those wrappers internally multiply by 8 to get the bit length. So the cipher
+// is only ever exercised on byte-aligned payloads.
+//
+// The previous test suite only used EEA0 (memcpy plumbing), so a regression in
+// the real EEA1/EEA2 keystream would have gone undetected. These known-answer
+// tests pin the exact cipher path the decrypter relies on.
+//
+// Vectors: 3GPP TS 33.401 Annex C.1 (EEA2) / C.3 (EEA1), test set 1, taken in
+// the byte-aligned 256-bit (32-byte) form so the byte-length API matches the
+// reference. These expected ciphertexts are exactly srsRAN's own passing
+// vectors in build/srsRAN-src/lib/test/common/test_eea{1,2}.cc
+// (test_set_1_block_size for both EEA1 and EEA2 — the byte-length API encrypts 256 bits).
+
+static void test_eea1_known_answer()
+{
+    uint8_t key[16] = {0xd3,0xc5,0xd5,0x92,0x32,0x7f,0xb1,0x1c,
+                       0x40,0x35,0xc6,0x68,0x0a,0xf8,0xc6,0xd1};
+    uint32_t count     = 0x398a59b4;
+    uint8_t  bearer    = 0x15;
+    uint8_t  direction = 1;
+    uint8_t  msg[32] = {0x98,0x1b,0xa6,0x82,0x4c,0x1b,0xfb,0x1a,
+                        0xb4,0x85,0x47,0x20,0x29,0xb7,0x1d,0x80,
+                        0x8c,0xe3,0x3e,0x2c,0xc3,0xc0,0xb5,0xfc,
+                        0x1f,0x3d,0xe8,0xa6,0xdc,0x66,0xb1,0xf0};
+    uint8_t  expect[32] = {0x5d,0x5b,0xfe,0x75,0xeb,0x04,0xf6,0x8c,
+                           0xe0,0xa1,0x23,0x77,0xea,0x00,0xb3,0x7d,
+                           0x47,0xc6,0xa0,0xba,0x06,0x30,0x91,0x55,
+                           0x08,0x6a,0x85,0x9c,0x43,0x41,0xb3,0x7c};
+    uint8_t out[32] = {};
+    CHECK(srsran::security_128_eea1(key, count, bearer, direction, msg, 32, out) == 0);
+    CHECK(memcmp(out, expect, 32) == 0);
+
+    // Stream cipher → re-applying keystream recovers plaintext.
+    uint8_t back[32] = {};
+    CHECK(srsran::security_128_eea1(key, count, bearer, direction, out, 32, back) == 0);
+    CHECK(memcmp(back, msg, 32) == 0);
+    printf("  [PASS] cipher: EEA1 known-answer (33.401 C.3 set1, byte-aligned)\n");
+}
+
+static void test_eea2_known_answer()
+{
+    uint8_t key[16] = {0xd3,0xc5,0xd5,0x92,0x32,0x7f,0xb1,0x1c,
+                       0x40,0x35,0xc6,0x68,0x0a,0xf8,0xc6,0xd1};
+    uint32_t count     = 0x398a59b4;
+    uint8_t  bearer    = 0x15;
+    uint8_t  direction = 1;
+    uint8_t  msg[32] = {0x98,0x1b,0xa6,0x82,0x4c,0x1b,0xfb,0x1a,
+                        0xb4,0x85,0x47,0x20,0x29,0xb7,0x1d,0x80,
+                        0x8c,0xe3,0x3e,0x2c,0xc3,0xc0,0xb5,0xfc,
+                        0x1f,0x3d,0xe8,0xa6,0xdc,0x66,0xb1,0xf0};
+    uint8_t  expect[32] = {0xe9,0xfe,0xd8,0xa6,0x3d,0x15,0x53,0x04,
+                           0xd7,0x1d,0xf2,0x0b,0xf3,0xe8,0x22,0x14,
+                           0xb2,0x0e,0xd7,0xda,0xd2,0xf2,0x33,0xdc,
+                           0x3c,0x22,0xd7,0xbd,0xee,0xed,0x8e,0x78};
+    uint8_t out[32] = {};
+    CHECK(srsran::security_128_eea2(key, count, bearer, direction, msg, 32, out) == 0);
+    CHECK(memcmp(out, expect, 32) == 0);
+
+    uint8_t back[32] = {};
+    CHECK(srsran::security_128_eea2(key, count, bearer, direction, out, 32, back) == 0);
+    CHECK(memcmp(back, msg, 32) == 0);
+    printf("  [PASS] cipher: EEA2 known-answer (33.401 C.1 set1, byte-aligned)\n");
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 int main()
@@ -481,6 +550,10 @@ int main()
     printf("--- Guard conditions ---\n");
     test_guard_unknown_rnti();
     test_guard_security_not_active();
+
+    printf("\n--- Cipher known-answer tests (EEA1/EEA2) ---\n");
+    test_eea1_known_answer();
+    test_eea2_known_answer();
 
     printf("\n--- Issue #3: pre-set cipher/integ algorithm ---\n");
     test_preset_algo_activates_at_load();
