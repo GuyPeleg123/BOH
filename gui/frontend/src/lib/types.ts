@@ -154,6 +154,51 @@ export interface SplitResponse {
   files: SplitFile[];
 }
 
+export interface SessionIdentity {
+  label: string;
+  confidence: "imsi" | "guti" | "tmsi" | "rnti-only" | string;
+  m_tmsi: string | null;
+  mmec: string | null;
+  s_tmsi: string | null;
+  guti: string | null;
+  imsi: string | null;
+  plmn: string | null;
+  source: string | null;
+}
+export interface SessionTaSample { t: number; range_m: number | null; delta_m?: number; src: string; }
+export interface SessionTa {
+  anchor_ta: number | null;
+  anchor_range_m: number | null;
+  has_absolute: boolean;
+  n_samples: number;
+  samples: SessionTaSample[];
+  min_range_m: number | null;
+  median_range_m: number | null;
+  max_range_m: number | null;
+}
+export interface UeSession {
+  session_id: string;
+  c_rnti: number;
+  c_rnti_hex: string;
+  start: number;
+  end: number;
+  duration_s: number;
+  dl_frames: number;
+  ul_frames: number;
+  frames: number;
+  identity: SessionIdentity;
+  ta: SessionTa;
+}
+export interface SessionsResponse {
+  ok: boolean;
+  error: string | null;
+  note: string | null;
+  source: string | null;
+  sessions: UeSession[];
+  unmatched_rar: number;
+  paging: Array<{ t: number; m_tmsi: string; imsi: string }>;
+}
+
 export interface BruteforceResponse {
   ok: boolean;
   found: boolean;

@@ -721,6 +721,25 @@ async def bruteforce_nas(body: _BruteforceBody) -> dict[str, Any]:
     )
 
 
+class _SessionsBody(BaseModel):
+    path: str | None = None                  # None → latest/active capture
+    entries: list[_DecryptEntryBody] = []
+    decrypt: bool = False
+
+
+@app.post("/api/sessions")
+async def analyze_sessions(body: _SessionsBody) -> dict[str, Any]:
+    """Correlate UE sessions: RNTI ↔ identity (M-TMSI/S-TMSI/GUTI/IMSI) ↔ TA
+    range, so a TA distance can be attributed to a specific UE. Post-capture
+    (tshark); off the event loop; failures return ok=False."""
+    import sessions as sessions_mod
+    cfg = config_mod.load()
+    entries = [e.model_dump() for e in body.entries]
+    return await asyncio.to_thread(
+        sessions_mod.analyze_sessions, cfg, body.path, entries, body.decrypt
+    )
+
+
 @app.get("/api/captures/split-dims")
 async def split_dims() -> dict[str, Any]:
     """Catalog of available split dimensions for the GUI."""

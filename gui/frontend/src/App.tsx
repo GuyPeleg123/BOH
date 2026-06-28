@@ -10,6 +10,7 @@ import { LoginPage } from "./pages/Login";
 import { CapturesPage } from "./pages/CapturesPage";
 import { LogHistoryPage } from "./pages/LogHistoryPage";
 import { UEsPage } from "./pages/UEsPage";
+import { SessionsPage } from "./pages/SessionsPage";
 import { api, setAuthLostHandler } from "./lib/api";
 
 type AuthState =
@@ -65,6 +66,7 @@ export default function App() {
           <Routes>
             <Route path="/"            element={<Dashboard />} />
             <Route path="/ues"         element={<UEsPage />} />
+            <Route path="/sessions"    element={<SessionsPage />} />
             <Route path="/config"      element={<ConfigPage />} />
             <Route path="/keys"        element={<KeysPage />} />
             <Route path="/captures"    element={<CapturesPage />} />
