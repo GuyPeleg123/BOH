@@ -45,6 +45,20 @@ def _first(s: str) -> str:
     return ""
 
 
+def _norm_mtmsi(v: str, decimal: bool) -> str:
+    """Normalize M-TMSI to 8-hex lowercase. lte-rrc.m_TMSI renders as hex,
+    nas_eps.emm.m_tmsi as decimal — unify so the same UE reads identically
+    regardless of which source it came from."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    try:
+        n = int(v, 10) if decimal else int(v, 16)
+    except ValueError:
+        return v.lower()
+    return f"{n & 0xFFFFFFFF:08x}"
+
+
 def _latest_pcap(cfg: SnifferConfig) -> str | None:
     pcaps = C.list_pcaps(cfg)
     for p in pcaps:                              # already sorted newest-first
@@ -132,7 +146,12 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                                    "nas_eps.emm.m_tmsi"]):
             r = (r + [""] * 7)[:7]
             t, rnti_s, rtype, mtmsi, mmec, imsi, nas_mtmsi = r
-            mtmsi = _first(mtmsi) or _first(nas_mtmsi)
+            # lte-rrc.m_TMSI is hex; nas_eps.emm.m_tmsi is decimal — normalize both,
+            # and record which layer the value actually came from.
+            rrc_m = _norm_mtmsi(_first(mtmsi), decimal=False)
+            nas_m = _norm_mtmsi(_first(nas_mtmsi), decimal=True)
+            mtmsi = rrc_m or nas_m
+            src = "rrc-connreq" if rrc_m else "nas" if nas_m else None
             imsi = _first(imsi); mmec = _first(mmec)
             if rtype == "3" and rnti_s:           # bound to a session's C-RNTI
                 s = sess.get(int(rnti_s))
@@ -142,7 +161,10 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                 if mtmsi: idd["m_tmsi"] = mtmsi
                 if mmec: idd["mmec"] = mmec
                 if imsi: idd["imsi"] = imsi
-                idd.setdefault("source", "rrc-connreq" if mtmsi else "nas" if imsi else "rrc")
+                if src and "source" not in idd:
+                    idd["source"] = src
+                elif imsi and "source" not in idd:
+                    idd["source"] = "nas"
             else:                                  # paging / broadcast identity pool
                 if mtmsi or imsi:
                     res["paging"].append({"t": _f(t), "m_tmsi": mtmsi, "imsi": imsi})
