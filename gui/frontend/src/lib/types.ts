@@ -79,6 +79,7 @@ export interface SnifferConfig {
   rf_args: string;
   usrp_a_args: string;
   usrp_b_args: string;
+  clock_source: string;
   decimate: number;
   cpu_affinity: number;
   sniffer_mode: number;

@@ -37,11 +37,13 @@ class SnifferConfig(BaseModel):
     usrp_a_args: str = Field("", description="Override USRP A rfargs (dual mode). -X")
     usrp_b_args: str = Field("", description="Override USRP B rfargs (dual mode). -Z")
     clock_source: str = Field(
-        "gpsdo",
+        "internal",
         description=(
-            "Clock/time reference forced into -X/-Z for UL/dual mode (e.g. 'gpsdo'). "
-            "UL sniffing needs both USRPs on a shared GPSDO time base; this is injected "
-            "automatically so the launcher can't drop it. Set '' to disable."
+            "RX clock + time reference, injected as clock=<source> into the device "
+            "args (-a/-X/-Z). 'internal' = onboard oscillator; 'gpsdo' = onboard GPSDO "
+            "(10 MHz + 1 PPS from GPS); 'external' = REF IN (10 MHz) + PPS IN (1 PPS) "
+            "shared reference. Authoritative — overrides any embedded clock=. "
+            "'' disables injection."
         ),
     )
     decimate: int = Field(0, description="Decimation factor. -Y")
@@ -63,6 +65,14 @@ class SnifferConfig(BaseModel):
         if v in VALID_PRB:
             return v
         return min(VALID_PRB, key=lambda p: abs(p - v))
+
+    @field_validator("clock_source")
+    @classmethod
+    def _norm_clock_source(cls, v: str) -> str:
+        # Constrain to the known UHD sources so a typo can't silently produce a
+        # bad clock= arg. Anything unrecognised falls back to the safe default.
+        v = (v or "").strip().lower()
+        return v if v in ("", "internal", "gpsdo", "external") else "internal"
 
     # --- Decoder tuning ---
     nof_sniffer_thread: int = Field(4, ge=2, description="Number of worker threads. -W")
@@ -133,21 +143,21 @@ class SnifferConfig(BaseModel):
             argv += ["-g", str(self.rf_gain)]
         if self.rf_nof_rx_ant != 1:
             argv += ["-A", str(self.rf_nof_rx_ant)]
-        if self.rf_args:
-            argv += ["-a", self.rf_args]
-        # Force the shared clock/time reference into the dual-USRP rfargs for
-        # UL/dual mode. The frontend used to add `clock=gpsdo` only in transient
-        # state and it was routinely lost before launch, silently breaking UL
-        # sync. Injecting it here makes it impossible to drop.
+        # clock_source is the single source of truth for the RX clock + time
+        # reference (the GUI dropdown). Inject it as clock=<source> into every
+        # device-args string (-a/-X/-Z), stripping any embedded clock= so the
+        # dropdown always wins — the args string used to bury clock= where it
+        # went stale or got dropped, silently breaking UL sync. internal =
+        # onboard; gpsdo = onboard GPSDO; external = REF IN + PPS IN (shared ref).
         def _with_clock(rfargs: str) -> str:
-            if not rfargs or not self.clock_source:
-                return rfargs
-            if "clock=" in rfargs:
-                return rfargs
-            if self.sniffer_mode not in (1, 2):  # only UL / dual need GPSDO sync
-                return rfargs
-            return f"clock={self.clock_source}," + rfargs
+            toks = [t for t in (rfargs or "").split(",")
+                    if t.strip() and not t.strip().startswith("clock=")]
+            if self.clock_source:
+                toks = [f"clock={self.clock_source}", *toks]
+            return ",".join(toks)
 
+        if self.rf_args:
+            argv += ["-a", _with_clock(self.rf_args)]
         if self.usrp_a_args:
             argv += ["-X", _with_clock(self.usrp_a_args)]
         if self.usrp_b_args:
