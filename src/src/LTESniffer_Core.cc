@@ -37,6 +37,27 @@ cf_t  uhd_dummy_buffer2[LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE];
 cf_t  uhd_dummy_buffer3[LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE];
 cf_t* uhd_dummy_buffer[4] = {uhd_dummy_buffer0, uhd_dummy_buffer1, uhd_dummy_buffer2, uhd_dummy_buffer3}; //dummy buffer to offset data
 bool  align_usrp = true;
+
+// RF error visibility: UHD Rx overflows/lates were silently swallowed (no handler
+// was ever registered), hiding the real cause of the -A 2 decode collapse. Count
+// and rate-limit-print them so streaming health is observable.
+static std::atomic<unsigned long> rf_overflow_a{0}, rf_overflow_b{0};
+static void lte_rf_error_handler(void* arg, srsran_rf_error_t error) {
+  const char* which = static_cast<const char*>(arg);
+  std::atomic<unsigned long>& ctr = (which && which[0] == 'B') ? rf_overflow_b : rf_overflow_a;
+  const char* kind = nullptr;
+  switch (error.type) {
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_OVERFLOW:  kind = "OVERFLOW";  break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_LATE:      kind = "LATE";      break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_UNDERFLOW: kind = "UNDERFLOW"; break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_RX:        kind = "RX-ERROR";  break;
+    default: return;
+  }
+  unsigned long n = ++ctr;
+  if (n == 1 || n % 50 == 0) {
+    fprintf(stderr, "[RF %s] %s (count=%lu)\n", which ? which : "?", kind, n);
+  }
+}
 std::atomic<bool> uhd_stop(false);// std::atomic<bool> uhd_stop(false);
 std::mutex mtx_a;
 std::mutex mtx_b;
@@ -208,23 +229,30 @@ bool LTESniffer_Core::run(){
      *      num_recv_frames / recv_frame_size kept for throughput.
      * The old hardcoded serials (32FCD4C / 3367EF9) are gone; pass -X/-Z
      * if you need to pin specific serials for dual-USRP operation.        */
+    // Throughput/buffering args: absorb host-scheduling jitter under the doubled
+    // -A 2 dual-radio load. Previously only the -a/auto branch set these; the
+    // explicit-serial -X/-Z path (used by dual mode) opened with UHD DEFAULT
+    // buffering and silently overflowed mid-subframe, stitching discontinuous IQ
+    // into antenna-0's buffer -> PSS autocorrelation collapsed -> ue_sync stuck
+    // in FIND -> 0 DL decode at -A 2. recv_frame_size=16360 = B210 USB3 max xfer.
+    const std::string tput = ",num_recv_frames=512,recv_frame_size=8000";
     std::string rf_a_string;
     if (!args.usrp_a_args.empty()) {
-      rf_a_string = args.usrp_a_args;
+      rf_a_string = args.usrp_a_args + tput;
     } else if (!args.rf_args.empty()) {
-      rf_a_string = args.rf_args + ",num_recv_frames=512,recv_frame_size=8000";
+      rf_a_string = args.rf_args + tput;
     } else {
       // Auto-detect: blank args → UHD opens the first enumerated device
-      rf_a_string = "num_recv_frames=512,recv_frame_size=8000";
+      rf_a_string = tput.substr(1);  // drop leading comma
     }
 
     /* ---------- Build rf_b args (UL/DUAL only) ---------- */
     std::string rf_b_string;
     if (!args.usrp_b_args.empty()) {
-      rf_b_string = args.usrp_b_args;
+      rf_b_string = args.usrp_b_args + tput;
     } else {
       // Auto-detect second USRP; caller must pass -Z if two identical models
-      rf_b_string = "clock=gpsdo,num_recv_frames=512,recv_frame_size=8000";
+      rf_b_string = "clock=gpsdo" + tput;
     }
 
     /*The following strings are for USRP X310 for specific application*/
@@ -249,25 +277,43 @@ bool LTESniffer_Core::run(){
       rf_b_open = true;  // class member
     }
 
-    /* Set receiver gain */
+    // Make UHD Rx overflow/late visible (previously swallowed silently).
+    srsran_rf_register_error_handler(&rf_a, lte_rf_error_handler, (void*)"A");
+    if (rf_b_open) srsran_rf_register_error_handler(&rf_b, lte_rf_error_handler, (void*)"B");
+
+    /* Set receiver gain.
+     * rf_a (DL) keeps the original behaviour: fixed if -g>0 else AGC.
+     * rf_b (UL) is independent: -G <dB> pins a FIXED UL gain (bursty UL decodes
+     * better with a fixed high gain than with AGC riding the noise floor); if
+     * -G unset it follows -g / AGC exactly as before. UL SNR is the yield
+     * limiter, so raising it via a dedicated UL gain is the primary lever. */
+    // --- rf_a (DL) ---
     if (args.rf_gain > 0) {
       srsran_rf_set_rx_gain(&rf_a, args.rf_gain);
-      if (rf_b_open) srsran_rf_set_rx_gain(&rf_b, args.rf_gain);
     } else {
-      printf("Starting AGC thread...\n");
+      printf("Starting AGC thread (rf_a/DL)...\n");
       if (srsran_rf_start_gain_thread(&rf_a, false)) {
         ERROR("Error opening rf_a");
         exit(-1);
       }
-      if (rf_b_open) {
+      srsran_rf_set_rx_gain(&rf_a, srsran_rf_get_rx_gain(&rf_a));
+      cell_detect_config.init_agc = srsran_rf_get_rx_gain(&rf_a);
+    }
+    // --- rf_b (UL) ---
+    if (rf_b_open) {
+      if (args.ul_rf_gain >= 0) {
+        srsran_rf_set_rx_gain(&rf_b, args.ul_rf_gain);
+        printf("UL (rf_b) FIXED gain = %.1f dB (-G)\n", args.ul_rf_gain);
+      } else if (args.rf_gain > 0) {
+        srsran_rf_set_rx_gain(&rf_b, args.rf_gain);
+      } else {
+        printf("Starting AGC thread (rf_b/UL)...\n");
         if (srsran_rf_start_gain_thread(&rf_b, false)) {
           ERROR("Error opening rf_b");
           exit(-1);
         }
         srsran_rf_set_rx_gain(&rf_b, srsran_rf_get_rx_gain(&rf_b));
       }
-      srsran_rf_set_rx_gain(&rf_a, srsran_rf_get_rx_gain(&rf_a));
-      cell_detect_config.init_agc = srsran_rf_get_rx_gain(&rf_a);
     }
 
     /* set receiver frequency */
@@ -886,7 +932,10 @@ int srsran_rf_recv_multi_usrp_wrapper( void* rf_a,
   /*If time stamp from usrp a == usrp b in second resolution, but different in fraction of second */
   if ((time_sec_a == time_sec_b) && !uhd_stop ){ //&& (nof_sf > 2000)
     /*calculate the time difference*/
-    double diff_time = abs(rev_frac_secs_a - rev_frac_secs_b);
+    // fabs, not abs: abs() is the int overload here (only <math.h>/<stdlib.h>
+    // are included), so abs(0.0003)==0 made diff_time always 0 and the entire
+    // rf_a/rf_b re-align below a dead no-op. Real UL timing alignment needs it.
+    double diff_time = fabs(rev_frac_secs_a - rev_frac_secs_b);
     /*if the time difference higher than 1 micro second*/
     if ((diff_time > 0.000001) && (diff_time < 0.001)){
       /*Convert time difference to number of samples*/

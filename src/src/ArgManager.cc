@@ -38,6 +38,7 @@ void ArgManager::defaultArgs(Args& args) {
 #else
   args.rf_gain = 50.0;
 #endif
+  args.ul_rf_gain = -1.0;  // -G: independent UL (rf_b) gain; <0 = follow rf_gain/AGC
   args.decimate = 0;
   args.nof_sniffer_thread = DEFAULT_NOF_THREAD;
   // other args
@@ -111,7 +112,7 @@ void ArgManager::usage(Args& args, const std::string& prog) {
 void ArgManager::parseArgs(Args& args, int argc, char **argv) {
   int opt;
   defaultArgs(args);
-  while ((opt = getopt(argc, argv, "aAcCDdEfghHilLnpPrRsStTvwWyYqFIuUmOozK:J:X:Z:")) != -1) {
+  while ((opt = getopt(argc, argv, "aAcCDdEfgGhHilLnpPrRsStTvwWyYqFIuUmOozK:J:X:Z:")) != -1) {
     switch (opt) {
       case 'a':
         args.rf_args = argv[optind];
@@ -121,6 +122,9 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'g':
         args.rf_gain = strtod(argv[optind], nullptr);
+        break;
+      case 'G':
+        args.ul_rf_gain = strtod(argv[optind], nullptr);
         break;
       case 'L':
         args.enable_shortcut_discovery = false;

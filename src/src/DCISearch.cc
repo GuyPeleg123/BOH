@@ -514,7 +514,11 @@ int DCISearch::search() {
   }
   float snr_db = falcon_ue_dl.q->chest_res.snr_db;
   // std::cout << "SF:" << sfn << ":" << sf_idx << "SNR = " << snr_db << std::endl;
-  if (snr_db > 6.0){
+  // LTESniffer: gate lowered 6.0 -> 3.0. With a single RX antenna on a 2-port
+  // cell the DL chest SNR hovers ~5-7 dB, so a 6.0 gate blocks the DCI blind
+  // search on most subframes (all-or-nothing yield). 3.0 lets marginal-SNR
+  // subframes attempt decode; false candidates are still rejected by DCI CRC.
+  if (snr_db > 3.0){
     //PrintLifetime lt(test_string + "DCI Blind Search: ");
     recursive_blind_dci_search(&dci_msg, sf->cfi);
     ret = SRSRAN_SUCCESS;

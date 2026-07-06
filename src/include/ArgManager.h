@@ -27,6 +27,7 @@ struct Args {
   uint32_t    rf_nof_rx_ant;
   double      rf_freq;
   double      rf_gain;
+  double      ul_rf_gain = -1.0;  // -G: fixed gain for rf_b (UL) only; <0 = follow rf_gain/AGC
   int         decimate;
   int         nof_sniffer_thread;
   uint32_t    cell_id = 0;
