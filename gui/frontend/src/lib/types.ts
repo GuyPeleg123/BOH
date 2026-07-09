@@ -85,8 +85,12 @@ export interface SnifferConfig {
   sniffer_mode: number;
   api_mode: number;
   cell_search: boolean;
+  force_n_id_2: number;
+  force_n_id_1: number;
   cell_id: number;
   nof_prb: number;
+  mcc: string;
+  mnc: string;
   target_rnti: number;
   nof_sniffer_thread: number;
   skip_secondary_meta_formats: boolean;
@@ -187,6 +191,8 @@ export interface UeSession {
   dl_frames: number;
   ul_frames: number;
   frames: number;
+  cell_identity: string | null;
+  plmn: string | null;
   identity: SessionIdentity;
   ta: SessionTa;
 }
@@ -198,6 +204,34 @@ export interface SessionsResponse {
   sessions: UeSession[];
   unmatched_rar: number;
   paging: Array<{ t: number; m_tmsi: string; imsi: string }>;
+}
+export interface CellIdResponse {
+  ok: boolean;
+  error?: string;
+  source?: string;
+  cell_identity?: string;   // 28-bit ECI, hex e.g. "0x3830200"
+  eci?: number;
+  enb_id?: number;
+  enb_id_hex?: string;
+  sector?: number;
+  tac?: number | null;
+  tac_hex?: string | null;
+  mcc?: string | null;
+  mnc?: string | null;
+  plmn?: string | null;
+}
+export interface PinCellResponse {
+  ok: boolean;
+  error?: string;
+  cancelled?: boolean;
+  pci?: number;
+  nof_prb?: number;
+  cell_identity?: string;
+  tac?: number | null;
+  tac_hex?: string | null;
+  mcc?: string | null;
+  mnc?: string | null;
+  plmn?: string | null;
 }
 
 export interface BruteforceResponse {

@@ -385,6 +385,65 @@ async def status() -> dict[str, Any]:
     return {"state": runner.state(), "mock": MOCK}
 
 
+# Cell-ID is a bounded tshark scan of SIB1; the identity is static per cell lock,
+# so cache it briefly to keep the dashboard poll cheap on a long/live pcap.
+_CELLID_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_CELLID_TTL_S = 15.0
+
+
+@app.get("/api/cell-id")
+async def cell_id() -> dict[str, Any]:
+    """WHICH tower we're on: E-UTRAN Cell Identity (+ eNB-ID / sector / TAC / PLMN)
+    read from SIB1 in the current (or latest) capture. PCI alone doesn't identify
+    a cell — many towers reuse the same PCI."""
+    cfg = config_mod.load()
+    running = bool(runner.state().get("running"))
+    pcaps = captures_mod.list_pcaps(cfg, running)
+    if not pcaps:
+        return {"ok": False, "error": "no capture available"}
+    pcap = pcaps[0]["path"]
+    now = time.monotonic()
+    hit = _CELLID_CACHE.get(pcap)
+    if hit and now - hit[0] < _CELLID_TTL_S:
+        info = hit[1]
+    else:
+        info = await asyncio.to_thread(captures_mod.read_cell_id, Path(pcap))
+        _CELLID_CACHE[pcap] = (now, info)
+    if not info:
+        return {"ok": False, "error": "SIB1 not decoded yet — cell identity unavailable", "source": pcap}
+    return {"ok": True, "source": pcap, **info}
+
+
+@app.post("/api/pin-cell")
+async def pin_cell() -> dict[str, Any]:
+    """Pin the configured PCI (+PRB), decode SIB1 until we read the MCC/MNC of the
+    cell transmitting there, then set the config to pinned mode (cell-search off)
+    with that PLMN. Needs the radios free (stop any capture first)."""
+    cfg = config_mod.load()
+    if bool(runner.state().get("running")):
+        return {"ok": False, "error": "Stop the current capture first — pinning needs the radios."}
+    import scanner
+    result = await asyncio.to_thread(scanner.pin_cell, cfg)
+    if result.get("ok"):
+        # Exact-PCI lock: fast search forcing both PSS group (-l) and SSS (-N).
+        cfg.cell_search = True
+        cfg.force_n_id_2 = result.get("n_id_2", cfg.cell_id % 3)
+        cfg.force_n_id_1 = result.get("n_id_1", cfg.cell_id // 3)
+        if result.get("mcc"):
+            cfg.mcc = result["mcc"]
+        if result.get("mnc"):
+            cfg.mnc = result["mnc"]
+        config_mod.save(cfg)
+    return result
+
+
+@app.post("/api/pin-cell/stop")
+async def pin_cell_stop() -> dict[str, Any]:
+    """Abort an in-flight Pin cell (user changed their mind mid-run)."""
+    import scanner
+    return scanner.cancel_pin()
+
+
 @app.post("/api/capture/start")
 async def capture_start(cfg: SnifferConfig | None = None) -> dict[str, Any]:
     if cfg is None:

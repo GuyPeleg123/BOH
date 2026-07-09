@@ -13,6 +13,7 @@ struct Args {
   bool        disable_cfo;
   uint32_t    time_offset;
   int         force_N_id_2;
+  int         force_N_id_1;   // -N: force SSS N_id_1 for an exact-PCI lock; -1 = any
   std::string input_file_name = "";
   std::string dci_file_name = "";
   std::string stats_file_name = "";

@@ -53,8 +53,19 @@ class SnifferConfig(BaseModel):
     sniffer_mode: int = Field(0, ge=0, le=2, description="0 DL, 1 UL, 2 dual. -m")
     api_mode: int = Field(-1, ge=-1, le=3, description="-1 off, 0 identity, 1 IMSI, 2 UECapa, 3 all. -z")
     cell_search: bool = Field(True, description="Enable PSS/SSS cell search. -C")
-    cell_id: int = Field(0, description="Fixed cell ID when -C disabled. -I")
+    force_n_id_2: int = Field(-1, ge=-1, le=2,
+                              description="Constrain cell-search to PSS group N_id_2 (=PCI mod 3); "
+                                          "-1 = any. Fast way to target a specific PCI. -l")
+    force_n_id_1: int = Field(-1, ge=-1, le=167,
+                              description="Force SSS N_id_1 (=PCI//3) for an EXACT-PCI lock (with "
+                                          "force_n_id_2); -1 = any. -N")
+    cell_id: int = Field(0, description="Fixed PCI (0-503) when -C disabled. -I")
     nof_prb: int = Field(50, description="PRBs of fixed cell. -p")
+    # MCC/MNC are the TARGET network. The radio locks by PCI (physical layer);
+    # PLMN (MCC+MNC) is only in SIB1, read after lock — so these are used to
+    # label/verify the cell, not to drive the -I lock. Not passed as CLI flags.
+    mcc: str = Field("", description="Target MCC (network id). Verification/label only.")
+    mnc: str = Field("", description="Target MNC (network id). Verification/label only.")
     target_rnti: int = Field(0, description="Only decode this RNTI; 0 = all. -r")
 
     @field_validator("nof_prb")
@@ -172,6 +183,10 @@ class SnifferConfig(BaseModel):
             argv += ["-z", str(self.api_mode)]
         if self.cell_search:
             argv.append("-C")
+            if self.force_n_id_2 >= 0:      # target a PCI group during search (fast + selective)
+                argv += ["-l", str(self.force_n_id_2)]
+            if self.force_n_id_1 >= 0:      # force the SSS too => lock an EXACT PCI
+                argv += ["-N", str(self.force_n_id_1)]
         else:
             argv += ["-I", str(self.cell_id), "-p", str(self.nof_prb)]
         if self.target_rnti:

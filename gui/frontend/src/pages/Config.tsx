@@ -76,7 +76,8 @@ const SECTIONS: Section[] = [
       { key: "sniffer_mode", label: "Sniffer mode", flag: "-m", widget: "select" },
       { key: "api_mode",     label: "API mode",     flag: "-z", widget: "select" },
       { key: "cell_search",  label: "Enable cell search (-C)", flag: "-C" },
-      { key: "cell_id",      label: "Fixed cell ID (when -C off)", flag: "-I" },
+      { key: "cell_id",      label: "PCI (fixed cell, when -C off)", flag: "-I",
+        hint: "physical cell id 0–503 — this is what actually locks the radio" },
       { key: "nof_prb",      label: "PRBs (fixed cell)", flag: "-p", widget: "select" },
       { key: "target_rnti",  label: "Target RNTI (0 = all)", flag: "-r" },
     ],
@@ -152,6 +153,8 @@ export function ConfigPage() {
   const [gpsdoMsg, setGpsdoMsg] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinMsg, setPinMsg] = useState<string | null>(null);
 
   const autoMsgTimerRef = useRef<number | null>(null);
   const gpsdoMsgTimerRef = useRef<number | null>(null);
@@ -321,6 +324,33 @@ export function ConfigPage() {
     }
   }
 
+  async function pinCell() {
+    if (!cfg) return;
+    setPinBusy(true); setErr(null);
+    setPinMsg(`Pinning PCI ${cfg.cell_id} (fast, targeted to its group) — decoding SIB1 for MCC/MNC…`);
+    try {
+      await api.putConfig(cfg);              // persist PCI/PRB before pinning
+      const r = await api.pinCell();
+      if (r.ok) {
+        const fresh = await api.getConfig(); // pin turned cell-search off + filled MCC/MNC
+        setCfg(fresh);
+        setPinMsg(`✅ Locked PCI ${r.pci} · PLMN ${r.mcc}-${r.mnc} · Cell ID ${r.cell_identity} · TAC ${r.tac} — starting capture…`);
+        await api.start(fresh);              // pinned → run
+        setPinMsg(`✅ PCI ${r.pci} · PLMN ${r.mcc}-${r.mnc} · Cell ID ${r.cell_identity} — capturing.`);
+      } else if (r.cancelled) {
+        setPinMsg("Pin cancelled."); setTimeout(() => setPinMsg(null), 2000);
+      } else {
+        setPinMsg(null); setErr(r.error ?? "pin failed");
+      }
+    } catch (e: any) {
+      setPinMsg(null); setErr(e?.message ?? String(e));
+    } finally { setPinBusy(false); }
+  }
+
+  async function stopPin() {
+    try { await api.pinCellStop(); } catch { /* the pin call will report the result */ }
+  }
+
   async function saveAndRestart() {
     if (!cfg) return;
     setBusy(true);
@@ -449,10 +479,28 @@ export function ConfigPage() {
             🔍 Auto-detect USRPs
           </button>
           <button className="btn" disabled={busy} onClick={save}>Save</button>
+          <button className="btn" disabled={busy || pinBusy} onClick={pinCell}
+            title="Pin the entered PCI: decode SIB1 to read the cell's MCC/MNC, then lock on (needs radios free)">
+            {pinBusy ? "📡 Pinning…" : "📌 Pin & Run"}
+          </button>
           <button className="btn btn-primary" disabled={busy} onClick={saveAndRestart}>
             Save & Restart
           </button>
         </div>
+        {(pinBusy || pinMsg) && (
+          <div className="mt-2">
+            {pinBusy && (
+              <div className="flex items-center gap-2">
+                <div className="h-1.5 flex-1 bg-border rounded overflow-hidden">
+                  <div className="h-full w-1/3 bg-accent" style={{ animation: "pinbar 1.2s ease-in-out infinite" }} />
+                </div>
+                <button className="btn !px-2 !py-0.5 !text-xs" onClick={stopPin}>✕ Stop</button>
+              </div>
+            )}
+            {pinMsg && <div className="text-xs font-mono mt-1 text-slate-100">{pinMsg}</div>}
+            <style>{`@keyframes pinbar{0%{margin-left:-33%}100%{margin-left:100%}}`}</style>
+          </div>
+        )}
       </div>
 
       {/* Status banners — auto-dismiss after a few seconds */}

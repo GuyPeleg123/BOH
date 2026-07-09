@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse, BruteforceResponse, SplitDim, SplitResponse, SessionsResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse, BruteforceResponse, SplitDim, SplitResponse, SessionsResponse, CellIdResponse, PinCellResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -62,6 +62,9 @@ export const api = {
       body: JSON.stringify(cfg),
     }),
   status: () => req<{ state: RuntimeState; mock: boolean }>("/api/status"),
+  cellId: () => req<CellIdResponse>("/api/cell-id"),
+  pinCell: () => req<PinCellResponse>("/api/pin-cell", { method: "POST" }),
+  pinCellStop: () => req<{ ok: boolean }>("/api/pin-cell/stop", { method: "POST" }),
   start: (cfg?: SnifferConfig) =>
     req<{ ok: boolean; state: RuntimeState }>("/api/capture/start", {
       method: "POST",

@@ -19,6 +19,7 @@ void ArgManager::defaultArgs(Args& args) {
   args.disable_cfo = false;
   args.time_offset = 0;
   args.force_N_id_2 = -1; // Pick the best
+  args.force_N_id_1 = -1; // -N: -1 = any; >=0 forces the SSS N_id_1 (exact PCI)
   args.input_file_name = "";
   args.dci_file_name = "";
   args.stats_file_name = "";
@@ -112,7 +113,7 @@ void ArgManager::usage(Args& args, const std::string& prog) {
 void ArgManager::parseArgs(Args& args, int argc, char **argv) {
   int opt;
   defaultArgs(args);
-  while ((opt = getopt(argc, argv, "aAcCDdEfgGhHilLnpPrRsStTvwWyYqFIuUmOozK:J:X:Z:")) != -1) {
+  while ((opt = getopt(argc, argv, "aAcCDdEfgGhHilLNnpPrRsStTvwWyYqFIuUmOozK:J:X:Z:")) != -1) {
     switch (opt) {
       case 'a':
         args.rf_args = argv[optind];
@@ -167,6 +168,9 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'l':
         args.force_N_id_2 = atoi(argv[optind]);
+        break;
+      case 'N':
+        args.force_N_id_1 = atoi(argv[optind]);
         break;
       case 'C':
         args.cell_search = true;

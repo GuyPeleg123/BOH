@@ -116,6 +116,14 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
             pcap = src
             oargs = ["-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE"]
 
+        # cell identity (ECI) + PLMN (MCC-MNC) from SIB1 — LTESniffer locks one cell
+        # per capture, so every session's DL/UL belongs to this cell. Cell ID + PLMN
+        # let you tell apart cells (and networks) that reuse the same PCI.
+        _cell = C.read_cell_id(pcap) or {}
+        _cellid = _cell.get("cell_identity")
+        _plmn = (f"{_cell['mcc']}-{_cell['mnc']}"
+                 if _cell.get("mcc") and _cell.get("mnc") else None)
+
         # ---- pass 1: C-RNTI activity (lifetime, frame counts) -----------------
         sess: dict[int, dict] = {}
         for r in C._tshark_fields(pcap, "mac-lte",
@@ -260,6 +268,8 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                 "start": round(s["start"], 3), "end": round(s["end"], 3),
                 "duration_s": round(s["end"] - s["start"], 3),
                 "dl_frames": s["dl"], "ul_frames": s["ul"], "frames": s["frames"],
+                "cell_identity": _cellid,
+                "plmn": _plmn,
                 "identity": {"label": label, "confidence": confidence, "m_tmsi": m_tmsi,
                              "mmec": mmec, "s_tmsi": s_tmsi, "guti": guti, "imsi": imsi,
                              "plmn": plmn or None, "source": idd.get("source")},

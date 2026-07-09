@@ -1,4 +1,7 @@
+import { useEffect, useState } from "react";
 import { useStore, shallow } from "../lib/store";
+import { api } from "../lib/api";
+import type { CellIdResponse } from "../lib/types";
 
 function Kv({ k, v, mono = true }: { k: string; v: React.ReactNode; mono?: boolean }) {
   return (
@@ -17,6 +20,18 @@ export function CellCard() {
   const m = state.mib;
   const s = state.stats;
   const h = state.hello;
+
+  // Cell ID (ECI) lives in SIB1, not the live cell event — poll the backend,
+  // which reads it from the current/live pcap. Refreshes every 10s; cheap
+  // (backend caches, and the identity is static per cell lock).
+  const [cid, setCid] = useState<CellIdResponse | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const poll = () => { api.cellId().then((r) => { if (alive) setCid(r); }).catch(() => {}); };
+    poll();
+    const id = setInterval(poll, 10000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
 
   if (!c) {
     return (
@@ -40,9 +55,22 @@ export function CellCard() {
         <span className="inline-block w-2 h-2 rounded-full bg-ok" />
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Cell</h2>
         <span className="text-xl font-mono font-semibold text-accent">PCI {c.pci}</span>
+        {cid?.ok && cid.cell_identity && (
+          <span className="text-sm font-mono"
+                title={`E-UTRAN Cell Identity (from SIB1) — which tower you're on. Hex ${cid.cell_identity}.`
+                  + ` eNB-ID ${cid.enb_id} · sector ${cid.sector}`
+                  + (cid.tac != null ? ` · TAC ${cid.tac}` : "")
+                  + (cid.plmn ? ` · PLMN ${cid.plmn}` : "")}>
+            <span className="text-muted">Cell&nbsp;ID</span>{" "}
+            <span className="text-accent font-semibold">{cid.eci}</span>
+          </span>
+        )}
         <span className="text-sm font-mono text-slate-100">{c.nof_prb} PRB · {c.nof_ports}-port {c.cp} CP · {c.mode}</span>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-x-4 gap-y-2">
+        {cid?.ok && cid.eci != null && <Kv k="Cell ID (ECI)" v={`${cid.eci} (${cid.cell_identity})`} />}
+        {cid?.ok && cid.enb_id != null && <Kv k="eNB / sector" v={`${cid.enb_id} / ${cid.sector}`} />}
+        {cid?.ok && cid.tac != null && <Kv k="TAC" v={String(cid.tac)} />}
         <Kv k="DL freq"      v={`${(c.dl_freq / 1e6).toFixed(3)} MHz`} />
         {c.ul_freq > 0 && <Kv k="UL freq" v={`${(c.ul_freq / 1e6).toFixed(3)} MHz`} />}
         <Kv k="Sample rate"  v={`${(c.sample_rate / 1e6).toFixed(2)} MHz`} />

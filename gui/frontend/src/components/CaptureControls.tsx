@@ -7,6 +7,7 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [ulFreqMissing, setUlFreqMissing] = useState(false);
+  const [pinCfg, setPinCfg] = useState<{ cell_id: number; force_n_id_2: number } | null>(null);
   const running = state.lifecycle === "running";
 
   // Re-fetch config on every mount (= every Dashboard navigation) and after
@@ -16,6 +17,7 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
       .then((c) => {
         const needsUl = (c.sniffer_mode === 1 || c.sniffer_mode === 2) && c.ul_freq === 0;
         setUlFreqMissing(needsUl);
+        setPinCfg({ cell_id: c.cell_id, force_n_id_2: c.force_n_id_2 });
       })
       .catch(() => {});
   }, [state.lifecycle]);
@@ -31,6 +33,29 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
       setBusy(false);
     }
   }
+
+  // Pin (fast targeted search, constrained to the PCI's PSS group) vs strongest
+  // (unconstrained search). Both use fast cell-search; pin just narrows to the
+  // target's group. Sets force_n_id_2 so the NEXT Start/Restart uses that mode.
+  async function togglePin(pin: boolean) {
+    await run(async () => {
+      const full = await api.getConfig();
+      full.cell_search = true;                                       // always fast search
+      full.force_n_id_2 = pin ? (full.cell_id % 3) : -1;             // pin => PSS group (-l)
+      full.force_n_id_1 = pin ? Math.floor(full.cell_id / 3) : -1;   // pin => SSS (-N) => EXACT PCI
+      await api.putConfig(full);
+      setPinCfg({ cell_id: full.cell_id, force_n_id_2: full.force_n_id_2 });
+    });
+  }
+
+  const pinToggle = pinCfg && (
+    <label className="flex items-center gap-1.5 text-xs cursor-pointer"
+      title="On: fast lock of the EXACT PCI (forces the PSS group + SSS via -l/-N). Off: search & lock the strongest cell overall. Applies to the next Start/Restart.">
+      <input type="checkbox" checked={pinCfg.force_n_id_2 >= 0} disabled={busy || running}
+        onChange={(e) => togglePin(e.target.checked)} />
+      <span>Pin PCI {pinCfg.cell_id} <span className="text-muted">(exact; off = strongest)</span></span>
+    </label>
+  );
 
   const startDisabled = busy || running || ulFreqMissing;
   const startTitle = ulFreqMissing
@@ -78,8 +103,9 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
 
   if (compact) {
     return (
-      <div className="flex items-center gap-2" title={err ?? undefined}>
+      <div className="flex items-center gap-2 flex-wrap" title={err ?? undefined}>
         {body}
+        {pinToggle}
         {ulFreqMissing && (
           <span className="text-xs text-bad font-mono ml-1">⛔ Set UL freq</span>
         )}
@@ -92,6 +118,7 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
     <div className="panel p-4">
       <h2 className="text-sm font-semibold uppercase tracking-wide text-muted mb-3">Capture</h2>
       <div className="flex flex-wrap gap-2">{body}</div>
+      {pinToggle && <div className="mt-2">{pinToggle}</div>}
       {ulFreqMissing && (
         <div className="mt-2 text-xs text-bad">
           ⛔ UL frequency is 0 — set it in Config before starting UL/Dual mode.

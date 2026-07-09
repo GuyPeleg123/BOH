@@ -427,6 +427,59 @@ def _tshark_fields(pcap: Path, dfilter: str, fields: list[str], timeout: int = 1
     return rows
 
 
+def read_cell_id(pcap: Path, max_packets: int = 20000) -> dict | None:
+    """Extract the E-UTRAN Cell Identity (ECI) + eNB-ID/sector + TAC/PLMN from the
+    most recent SIB1 in a pcap. This is what identifies WHICH cell/tower you are
+    on (PCI only labels the physical layer and is widely reused).
+
+    Bounded read (`-c`): SIB1 broadcasts from the moment the cell locks, so it is
+    among the earliest frames — no need to scan a long/live pcap. Returns None if
+    no SIB1 has been decoded yet."""
+    cmd = ["tshark", "-r", str(pcap), "-c", str(max_packets),
+           "-Y", "lte-rrc.systemInformationBlockType1_element", "-T", "fields",
+           "-e", "lte-rrc.cellIdentity", "-e", "lte-rrc.trackingAreaCode",
+           "-e", "lte-rrc.MCC_MNC_Digit"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    last = None
+    for line in out.stdout.splitlines():
+        c = (line.split("\t") + ["", "", ""])[:3]
+        ci = c[0].split(",")[0].strip()
+        if ci:  # keep the most recent SIB1 with a cell identity
+            last = (ci, c[1].split(",")[0].strip(), c[2].strip())
+    if not last:
+        return None
+    ci_hex, tac_hex, digits = last
+    try:
+        eci = int(ci_hex, 16)
+    except ValueError:
+        return None
+    try:
+        tac_dec = int(tac_hex, 16) if tac_hex else None
+    except ValueError:
+        tac_dec = None
+    # SIB1 plmn-IdentityList is a flat digit list (MCC=3 + MNC=2 per PLMN). Take
+    # the FIRST PLMN, 2-digit MNC (the common case outside North America).
+    d = [x for x in digits.split(",") if x.strip().isdigit()]
+    mcc = "".join(d[0:3]) if len(d) >= 3 else None
+    mnc = "".join(d[3:5]) if len(d) >= 5 else None
+    # ECI (28-bit) = eNB-ID (top 20 bits) · Cell/sector (low 8 bits), per TS 36.413.
+    return {
+        "cell_identity": f"0x{eci:07X}",
+        "eci": eci,
+        "enb_id": eci >> 8,
+        "enb_id_hex": f"0x{eci >> 8:X}",
+        "sector": eci & 0xFF,
+        "tac": tac_dec,
+        "tac_hex": f"0x{tac_dec:04X}" if tac_dec is not None else None,
+        "mcc": mcc,
+        "mnc": mnc,
+        "plmn": (mcc + mnc) if (mcc and mnc) else None,
+    }
+
+
 def _rnti_identity_map(pcap: Path) -> dict:
     """Best-effort rnti -> identity label ('imsi-<v>' / 'tmsi-<v>') from cleartext
     RRC in the pcap and a sibling sniffer.log API table. Empty if none found."""

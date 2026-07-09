@@ -336,6 +336,9 @@ bool LTESniffer_Core::run(){
       ERROR("UL/Dual mode requires a UL frequency (-u). This branch needs 2 USRPs for UL/Dual sniffing.\n");
     }
 
+    // LTESniffer exact-PCI: forces the SSS N_id_1 (with -l/force_N_id_2 → exact PCI).
+    // -1 (default) leaves cell-search behaviour unchanged. See ForcedPciAcquisition doc.
+    cell_detect_config.force_N_id_1 = args.force_N_id_1;
     if (args.cell_search){
       uint32_t ntrial = 0;
       do {
