@@ -268,13 +268,21 @@ bool LTESniffer_Core::run(){
       exit(-1);
     }
 
+    // UL 2-RX diversity (opt-in via env UL_DIVERSITY): open the UL USRP (rf_b)
+    // with 2 RX channels while the DL radio (rf_a) keeps its own antenna count.
+    // -A is coupled to BOTH radios and -A 2 breaks DL, so we decouple UL here.
+    // sf_buffer_b[0..3] are already allocated; the streamer fills as many
+    // channels as rf_b was opened with. Default (unset) = unchanged behaviour.
+    uint32_t ul_nof_rx_ant = (getenv("UL_DIVERSITY") ? 2u : args.rf_nof_rx_ant);
+
     // rf_b is only needed for UL/DUAL mode
     if (sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) {
-      if (srsran_rf_open_multi(&rf_b, rfArgsCStr_b, args.rf_nof_rx_ant)) {
+      if (srsran_rf_open_multi(&rf_b, rfArgsCStr_b, ul_nof_rx_ant)) {
         fprintf(stderr, "Error opening rf_b — UL/DUAL mode requires a second USRP\n");
         exit(-1);
       }
       rf_b_open = true;  // class member
+      if (ul_nof_rx_ant > 1) printf("UL 2-RX diversity ENABLED: rf_b opened with %u channels\n", ul_nof_rx_ant);
     }
 
     // Make UHD Rx overflow/late visible (previously swallowed silently).
@@ -329,7 +337,7 @@ bool LTESniffer_Core::run(){
         ///ERROR("Tunning DL Freq failed\n");
       }
       printf("Tunning UL receiver to %.3f MHz\n", (double) (args.ul_freq / 1000000));
-      if (srsran_rf_set_rx_freq(&rf_b, args.rf_nof_rx_ant, args.ul_freq )){
+      if (srsran_rf_set_rx_freq(&rf_b, ul_nof_rx_ant, args.ul_freq )){
         //ERROR("Tunning UL Freq failed \n");
       }
     } else {
@@ -585,7 +593,19 @@ bool LTESniffer_Core::run(){
               exit(-1);
               std::cout << "Error decoding MIB" << std::endl;
             } else if (n == SRSRAN_UE_MIB_FOUND) {
-              srsran_pbch_mib_unpack(bch_payload, &cell, &sfn);
+              // Unpack into a scratch cell first: a corrupt PBCH can decode to an
+              // INVALID bandwidth (e.g. 125 PRB), which then crashes the FFT init
+              // downstream (ofdm.c "Invalid number of PRB 125" -> ue_mib FFT error
+              // -> exit). Validate before committing; reject bad decodes and keep
+              // searching instead of aborting the whole capture.
+              srsran_cell_t decoded_cell = cell;
+              srsran_pbch_mib_unpack(bch_payload, &decoded_cell, &sfn);
+              if (!srsran_nofprb_isvalid(decoded_cell.nof_prb)) {
+                printf("[MIB] Rejecting corrupt MIB decode (invalid nof_prb=%u) — retrying cell search.\n",
+                       decoded_cell.nof_prb);
+                break;  // stay in DECODE_MIB; retry on the next opportunity
+              }
+              cell = decoded_cell;
               srsran_cell_fprint(stdout, &cell, sfn);
               printf("Decoded MIB. SFN: %d, offset: %d\n", sfn, sfn_offset);
               json_emitter.emitMIB(sfn, sfn_offset);

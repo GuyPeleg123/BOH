@@ -1,0 +1,396 @@
+================================================================================
+  LTESniffer — PROJECT_2.txt
+  FULL HANDOFF DOCUMENTATION (written 2026-07-02)
+  Read this top-to-bottom. It is written so a new agent/operator can (a) understand
+  what the program is and how it works, (b) run it and reproduce today's results,
+  and (c) continue exactly where the previous agent stopped.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. TL;DR — CURRENT STATE IN ONE PARAGRAPH
+--------------------------------------------------------------------------------
+LTESniffer is a dual-USRP (2x Ettus B210) LTE sniffer that captures BOTH the
+downlink (DL, tower->phone) and uplink (UL, phone->tower) of a live LTE cell and
+writes MAC-LTE pcap files. As of today it WORKS end-to-end: DL, UL, and RRC
+signalling all decode. Getting here required (1) a shared external 10 MHz + 1 PPS
+clock feeding both radios (hardware — already installed by the operator), and
+(2) FOUR C++ source fixes made today (DCI SNR gate, dual-mode USB buffering, a
+re-align abs()->fabs() bug, and an RF-error handler for visibility). The winning
+run config is: DL 1825 MHz / UL 1730 MHz, dual mode, 2 RX antennas (-A 2),
+clock=external, DCI gate 3.0. DL/RRC/coverage are excellent and stable. UL
+decodes but yield is LOW and swings with RF conditions — improving the UL
+antenna position is the main remaining lever (a hardware/operator task, not code).
+The fixes live in the local dev build only; shipping to the air-gapped appliance
+needs a full C++ rebuild + reship.
+
+--------------------------------------------------------------------------------
+1. WHAT THE PROGRAM IS
+--------------------------------------------------------------------------------
+- A FALCON/srsRAN-based passive LTE sniffer. It does NOT transmit. It listens.
+- Fork context: repo GuyPeleg123/BOH lineage; local clone at ~/work/LTESniffer.
+- Two hardware receivers (USRP B210 software-defined radios):
+    * rf_a  = DL radio, serial 32FCD4C  -> tuned to the DL centre freq (-f)
+    * rf_b  = UL radio, serial 3367EF9  -> tuned to the UL centre freq (-u)
+- Output: MAC-LTE pcap (DLT 147) that Wireshark/tshark can dissect. With a key
+  file (-K) it can also decrypt PDCP and write *_decrypted_ip.pcap (DLT 101).
+- A web GUI (FastAPI backend + React frontend) wraps the C++ binary: start/stop
+  captures, live counters, key derivation, pcap organizing/splitting.
+
+WHY TWO RADIOS + A SHARED CLOCK:
+LTE FDD puts DL and UL on different frequencies, so you physically need two
+receivers. To decode UL PUSCH the sniffer must know the exact DL<->UL timing
+relationship, which means BOTH radios must share ONE sample clock (10 MHz) and
+ONE time reference (1 PPS). Two independent clocks (e.g. each B210's own GPSDO)
+drift and their PPS edges never align -> UL never decodes. The single most
+important hardware fact in this whole project: **UL requires a shared 10 MHz +
+1 PPS reference feeding BOTH B210s.** That reference is now installed (external).
+
+--------------------------------------------------------------------------------
+2. REPO / BUILD LAYOUT (where things live)
+--------------------------------------------------------------------------------
+~/work/LTESniffer/
+  src/                         C++ application code (the sniffer itself)
+    src/LTESniffer.cc          main() entry
+    src/src/ArgManager.cc      CLI flag parsing (getopt); see the option table
+    src/src/LTESniffer_Core.cc **CORE**: opens radios, cell search, main decode
+                               loop, dual-USRP receive + re-align. MOST FIXES
+                               TODAY ARE HERE.
+    src/src/DCISearch.cc       DL control-channel (PDCCH/DCI) blind search.
+                               Contains the SNR GATE fix.
+    src/src/UL_Sniffer_PUSCH.cc  UL PUSCH decode + UL stats table.
+    src/src/ULSchedule.cc      Maps a DL UL-grant (DCI format 0) to the PUSCH
+                               subframe to decode (n+4 FDD timing).
+    src/src/SubframeWorker.cc  Per-subframe worker: runs DCI search then UL decode.
+    src/src/SubframeBuffer.cc  Allocates the per-antenna sample buffers.
+    src/src/KeyAttaching.cc    TS 33.401 key derivation at capture time (-K).
+  lib/                         FALCON support libs.
+  build/                       CMake build tree (out-of-source).
+    build/src/LTESniffer       **THE BINARY** the GUI runs. Rebuilt today.
+    build/srsRAN-src/          srsRAN source (the PHY/RF layer).
+      .../phy/rf/rf_uhd_imp.cc UHD glue: clock/time source, recv, overflow log.
+      .../phy/ue/ue_sync.c     PSS/SSS sync state machine (SF_FIND / SF_TRACK).
+    build/srsRAN-build/        srsRAN build tree.
+      .../phy/rf/libsrsran_rf.so   dynamically linked by LTESniffer (see below).
+  gui/
+    backend/  FastAPI (serve.py launcher, main.py routes, config.py, sniffer.py,
+              captures.py, keyderiv.py).
+    frontend/ React+TS+Vite (build -> dist/, served by backend).
+  scripts/    Python/tshark analysis helpers (ta_report.py, spectrum_plot.py...).
+
+--------------------------------------------------------------------------------
+3. HOW THE DECODE PIPELINE WORKS (mental model)
+--------------------------------------------------------------------------------
+Per 1 ms subframe, in LTESniffer_Core.cc main loop (~line 511 onward):
+  1. RECEIVE: srsran_ue_sync_zerocopy_multi_usrp() reads one subframe from BOTH
+     radios in lockstep (rf_a into buffer_a[], rf_b into buffer_b[]). The two
+     UhdStreamThreads stream concurrently; a wrapper compares their PPS
+     timestamps and, if they differ, drops dummy samples to RE-ALIGN them
+     (Core.cc ~918). With a shared clock the timestamps match, so alignment is
+     tiny/zero.
+  2. SYNC (ue_sync.c): a state machine. SF_FIND correlates PSS on buffer_a[0]
+     (antenna 0 of the DL radio ONLY) to lock subframe timing. Once locked it
+     goes SF_TRACK. If antenna-0 samples are corrupt, PSS peak collapses to ~1.0
+     and it never leaves FIND -> nothing decodes. (This was the -A 2 bug.)
+  3. DL CONTROL (DCISearch.cc): if the DL channel SNR passes a GATE, run the DCI
+     blind search on the PDCCH. DCIs are the pointers: a DL grant -> decode
+     PDSCH (DL data); a UL grant (DCI format 0) -> schedule a PUSCH decode.
+  4. UL DATA (UL_Sniffer_PUSCH.cc via ULSchedule.cc): 4 ms after a UL grant at
+     subframe n, decode PUSCH from rf_b's subframe n+4. Chest estimates UL SNR;
+     if it clears internal thresholds, the PDU is written and the UL stats row
+     printed.
+  5. WRITE: decoded MAC PDUs -> pcap (flushed every ~64 writes; short runs look
+     empty on disk until the process exits and flushes).
+
+KEY INSIGHT: You cannot get UL without DL. UL grants ride inside DL control
+messages. If DL control (DCI) isn't decoding, UL is impossible. So "fix DL
+first, then UL" is the correct order, and it is exactly how today went.
+
+--------------------------------------------------------------------------------
+4. THE FOUR CODE FIXES MADE TODAY (what/why/where) — CRITICAL SECTION
+--------------------------------------------------------------------------------
+All are UNCOMMITTED working-tree edits on branch
+feat/gui-split-pktindex-and-key-boxes (HEAD a1c5eeb). Confirm with `git diff src/`.
+
+FIX 1 — DCI SNR GATE lowered 6.0 -> 3.0   [src/src/DCISearch.cc ~line 517]
+  Code: `if (snr_db > 6.0)` changed to `if (snr_db > 3.0)`.
+  Why: The DCI blind search only runs on subframes whose DL channel SNR exceeds
+  the gate. Our real-world signal hovers ~5-8 dB and swings; a 6.0 gate threw
+  away most subframes (all-or-nothing). One 150 s run at mean SNR 5.76 decoded
+  ZERO. Lowering to 3.0 lets marginal subframes attempt decode. SAFE because
+  every DCI candidate is still CRC-checked; garbage fails CRC and is dropped.
+  IMPACT (the single biggest unlock): DL-SCH 0->6049, UL-SCH 0->20, RNTIs
+  37->446, RRC 0->1277 in one 90 s run. This is what turned the project from
+  "nothing decodes" to "everything decodes".
+
+FIX 2 — DUAL-MODE USB BUFFERING on the -X/-Z path   [LTESniffer_Core.cc ~line 234]
+  Code: added `const std::string tput = ",num_recv_frames=512,recv_frame_size=8000";`
+  and appended `tput` to the usrp_a_args / usrp_b_args (-X/-Z) device strings.
+  Why: The throughput/buffering args were ONLY added on the -a/auto branch. The
+  explicit-serial -X/-Z path (which dual mode uses) opened the B210s with UHD
+  DEFAULT buffering. Under the doubled load of -A 2 (2 channels x 2 radios) this
+  silently overflowed mid-subframe; the discontinuous IQ corrupted antenna-0's
+  buffer -> PSS collapse -> ue_sync stuck in FIND -> 0 DL at -A 2. THIS is the
+  real reason 2-antenna mode was "broken"; it was never a bad antenna.
+  IMPACT: -A 2 now works — DL 4k-12k, RRC up to 1721, up to 566 UEs, ~27 dB SNR,
+  ZERO overflows, stable sync.
+  WARNING: Do NOT raise these to 1024/16360. That needs ~33 MB > the kernel
+  usbfs default 16 MB budget and fails at device-open with
+  `LIBUSB_ERROR_NO_MEM`. 512/8000 (~8 MB) is the safe, proven value. (If you ever
+  need more, raise /sys/module/usbcore/parameters/usbfs_memory_mb first.)
+
+FIX 3 — RE-ALIGN abs() -> fabs()   [LTESniffer_Core.cc ~line 921]
+  Code: `double diff_time = abs(...)` changed to `fabs(...)`.
+  Why: With only <math.h>/<stdlib.h> in scope, abs() is the INTEGER overload, so
+  abs(0.0003) == 0. That made diff_time always 0, so the rf_a/rf_b fine re-align
+  block below it NEVER ran — a dead no-op. Real UL timing alignment needs it.
+  IMPACT: correctness fix for DL/UL sample alignment. Did not regress DL; its
+  effect on UL is positive-or-neutral (UL is currently signal-limited, so hard
+  to quantify in isolation).
+
+FIX 4 — RF ERROR HANDLER (visibility)   [LTESniffer_Core.cc top ~line 40 + ~line 280]
+  Code: added static `lte_rf_error_handler()` + two
+  `srsran_rf_register_error_handler(&rf_a/&rf_b, ...)` calls after the opens.
+  Why: srsRAN's overflow logger (log_overflow) EARLY-RETURNS if no error handler
+  is registered — and none ever was. So "no overflow in the log" was meaningless;
+  overflows were physically unreportable. Now they print as
+  `[RF A] OVERFLOW (count=N)` (rate-limited). This is what let us diagnose FIX 2.
+  IMPACT: pure diagnostics. If -A 2 ever regresses, watch for these lines.
+
+--------------------------------------------------------------------------------
+5. HOW TO BUILD (after any C++ change)
+--------------------------------------------------------------------------------
+LTESniffer links libsrsran_rf.so DYNAMICALLY, so pick the right target:
+
+  * Changed anything under src/ (app code — DCISearch, LTESniffer_Core, etc.):
+        cd ~/work/LTESniffer/build && make LTESniffer
+    (~8 s; recompiles the changed .cc and relinks build/src/LTESniffer.)
+
+  * Changed the srsRAN RF layer (build/srsRAN-src/.../rf/rf_uhd_imp.cc):
+        cd ~/work/LTESniffer/build/srsRAN-build/lib/src/phy/rf && make
+    (relinks libsrsran_rf.so; LTESniffer picks it up at next launch, no relink.)
+
+  * Full rebuild (rarely needed):  cd ~/work/LTESniffer/build && make -j$(nproc)
+
+Backup of the last-known-good binary from before the gate change:
+  $CLAUDE_JOB_DIR/tmp/LTESniffer.working.bak   (job-dir tmp; may be cleaned up —
+  the authoritative source of truth is `git diff` + this file).
+
+--------------------------------------------------------------------------------
+6. HOW TO RUN
+--------------------------------------------------------------------------------
+6a. THE GUI (recommended for the operator)
+    cd ~/work/LTESniffer/gui/backend
+    .venv/bin/python serve.py                 # HTTPS on 127.0.0.1:8443
+    - URL:   https://127.0.0.1:8443/   (localhost only; see note below)
+    - Login: admin / Sniff2026!
+    - Config is persisted at ~/.config/ltesniffer-gui/config.json and already set
+      to the winning values (see section 7). Log in and press Start.
+    - REMOTE ACCESS: it binds 127.0.0.1 by default (browser must be on the
+      laptop). To reach it from another LAN machine:
+        LTESNIFFER_GUI_BIND=<lan-ip> .venv/bin/python serve.py
+      (delete ~/.config/ltesniffer-gui/cert.pem + key.pem first if the IP changed).
+    - Health check:  curl -sk -o /dev/null -w '%{http_code}\n' https://127.0.0.1:8443/
+
+6b. THE BINARY DIRECTLY (what the agent used for experiments)
+    The winning invocation (dual mode, external clock, 2 antennas, gate 3.0):
+      sudo -n ~/work/LTESniffer/build/src/LTESniffer \
+        -f 1825000000 -u 1730000000 -A 2 \
+        -X clock=external,type=b200,serial=32FCD4C \
+        -Z clock=external,type=b200,serial=3367EF9 \
+        -m 2 -C -W 4 -S 0.5 -T 100 -q 1 -d \
+        -J <rundir>/events.json > <rundir>/run.log 2>&1
+    Stop cleanly with SIGINT to the ROOT child pid (NOT the sudo wrapper) so the
+    pcap flushes:
+      CH=$(pgrep -f 'LTESniffer.*serial=32FCD4C' | tail -1); sudo -n kill -INT $CH
+    Wait for "Saving MAC PCAP file" in run.log before reading the pcap.
+
+--------------------------------------------------------------------------------
+7. THE WINNING CONFIGURATION (current, persisted)
+--------------------------------------------------------------------------------
+  DL centre freq (-f):    1825 MHz     (rf_freq  = 1825000000)
+  UL centre freq (-u):    1730 MHz     (ul_freq  = 1730000000)   [= DL - 95 MHz, Band 3]
+  RX antennas (-A):       2            (rf_nof_rx_ant = 2)        [was 1; -A 2 now fixed]
+  Clock/time source:      external     (clock_source = external)  [shared 10MHz+1PPS]
+  Mode (-m):              2 (dual)      DL + UL simultaneously
+  Cell search (-C):       on           (auto-finds the cell; PCI 237/238 here)
+  Worker threads (-W):    4
+  DCI gate:               3.0          (compiled into the binary, not a CLI flag)
+  Radios:  rf_a/DL=serial 32FCD4C ; rf_b/UL=serial 3367EF9
+
+WHY 1825/1730 AND NOT THE OLD 1845/1750:
+The operator's DL carrier MOVED. A band scan showed 1845 MHz is now dead
+(-4.5 dB above noise) while 1825 MHz is live (+16 dB). If DL stops decoding in
+future, RE-SCAN THE BAND (see tools) — the carrier can move again.
+
+--------------------------------------------------------------------------------
+8. RESULTS / EVIDENCE (real numbers from today, 90 s runs unless noted)
+--------------------------------------------------------------------------------
+  Before any fix (-A 2, 1845 MHz, external): DL 0, UL 0        (nothing)
+  After gate 3.0 (-A 1, 1825/1730):          DL 6049, UL 20, RRC 1277, 446 UEs
+                                             DL 1685, UL 31, RRC  461, 223 UEs
+  After -A 2 buffering fix (-A 2):           DL 4137, UL  0, RRC  648, 353 UEs, 27 dB
+                                             DL 8764, UL 10, RRC 1604, 526 UEs, 27 dB
+                                             DL 11906,UL 11, RRC 1721, 566 UEs, 27 dB
+  UL frames are validated real (recurring C-RNTIs, valid RRC types, coherent
+  per-UE uplink PDUs — not CRC false positives).
+
+INTERPRETATION:
+  - DL / RRC / UE-coverage: EXCELLENT and stable, clearly better at -A 2 (~27 dB
+    SNR from 2-antenna diversity vs ~6-12 dB single).
+  - UL: works but LOW (single digits to ~30 per 90 s) and DOMINATED by
+    time-varying RF (SNR swung 4->27 dB run-to-run; the cell hops PCI 237<->238
+    with very different decodability). This variability is bigger than the -A1
+    vs -A2 difference, so neither antenna count is provably better for UL yet.
+
+--------------------------------------------------------------------------------
+9. WHAT WORKS WELL  vs  WHAT NEEDS TWEAKING
+--------------------------------------------------------------------------------
+WORKS WELL (leave alone):
+  + External shared clock -> both radios open over USB3, lock, stay in sync.
+  + Cell search + MIB + DL PDSCH decode: robust.
+  + DCI gate 3.0: the core unlock; do not raise it back.
+  + -A 2 dual-antenna: fixed, high SNR, zero overflows, stable.
+  + RRC signalling capture: hundreds-to-thousands of messages per run.
+  + GUI: launches, serves, persists config, runs the fixed binary.
+
+NEEDS TWEAKING / WATCH:
+  ! UL YIELD is the #1 open item. It is currently RF-limited, not code-limited.
+    The lever is the UL radio (serial 3367EF9) antenna: aim it at the cell /
+    move closer to the phones (UL comes FROM handsets, so proximity matters a
+    lot). This is a HARDWARE/operator task, pending — see section 10.
+  ! SIGNAL VARIABILITY: SNR swings 4->27 dB; the cell hops PCI 237<->238. A fixed,
+    better antenna position should stabilise this. Optionally pin a cell with
+    -C off + -I <cellid> -p <prb> if hopping proves harmful.
+  ! DECODE STOP RELIABILITY: the C++ flushes pcap only every ~64 writes and on
+    clean exit. Always stop via SIGINT to the root child and wait for
+    "Saving MAC PCAP file"; a SIGKILL before flush loses recent frames.
+  ! DEPLOYMENT: all four fixes are in the LOCAL DEV build only. The air-gapped
+    appliance (/opt/ltesniffer) has the OLD binary. Shipping needs a full C++
+    rebuild + ~600 MB reship (these are C++ changes, not a GUI bundle).
+
+--------------------------------------------------------------------------------
+10. WHAT TO DO NEXT (pick up here)
+--------------------------------------------------------------------------------
+IMMEDIATE (waiting on the operator):
+  [ ] Operator will reposition/aim the UL antenna (radio 3367EF9) to a good spot
+      / closer to the phones. When they say it's placed, run a fair BEFORE/AFTER
+      UL measurement (back-to-back -A 2 runs at 1825/1730) and report the UL
+      delta. Use tools/cap.sh (section 11).
+
+SHORT TERM (code, optional improvements):
+  [ ] Consider INDEPENDENT per-radio gain. Today -g sets the SAME gain on rf_a
+      and rf_b (LTESniffer_Core.cc ~253). UL and DL want different gains; a
+      separate UL gain knob could raise UL SNR. (New CLI flag + Core change.)
+  [ ] Consider a "reject discontinuous subframe" guard in rf_uhd_recv_with_time_
+      multi (rf_uhd_imp.cc ~1327): if the mid-subframe timestamp jumps, drop the
+      subframe instead of feeding corrupt IQ to ue_sync. Hardens against any
+      residual overflow.
+  [ ] If cell hopping hurts, add a "lock to PCI" option or prefer the stronger
+      cell in rf_search_and_decode_mib.
+
+DEPLOYMENT (when results are accepted):
+  [ ] Commit the four fixes (ONLY when the user asks). Suggested message scope:
+      "fix(core): unlock UL/DL decode — DCI gate 3.0, -A2 USB buffering, fabs
+      re-align, RF error handler". End with the Co-Authored-By trailer.
+  [ ] Rebuild + reship the full appliance (~600 MB) to /opt/ltesniffer. GUI-only
+      upgrade bundles will NOT carry these C++ changes.
+
+--------------------------------------------------------------------------------
+11. DIAGNOSTIC TOOLS (built today; in $CLAUDE_JOB_DIR/tmp — copy into scripts/ if
+    you want them permanent). All assume the two serials above.
+--------------------------------------------------------------------------------
+  specq.py <freq_hz> <serial> <gain> <label>
+      Capture IQ (uhd_rx_cfile) and print in-band-vs-noise dB. Tells you if a
+      channel is live. Example: python3 specq.py 1825000000 32FCD4C 60 DL
+
+  scan.py <serial> <gain> <f_start_MHz> <f_stop_MHz> <step_MHz>
+      Sweep a band and print channel-above-noise per step. USE THIS IF DL STOPS
+      DECODING — the carrier may have moved (that is how 1825 was found).
+      Example: python3 scan.py 32FCD4C 50 1805 1880 5
+
+  cap.sh <A> <secs> [DL_MHz] [UL_MHz] [extra_flags]
+      One clean capture (external clock, gate-3.0 binary) + measure. Prints
+      RESULT|A=..|DL-SCH=..|UL-SCH=..|RNTIs=..|RRC=..|meanSNR=..|clean=..
+      Handles child-pid SIGINT + flush wait. Example: bash cap.sh 2 90
+      NB: for runs >= 90 s, invoke with a Bash timeout >= 300000 ms or the outer
+      command can be killed before the pcap flushes.
+
+  MANUAL pcap analysis (Wireshark 3.6.2 / tshark on the target). The MAC-LTE user
+  DLT mapping is REQUIRED or frames won't dissect:
+    MAC='uat:user_dlts:"User 0 (DLT=147)","mac-lte-framed","0","","0",""'
+    sudo -n tshark -r <pcap> -o "$MAC" -Y 'mac-lte.ulsch'   # UL frames
+    sudo -n tshark -r <pcap> -o "$MAC" -Y 'mac-lte.dlsch'   # DL frames
+    sudo -n tshark -r <pcap> -o "$MAC" -Y 'lte_rrc'         # RRC (note underscore
+      for the PROTOCOL filter; FIELDS use hyphen: lte-rrc.*)
+  Captures land in ~/ltesniffer-captures/<rundir>/ltesniffer_dual_mode.pcap.
+
+--------------------------------------------------------------------------------
+12. CLI FLAG REFERENCE (LTESniffer binary; from ArgManager.cc)
+--------------------------------------------------------------------------------
+  -f <Hz>   DL centre frequency (rf_a).
+  -u <Hz>   UL centre frequency (rf_b). Required for UL/dual.
+  -A <n>    Number of RX antennas per radio (1 or 2). Use 2 (fixed today).
+  -g <dB>   RX gain (SAME on both radios). Omit for AGC. -1 = AGC.
+  -X <args> rf_a (DL) UHD device args, e.g. clock=external,type=b200,serial=32FCD4C
+  -Z <args> rf_b (UL) UHD device args, e.g. clock=external,type=b200,serial=3367EF9
+            clock= values: internal | gpsdo | external. USE external (shared ref).
+  -m <0|1|2> Mode: 0 DL-only, 1 UL-only, 2 DUAL. Use 2. (DL-only -m 0 can segfault
+             in this build — known; not needed.)
+  -C        Enable cell search (PSS/SSS). Recommended.
+  -I <id> -p <prb>   Fixed cell instead of search (use if -C off).
+  -r <rnti> Target a single RNTI (0 = all). Handy to force-probe one UE's UL.
+  -W <n>    Worker threads (4).
+  -S <r> -T <ms>   DCI format split ratio / update interval (0.5 / 100).
+  -q <n>    MCS tracking mode (1).
+  -z <n>    API mode: -1 off, 0 identity, 1 IMSI, 2 UECapa, 3 all.
+  -K <file> Key file -> in-core PDCP decrypt (writes *_decrypted_ip.pcap DLT 101).
+  -d        Debug logging (per-subframe PSS/decode lines; used for diagnosis).
+  -J <file> JSON event stream for the GUI.
+  NOTE: output pcap names are hardcoded by mode (ltesniffer_dual_mode.pcap etc.);
+  the GUI separates runs by timestamped subdirectory, not by -F.
+
+--------------------------------------------------------------------------------
+13. HARD-WON FACTS / GOTCHAS (do not relearn these)
+--------------------------------------------------------------------------------
+  * UL needs a SHARED 10 MHz + 1 PPS on BOTH B210s. Two independent GPSDOs do
+    NOT align PPS edges -> UL fails. clock=external is that shared reference.
+  * DL must decode before UL can (UL grants live inside DL control).
+  * Both B210s must be USB3 (lsusb -t shows 5000M). USB2/480M = power starvation
+    -> flapping. Keep them on separate USB3 controllers.
+  * The DCI SNR gate (DCISearch.cc) is the master throttle. 6.0 was too strict
+    for real signals; 3.0 is correct here. CRC still filters garbage.
+  * -A 2 depends on the -X/-Z buffering fix. Without it, 2-antenna silently
+    overflows and decodes nothing. Do not exceed 512/8000 (usbfs 16 MB limit).
+  * pcap flushes every ~64 writes; always SIGINT the ROOT child + wait for
+    "Saving MAC PCAP file". Never trust a hard-killed run's frame count.
+  * Cell search "finds" cells far below decode SNR (PSS has huge processing
+    gain). A found cell at low power/SNR will NOT decode PDSCH — that is normal,
+    not a bug. Check meanSNR, not just "found cell".
+  * tshark needs the DLT=147 -> mac-lte-framed user-DLT mapping (section 11) or
+    frames won't dissect. Protocol filter is lte_rrc (underscore).
+  * GUI creds: admin / Sniff2026!  (auth.json; delete it to rotate.)
+  * When killing sniffers, match the ROOT binary pattern precisely
+    (pgrep -f 'LTESniffer.*serial=32FCD4C'); do NOT pkill broad patterns that
+    also match your own shell/grep commands.
+
+--------------------------------------------------------------------------------
+14. STATE OF GIT / DEPLOYMENT AT HANDOFF
+--------------------------------------------------------------------------------
+  Branch:  feat/gui-split-pktindex-and-key-boxes   HEAD a1c5eeb
+  Uncommitted (working tree) — the four fixes:
+     M src/src/DCISearch.cc          (gate 6.0->3.0)
+     M src/src/LTESniffer_Core.cc    (buffering, error handler, fabs)
+  Also present from earlier work (untracked, not part of today):
+     ?? scripts/*.py (analysis helpers)
+  Binary build/src/LTESniffer is REBUILT with all four fixes (verify by
+  `grep 'snr_db > 3.0' src/src/DCISearch.cc` and by an -A 2 run decoding).
+  NOTHING is committed or pushed — do that ONLY when the user asks.
+  The air-gapped appliance still runs the OLD binary; needs rebuild+reship.
+
+================================================================================
+  END OF PROJECT_2.txt  — you now have everything: what it is, how it works, how
+  to build/run it, the exact fixes and why, the winning config, real results,
+  what's solid, what needs work, the next steps, the tools, and the gotchas.
+  The immediate next action is: measure UL before/after the operator repositions
+  the UL antenna. The rig is idle and ready; the GUI is running on :8443.
+================================================================================

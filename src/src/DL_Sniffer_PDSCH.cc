@@ -2,6 +2,28 @@
 
 float p_a_array[8]{-6, -4.77, -3, -1.77, 0, 1, 2, 3};
 
+/* srsRAN implements PDSCH spatial-multiplexing predecoding only for 1 and 2 Tx
+ * ports; for a 4-Tx-port cell every UE-data PDSCH (TM3/TM4) hits
+ * srsran_predecoding_multiplex's unimplemented branch and floods
+ * "Error predecoding multiplex: not implemented for 4 Tx ports". This wrapper
+ * skips exactly that case (4 ports + spatial-mux/CDD) and reports a clean decode
+ * failure instead. Everything else — paging/SIB and single-port or transmit-
+ * diversity PDSCH (PORT0/DIVERSITY), and all of the uplink — is untouched. */
+static int ul_sniffer_decode_pdsch_4pguard(srsran_ue_dl_t*      q,
+                                           srsran_dl_sf_cfg_t*  sf,
+                                           srsran_pdsch_cfg_t*  cfg,
+                                           srsran_pdsch_res_t*  res)
+{
+	if (q->cell.nof_ports >= 4 &&
+	    (cfg->grant.tx_scheme == SRSRAN_TXSCHEME_SPATIALMUX ||
+	     cfg->grant.tx_scheme == SRSRAN_TXSCHEME_CDD))
+	{
+		for (int tb = 0; tb < SRSRAN_MAX_CODEWORDS; tb++) res[tb].crc = false;
+		return SRSRAN_SUCCESS;   // skipped cleanly, no error flood
+	}
+	return srsran_ue_dl_decode_pdsch(q, sf, cfg, res);
+}
+
 PDSCH_Decoder::PDSCH_Decoder(uint32_t idx,
 							 LTESniffer_pcap_writer *pcapwriter,
 							 MCSTracking *mcs_tracking,
@@ -214,7 +236,7 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 		// main function to decode
 		if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 		{
-			if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+			if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 			{
 				ERROR("ERROR: Decoding PDSCH");
 			}
@@ -478,7 +500,7 @@ int PDSCH_Decoder::decode_SIB() // change to decode SIB
 				// main function to decode
 				if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 				{
-					if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+					if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 					{
 						ERROR("ERROR: Decoding PDSCH");
 					}
@@ -667,7 +689,7 @@ int PDSCH_Decoder::run_rar_decode(srsran_dci_format_t cur_format,
 		if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 		{
 			// std::cout << "Runing table: " << table << " -- 1" << std::endl;
-			if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+			if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 			{
 				ERROR("ERROR: Decoding PDSCH");
 			}
@@ -882,7 +904,7 @@ int PDSCH_Decoder::decode_dl_mode()
 					// main function to decode
 					if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 					{
-						if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+						if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 						{
 							ERROR("ERROR: Decoding PDSCH");
 						}
@@ -990,7 +1012,7 @@ int PDSCH_Decoder::decode_dl_mode()
 					}
 
 					/*main function to decode */
-					if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+					if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 					{
 						ERROR("ERROR: Decoding PDSCH");
 					}
@@ -1083,7 +1105,7 @@ int PDSCH_Decoder::decode_dl_mode()
 						}
 
 						// main function to decode
-						if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+						if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 						{
 							ERROR("ERROR: Decoding PDSCH");
 						}

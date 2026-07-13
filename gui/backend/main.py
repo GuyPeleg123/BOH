@@ -463,6 +463,28 @@ async def capture_start(cfg: SnifferConfig | None = None) -> dict[str, Any]:
     return {"ok": True, "state": runner.state()}
 
 
+@app.post("/api/capture/dense-test")
+async def capture_dense_test() -> dict[str, Any]:
+    """TEMPORARY: start a normal capture with the UL diagnostics enabled.
+
+    Identical to /api/capture/start (same config → same pcap, visible in
+    Captures/Sessions), but the run also enables the env-gated UL diagnostics and
+    saves their output to <run_dir>/ul_diag.log for offline analysis. Meant for a
+    dense-area test where the extra UL instrumentation is wanted."""
+    cfg = config_mod.load()
+    if runner.running:
+        raise HTTPException(409, "sniffer already running")
+    try:
+        await runner.start(cfg, diag=True)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"failed to start: {e}")
+    return {"ok": True, "state": runner.state()}
+
+
 @app.post("/api/capture/stop")
 async def capture_stop() -> dict[str, Any]:
     await runner.stop()

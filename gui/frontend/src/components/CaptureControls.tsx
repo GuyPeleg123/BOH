@@ -98,6 +98,16 @@ export function CaptureControls({ compact = false }: { compact?: boolean }) {
       >
         <span aria-hidden>⟳</span> Restart
       </button>
+      {/* TEMPORARY: dense-area diagnostic run. Same capture (pcap → Captures/
+          Sessions) but with UL diagnostics on, saved to <run>/ul_diag.log. */}
+      <button
+        className="btn btn-warn"
+        disabled={startDisabled}
+        title={startTitle ?? "Dense-area test: normal capture + UL diagnostics saved to ul_diag.log for offline analysis"}
+        onClick={() => run(() => api.denseTest())}
+      >
+        <span aria-hidden>🧪</span> Dense Test
+      </button>
     </>
   );
 

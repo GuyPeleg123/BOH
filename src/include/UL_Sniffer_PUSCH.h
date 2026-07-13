@@ -108,6 +108,18 @@ public:
         }
     }
 private:
+    /* Run the full per-grant MCS-table decode sequence on whatever symbols are
+       currently in enb_ul.sf_symbols. Returns true if CRC passed. Used by both
+       the nominal pass and the FFT-window-offset retry pass. Internal to the
+       decode() call sequence — must not be called out of order. */
+    bool decode_grant(DCI_UL &decoding_mem);
+
+    /* Re-run the UL FFT on a window shifted by sample_offset samples relative to
+       the nominal subframe start, writing into enb_ul.sf_symbols. Reads from the
+       clean pre-FFT snapshot in sf_buffer_offset[0]. Returns false if the offset
+       would read outside the available buffer. */
+    bool refft_at_offset(int sample_offset);
+
     bool        decoder_a = false;
     bool        decoder_b = false;
     std::string debug_str = "";
@@ -145,6 +157,18 @@ private:
 
     /*Backup*/
     int                     multi_ul_offset;
+
+    /* Nominal-window frequency-domain symbols, saved once per subframe after the
+       top FFT so the offset-retry pass can restore enb_ul.sf_symbols for the
+       next grant without re-running the (in-place, non-repeatable) FFT. */
+    cf_t*                   sf_symbols_nominal  = nullptr;
+    uint32_t                sf_symbols_len      = 0;
+
+    /* UL 2-RX selection diversity (env UL_DIVERSITY): antenna-1 frequency-domain
+       symbols, FFT'd once per subframe from original_buffer[1] so a CRC-failed
+       grant can retry on the second UL antenna. */
+    bool                    ul_diversity        = false;
+    cf_t*                   sf_symbols_ant1     = nullptr;
 };
 
 

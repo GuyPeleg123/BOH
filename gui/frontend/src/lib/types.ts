@@ -169,6 +169,8 @@ export interface SessionIdentity {
   imsi: string | null;
   plmn: string | null;
   source: string | null;
+  id_via: "ul" | "paging" | "dl" | null;   // how the identity was learned
+  from_ul: boolean;                          // TMSI/IMSI seen in an uplink frame
 }
 export interface SessionTaSample { t: number; range_m: number | null; delta_m?: number; src: string; }
 export interface SessionTa {
@@ -203,7 +205,13 @@ export interface SessionsResponse {
   source: string | null;
   sessions: UeSession[];
   unmatched_rar: number;
-  paging: Array<{ t: number; m_tmsi: string; imsi: string }>;
+  paging: Array<{ t: number; m_tmsi?: string; mmec?: string; s_tmsi?: string | null; imsi?: string }>;
+  paging_summary?: {
+    records: number;
+    distinct_m_tmsi: number;
+    distinct_s_tmsi: number;
+    distinct_imsi: number;
+  };
 }
 export interface CellIdResponse {
   ok: boolean;

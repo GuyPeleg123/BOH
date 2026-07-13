@@ -91,6 +91,7 @@ _ALLOWED_BINARIES: set[Path] = {
     (_REPO_ROOT / "build" / "src" / "LTESniffer").resolve(),
     Path("/usr/local/bin/LTESniffer"),
     Path("/usr/bin/LTESniffer"),
+    Path("/opt/ltesniffer/bin/LTESniffer"),   # offline appliance install location
 }
 
 
@@ -160,6 +161,7 @@ class SnifferRunner:
         self._frames_task: Optional[asyncio.Task] = None  # periodic live-pcap frame count
         self._run_dir: Optional[Path] = None            # timestamped subdir for this run's pcaps
         self._log_fp = None                             # per-run sniffer.log for the history browser
+        self._diag_fp = None                            # per-run ul_diag.log (Dense Test mode only)
         self._subscribers: set[asyncio.Queue] = set()
         self._last_events: deque[dict[str, Any]] = deque(maxlen=500)
         self._dropped_for_slow_consumer = 0
@@ -250,7 +252,7 @@ class SnifferRunner:
     def running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
-    async def start(self, cfg: SnifferConfig) -> None:
+    async def start(self, cfg: SnifferConfig, diag: bool = False) -> None:
         if self.running:
             raise RuntimeError("sniffer already running")
 
@@ -270,6 +272,17 @@ class SnifferRunner:
 
         argv = cfg.to_argv(str(self._fifo_path))
         argv[argv.index(cfg.binary_path)] = str(binary)
+
+        # --- Dense Test / diagnostic mode -----------------------------------
+        # Runs the SAME capture (normal pcap → Captures/Sessions) but turns on
+        # the env-gated UL diagnostics and saves their stdout to ul_diag.log in
+        # the run dir. Those diagnostics print to STDOUT, which is DEVNULL'd in a
+        # normal run; and they arrive via the process ENV, which sudo's env_reset
+        # would strip. So for diag mode we drop the `sudo -n` prefix and spawn the
+        # binary directly (the GUI user has plugdev USRP access — same as running
+        # it from a shell), which lets both the env and the stdout capture work.
+        if diag and argv[:2] == ["sudo", "-n"]:
+            argv = argv[2:]
 
         # Each run gets its own timestamped subdirectory so captures never
         # overwrite each other.  LTESniffer always uses hardcoded filenames
@@ -320,10 +333,31 @@ class SnifferRunner:
         child_env = dict(os.environ)
         if cfg.pcap_stream_fifo:
             child_env["LTESNIFFER_PCAP_STREAM"] = cfg.pcap_stream_fifo
+
+        # Diag mode: enable the UL diagnostics and capture their stdout to a file
+        # so it can be analyzed offline. Normal runs keep stdout on DEVNULL.
+        stdout_target = asyncio.subprocess.DEVNULL
+        self._diag_fp = None
+        if diag:
+            child_env.update({
+                "UL_RATE_DIAG": "1", "UL_DMRS_DIAG": "1",
+                "UL_TOFF_DIAG": "1", "UL_DMRS_DIAG_PWR": "2",
+            })
+            # NOTE: UL_DIVERSITY (2-RX) is intentionally NOT set here. Opening the
+            # UL USRP with 2 channels doubles its USB load and stalls the shared
+            # lock-step streamer, which collapses DL sync (measured: 89 -> 0.4
+            # DL frames/s, constant re-sync). Diversity needs streamer rework
+            # before it can be enabled by default. Set UL_DIVERSITY=1 manually
+            # only for isolated experiments.
+            try:
+                self._diag_fp = open(run_dir / "ul_diag.log", "w", buffering=1)
+                stdout_target = self._diag_fp
+            except OSError:
+                self._diag_fp = None
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *argv,
-                stdout=asyncio.subprocess.DEVNULL,   # we don't read it, and PIPE would fill at ~64KB and wedge LTESniffer
+                stdout=stdout_target,   # DEVNULL normally; ul_diag.log in diag mode
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(run_dir),
                 env=child_env,
@@ -592,6 +626,13 @@ class SnifferRunner:
             except OSError:
                 pass
             self._log_fp = None
+        diag_fp = getattr(self, "_diag_fp", None)
+        if diag_fp is not None:
+            try:
+                diag_fp.close()
+            except OSError:
+                pass
+            self._diag_fp = None
 
     def _cleanup_fifo(self) -> None:
         if self._fifo_dir:

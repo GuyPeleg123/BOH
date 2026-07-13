@@ -70,6 +70,8 @@ export const api = {
       method: "POST",
       body: cfg ? JSON.stringify(cfg) : "null",
     }),
+  denseTest: () =>
+    req<{ ok: boolean; state: RuntimeState }>("/api/capture/dense-test", { method: "POST" }),
   stop: () => req<{ ok: boolean; state: RuntimeState }>("/api/capture/stop", { method: "POST" }),
   restart: (cfg?: SnifferConfig) =>
     req<{ ok: boolean; state: RuntimeState }>("/api/capture/restart", {

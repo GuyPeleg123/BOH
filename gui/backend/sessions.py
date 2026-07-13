@@ -151,16 +151,17 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
         for r in C._tshark_fields(pcap, idf,
                                   ["frame.time_relative", "mac-lte.rnti", "mac-lte.rnti-type",
                                    "lte-rrc.m_TMSI", "lte-rrc.mmec", "e212.imsi",
-                                   "nas_eps.emm.m_tmsi"]):
-            r = (r + [""] * 7)[:7]
-            t, rnti_s, rtype, mtmsi, mmec, imsi, nas_mtmsi = r
+                                   "nas_eps.emm.m_tmsi", "mac-lte.direction"]):
+            r = (r + [""] * 8)[:8]
+            t, rnti_s, rtype, mtmsi_raw, mmec_raw, imsi_raw, nas_mtmsi_raw, direction = r
             # lte-rrc.m_TMSI is hex; nas_eps.emm.m_tmsi is decimal — normalize both,
             # and record which layer the value actually came from.
-            rrc_m = _norm_mtmsi(_first(mtmsi), decimal=False)
-            nas_m = _norm_mtmsi(_first(nas_mtmsi), decimal=True)
+            rrc_m = _norm_mtmsi(_first(mtmsi_raw), decimal=False)
+            nas_m = _norm_mtmsi(_first(nas_mtmsi_raw), decimal=True)
             mtmsi = rrc_m or nas_m
             src = "rrc-connreq" if rrc_m else "nas" if nas_m else None
-            imsi = _first(imsi); mmec = _first(mmec)
+            imsi = _first(imsi_raw); mmec = _first(mmec_raw)
+            is_ul = (_first(direction) == "0")     # mac-lte.direction: 0=UL, 1=DL
             if rtype == "3" and rnti_s:           # bound to a session's C-RNTI
                 s = sess.get(int(rnti_s))
                 if s is None:
@@ -173,9 +174,29 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                     idd["source"] = src
                 elif imsi and "source" not in idd:
                     idd["source"] = "nas"
+                # Track HOW we learned this identity. Seeing the TMSI/IMSI in the
+                # UPLINK (RRC ConnReq Msg3 / UL NAS) is the rare, valuable case;
+                # if we only ever saw it in the downlink it came from DL NAS /
+                # contention resolution. Sticky-true once any UL sighting occurs.
+                if is_ul:
+                    idd["from_ul"] = True
             else:                                  # paging / broadcast identity pool
-                if mtmsi or imsi:
-                    res["paging"].append({"t": _f(t), "m_tmsi": mtmsi, "imsi": imsi})
+                # A single paging PDU carries up to 16 PagingRecords; tshark
+                # comma-joins them per frame. Keep EVERY record, not just the
+                # first — this is the primary DL identity harvest (thousands in a
+                # busy tracking area), and taking only _first() dropped ~3 of
+                # every 4 paged M-TMSIs. mmec is paired positionally with m_TMSI
+                # to reconstruct each S-TMSI.
+                mm_list   = [m for m in (_norm_mtmsi(x, decimal=False)
+                                         for x in mtmsi_raw.split(",")) if m]
+                mmec_list = [x.strip() for x in mmec_raw.split(",") if x.strip()]
+                imsi_list = [x.strip() for x in imsi_raw.split(",") if x.strip()]
+                for i, mt in enumerate(mm_list):
+                    mc = mmec_list[i] if i < len(mmec_list) else ""
+                    res["paging"].append({"t": _f(t), "m_tmsi": mt, "mmec": mc,
+                                          "s_tmsi": (mc + mt) if (mc and mt) else None})
+                for im in imsi_list:               # paging-by-IMSI (rare)
+                    res["paging"].append({"t": _f(t), "imsi": im})
 
         # ---- pass 3: SIB1 PLMN (for GUTI assembly) ---------------------------
         plmn = ""
@@ -211,6 +232,11 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                 if cv.isdigit():
                     cmds.setdefault(rnti, []).append({"t": _f(r[0]), "cmd": int(cv)})
 
+        # Set of M-TMSIs seen in DL paging — lets us tell, for an identified
+        # session, whether that UE was ALSO paged (i.e. "DL paging + answered")
+        # vs only ever revealed in an UL message.
+        paged_mtmsi = {p["m_tmsi"] for p in res["paging"] if p.get("m_tmsi")}
+
         # ---- assemble sessions ----------------------------------------------
         out = []
         for rnti, s in sess.items():
@@ -230,6 +256,19 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                      else f"stmsi-{s_tmsi}" if s_tmsi else f"mtmsi-{m_tmsi}" if m_tmsi
                      else f"rnti-{rnti:04x}")
             confidence = "imsi" if imsi else "guti" if guti else "tmsi" if m_tmsi else "rnti-only"
+
+            # How we learned this UE's identity:
+            #   "ul"     – seen in the UPLINK (RRC ConnReq Msg3 / UL NAS). Rare & strong.
+            #   "paging" – identity also appears in DL paging => paged, then answered.
+            #   "dl"     – only seen in the downlink (DL NAS / contention resolution).
+            if confidence == "rnti-only":
+                id_via = None
+            elif idd.get("from_ul"):
+                id_via = "ul"
+            elif m_tmsi and m_tmsi in paged_mtmsi:
+                id_via = "paging"
+            else:
+                id_via = "dl"
 
             # TA anchor: most-recent unclaimed RAR just before this session started
             anchor = None
@@ -272,19 +311,37 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
                 "plmn": _plmn,
                 "identity": {"label": label, "confidence": confidence, "m_tmsi": m_tmsi,
                              "mmec": mmec, "s_tmsi": s_tmsi, "guti": guti, "imsi": imsi,
-                             "plmn": plmn or None, "source": idd.get("source")},
+                             "plmn": plmn or None, "source": idd.get("source"),
+                             "id_via": id_via, "from_ul": bool(idd.get("from_ul"))},
                 "ta": ta_block,
             })
 
         out.sort(key=lambda x: x["start"], reverse=True)
         res["sessions"] = out
         res["unmatched_rar"] = sum(1 for c in rar if not c["used"])
+        # DL paging harvest summary — the dominant identity source in a busy
+        # tracking area. This is independent of UL reception (paging is DL
+        # broadcast on P-RNTI), so it is reported separately from the UL-gated
+        # session-bound identities above.
+        pg = res["paging"]
+        res["paging_summary"] = {
+            "records":         len(pg),
+            "distinct_m_tmsi": len({p["m_tmsi"] for p in pg if p.get("m_tmsi")}),
+            "distinct_s_tmsi": len({p["s_tmsi"] for p in pg if p.get("s_tmsi")}),
+            "distinct_imsi":   len({p["imsi"] for p in pg if p.get("imsi")}),
+        }
         named = sum(1 for x in out if x["identity"]["confidence"] != "rnti-only")
         with_ta = sum(1 for x in out if x["ta"]["n_samples"] > 0)
         notes = []
+        pg_distinct = res["paging_summary"]["distinct_m_tmsi"]
+        if pg_distinct:
+            notes.append(f"DL paging harvested {pg_distinct} distinct M-TMSI "
+                         f"({res['paging_summary']['records']} records) — these are UEs registered "
+                         "in the tracking area, seen on P-RNTI broadcast (no UL needed).")
         if out and named == 0:
-            notes.append("No UE identities recovered in the clear — capture RRC Connection "
-                         "Requests / paging (API mode -z) or enable decrypt with keys.")
+            notes.append("No identity bound to a UL session in the clear (session-bound identity "
+                         "needs an UL RRC Connection Request / Msg3, which is UL-reception-limited); "
+                         "the DL paging pool above is the primary identity harvest.")
         if not do_decrypt:
             notes.append("Cleartext mode: GUTI/IMSI from encrypted NAS not included. "
                          "Enable decrypt with keys to complete identities.")
