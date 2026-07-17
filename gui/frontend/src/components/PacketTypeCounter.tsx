@@ -22,13 +22,18 @@ const LS_KEY = "ltesniffer-packet-types";
 // MAC-level frame types decoded from the per-subframe `sf` stream (classified
 // by RNTI) plus MIB. These are always-present built-ins — they're radio-layer
 // frame types, not NAS/RRC messages, so they can't be removed from the table.
+// These are derived from the DCI *grant* stream: one count per grant the eNB
+// scheduled (seen in the downlink), NOT per frame we actually decoded. Labelled
+// "grants (scheduled)" so they're never mistaken for captured frames — a UL
+// grant is a transmit opportunity assigned to a UE; whether we received and
+// decoded that PUSCH is a separate thing (see the "captured (pcap)" rows).
 const MAC_TYPES: { key: keyof AppFrameTypes; label: string }[] = [
   { key: "mib", label: "MIB" },
   { key: "sib", label: "SIB (system information)" },
   { key: "paging", label: "Paging" },
   { key: "rar", label: "RAR (random access)" },
-  { key: "dl_data", label: "DL data (C-RNTI)" },
-  { key: "ul_data", label: "UL data (C-RNTI)" },
+  { key: "dl_data", label: "DL grants (scheduled)" },
+  { key: "ul_data", label: "UL grants (scheduled)" },
 ];
 
 // Local alias so the keys above are type-checked against the store shape.
@@ -63,6 +68,11 @@ function saveTypes(types: string[]) {
 export function PacketTypeCounter() {
   const identities = useStore((s) => s.identities);
   const frameTypes = useStore((s) => s.frameTypes);
+  // Ground truth: frames that actually decoded (CRC-OK) and were written to the
+  // pcap, split by direction. These come from the backend polling the pcap on
+  // disk — NOT from the grant stream — so they match `tshark` exactly.
+  const pcapUl = useStore((s) => s.pcapUl);
+  const pcapDl = useStore((s) => s.pcapDl);
   const [types, setTypes] = useState<string[]>(loadTypes);
   const [input, setInput] = useState("");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -99,13 +109,20 @@ export function PacketTypeCounter() {
       count: frameTypes[m.key] ?? 0,
       builtin: true,
     }));
+    // Real decoded/captured frames from the pcap (direction-split). Shown
+    // alongside the "grants (scheduled)" rows so the gap between what the tower
+    // scheduled and what we actually received is visible at a glance.
+    const capturedRows: Row[] = [
+      { name: "DL captured (pcap)", count: pcapDl, builtin: true },
+      { name: "UL captured (pcap)", count: pcapUl, builtin: true },
+    ];
     const nasRows: Row[] = types.map((t) => ({
       name: t,
       count: counts.get(t) ?? 0,
       builtin: false,
       removeKey: t,
     }));
-    const all = [...macRows, ...nasRows];
+    const all = [...macRows, ...capturedRows, ...nasRows];
     const dir = sortDir === "desc" ? -1 : 1;
     all.sort((a, b) => {
       if (a.count !== b.count) return dir * (a.count - b.count);
@@ -114,7 +131,7 @@ export function PacketTypeCounter() {
       return a.name.localeCompare(b.name);
     });
     return all;
-  }, [frameTypes, types, counts, sortDir]);
+  }, [frameTypes, pcapUl, pcapDl, types, counts, sortDir]);
 
   function remove(t: string) {
     setTypes((prev) => prev.filter((x) => x !== t));

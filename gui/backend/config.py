@@ -32,6 +32,9 @@ class SnifferConfig(BaseModel):
     rf_freq: float = Field(0.0, description="Downlink centre frequency (Hz). -f")
     ul_freq: float = Field(0.0, description="Uplink centre frequency (Hz). -u")
     rf_gain: float = Field(-1.0, description="RX gain dB; -1 enables AGC. -g")
+    ul_rf_gain: float = Field(30.0, description="UL (rf_b) RX gain dB (-G). Lower it when an "
+                             "LNA is inline to protect the USRP: no LNA -> 50, with LNA -> 30. "
+                             "-1 follows the general gain.")
     rf_nof_rx_ant: int = Field(1, ge=1, le=4, description="Number of RX antennas. -A")
     rf_args: str = Field("", description="Free-form rfargs for single-USRP mode. -a")
     usrp_a_args: str = Field("", description="Override USRP A rfargs (dual mode). -X")
@@ -152,6 +155,8 @@ class SnifferConfig(BaseModel):
             argv += ["-u", str(int(self.ul_freq))]
         if self.rf_gain >= 0:
             argv += ["-g", str(self.rf_gain)]
+        if self.ul_rf_gain >= 0:                 # independent UL (rf_b) gain; lower with an LNA
+            argv += ["-G", str(self.ul_rf_gain)]
         if self.rf_nof_rx_ant != 1:
             argv += ["-A", str(self.rf_nof_rx_ant)]
         # clock_source is the single source of truth for the RX clock + time

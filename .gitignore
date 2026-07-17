@@ -24,3 +24,5 @@ ul_sample.raw
 .claude/settings.local.json
 .claude/worktrees/
 .claude/agent-memory/
+srsRAN.backtrace.crash
+*.crash

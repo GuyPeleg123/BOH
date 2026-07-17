@@ -43,6 +43,52 @@ _PCAP_MAGIC_LE = (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1")
 _PCAP_MAGIC_BE = (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d")
 
 
+def count_pcap_by_direction(path: Path) -> tuple[int, int]:
+    """Count MAC-LTE records split into (uplink, downlink) actually written.
+
+    These are the frames that DECODED (CRC-OK) and reached the pcap — the
+    ground truth. This is deliberately NOT the same as the live "grants"
+    counters the frontend derives from the DCI event stream: a UL grant is the
+    eNB *scheduling* a UE to transmit (seen in the strong downlink), whereas a
+    UL frame here is a PUSCH we actually received and decoded. On a passive
+    monitor the two differ enormously (e.g. 118 UL grants scheduled vs 4 UL
+    PUSCH captured), so the dashboard must show both, not conflate them.
+
+    Format: DLT_MAC_LTE (147). Each record payload starts with
+    radioType(1) | direction(1) | rntiType(1) | tags…, so byte offset 1 is the
+    direction: 0 = uplink, 1 = downlink. Verified byte-exact against
+    `tshark -Y 'mac-lte.direction==0/1'`. Returns (0, 0) on any error so a
+    mid-run read of a freshly-opened pcap is harmless.
+    """
+    ul = dl = 0
+    try:
+        with open(path, "rb") as f:
+            gh = f.read(24)
+            if len(gh) < 24:
+                return (0, 0)
+            if gh[:4] in _PCAP_MAGIC_LE:
+                endian = "<"
+            elif gh[:4] in _PCAP_MAGIC_BE:
+                endian = ">"
+            else:
+                return (0, 0)
+            while True:
+                rh = f.read(16)
+                if len(rh) < 16:
+                    break
+                caplen = struct.unpack(endian + "IIII", rh)[2]
+                payload = f.read(caplen)
+                if len(payload) >= 2:
+                    d = payload[1]          # byte 1 = direction: 0=UL, 1=DL
+                    if d == 0:
+                        ul += 1
+                    elif d == 1:
+                        dl += 1
+    except OSError:
+        return (0, 0)
+    return (ul, dl)
+
+
 def count_pcap_records(path: Path) -> int:
     """Count MAC records in a libpcap file by walking the record headers.
 
@@ -334,14 +380,60 @@ class SnifferRunner:
         if cfg.pcap_stream_fifo:
             child_env["LTESNIFFER_PCAP_STREAM"] = cfg.pcap_stream_fifo
 
+        # Per-UE wide UL timing search: for grants clearing UL_TIMING_ACQ_MINDB of
+        # allocated-RB energy, scan a wide FFT-window range and centre on that UE's
+        # SNR peak (the passive monitor sees every UE with its own geometry-dependent
+        # arrival offset; the narrow ±64 retry can't reach the ~700-sample systematic
+        # offset measured on this cell). Previously left off because the wide chest
+        # scan overloaded the RT path at 4 worker threads; with the 10-thread default
+        # (skip ~0.6%) it is affordable, and it is gated to the rare high-energy
+        # grants so it costs nothing on the ~99% that are noise.
+        child_env.setdefault("UL_TIMING_ACQ", "1")
+        child_env.setdefault("UL_TIMING_ACQ_MINDB", "4")
+        child_env.setdefault("UL_TIMING_ACQ_MAX", "800")
+
         # Diag mode: enable the UL diagnostics and capture their stdout to a file
         # so it can be analyzed offline. Normal runs keep stdout on DEVNULL.
         stdout_target = asyncio.subprocess.DEVNULL
         self._diag_fp = None
         if diag:
+            # UL_DMRS_DIAG_PWR=-20 so the DMRS-cyclic-shift + time-offset sweeps
+            # also fire on the weak grants we're investigating (was 2 dB, which
+            # only the rare strong grant cleared). UL_FAIL_DIAG adds the failure
+            # breakdown. UL_IQ_REC saves each grant's raw pre-FFT IQ into the run
+            # dir so failing grants can be replayed offline through the real
+            # decoder (the only way to tell an inflated chest SNR from a genuine
+            # decodable-but-failing grant).
+            iq_dir = run_dir / "iq"
+            try:
+                iq_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
             child_env.update({
+                # NEW from-scratch calibrated-window UL decoder (docs/UlDenseDecoder.md).
+                # Replaces the legacy per-grant decode on the Dense Test button: it
+                # self-calibrates the ~-725-sample systematic UL-window offset from
+                # strong DMRS locks, then decodes each grant at (C_fixed + per-UE
+                # residual). The legacy Start button path is unchanged.
+                "UL_DENSE2": "1",
                 "UL_RATE_DIAG": "1", "UL_DMRS_DIAG": "1",
-                "UL_TOFF_DIAG": "1", "UL_DMRS_DIAG_PWR": "2",
+                # -100 so the DMRS-cyclic-shift + time-offset sweeps fire on EVERY
+                # grant (the weak grants we're chasing sit below any realistic power
+                # gate). This is the decisive DMRS-config bug check: if a non-signaled
+                # cyclic shift yields markedly higher SNR than the signaled one, our
+                # DMRS extraction is wrong; if all 8 cap at the same low SNR, the
+                # signal is genuinely that weak (RF-limited).
+                "UL_TOFF_DIAG": "1", "UL_DMRS_DIAG_PWR": "-100",
+                "UL_FAIL_DIAG": "1",
+                "UL_IQ_REC": "1", "UL_IQ_DIR": str(iq_dir), "UL_IQ_MAX": "600",
+                # NOTE: the blind wide per-UE timing SEARCH (UL_TIMING_ACQ) is
+                # intentionally OFF — on this cell ~43% of grants cleared the energy
+                # gate, so the 24-chest wide search ran on half the grants and
+                # dropped 26% of subframes (RT overload). The right per-UE timing
+                # mechanism is TA-DIRECTED (one window shift computed from the
+                # eNB-commanded Timing Advance we decode in the DL), not a blind
+                # search — see solution.txt. Left available via env for isolated
+                # experiments only.
             })
             # NOTE: UL_DIVERSITY (2-RX) is intentionally NOT set here. Opening the
             # UL USRP with 2 channels doubles its USB load and stalls the shared
@@ -543,8 +635,10 @@ class SnifferRunner:
         p = self._live_pcap(run_dir)
         if p is None:
             return
-        count = await asyncio.get_running_loop().run_in_executor(None, count_pcap_records, p)
-        self._broadcast({"t": "frames", "ts": time.time(), "count": count})
+        loop = asyncio.get_running_loop()
+        count = await loop.run_in_executor(None, count_pcap_records, p)
+        ul, dl = await loop.run_in_executor(None, count_pcap_by_direction, p)
+        self._broadcast({"t": "frames", "ts": time.time(), "count": count, "ul": ul, "dl": dl})
 
     async def _poll_frames(self, run_dir: Path) -> None:
         """Every ~2 s, count MAC records in the live pcap and broadcast it.
@@ -558,7 +652,8 @@ class SnifferRunner:
                 p = self._live_pcap(run_dir)
                 if p is not None:
                     count = await loop.run_in_executor(None, count_pcap_records, p)
-                    self._broadcast({"t": "frames", "ts": time.time(), "count": count})
+                    ul, dl = await loop.run_in_executor(None, count_pcap_by_direction, p)
+                    self._broadcast({"t": "frames", "ts": time.time(), "count": count, "ul": ul, "dl": dl})
                 await asyncio.sleep(self._FRAMES_POLL_S)
         except asyncio.CancelledError:
             pass

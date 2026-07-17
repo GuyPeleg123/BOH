@@ -80,6 +80,8 @@ export interface AppState {
   // `rntis` map — so counts stay accurate across a multi-day capture.
   frameTypes: { mib: number; sib: number; paging: number; rar: number; dl_data: number; ul_data: number };
   pcapFrames: number;                    // live frame count of the final pcap (from backend `frames` events)
+  pcapUl: number;                        // UL frames actually DECODED + written to pcap (truth, != UL grants)
+  pcapDl: number;                        // DL frames actually DECODED + written to pcap
   rateSamples: RateSample[];             // for sliding-window rates
   monotonic: number;                     // last-seen event ts (sniffer side)
 }
@@ -104,6 +106,8 @@ const initial: AppState = {
   totals: { dci: 0, dci_dl: 0, dci_ul: 0, tbs: 0, rb: 0, sf: 0 },
   frameTypes: { mib: 0, sib: 0, paging: 0, rar: 0, dl_data: 0, ul_data: 0 },
   pcapFrames: 0,
+  pcapUl: 0,
+  pcapDl: 0,
   rateSamples: [],
   monotonic: 0,
 };
@@ -150,6 +154,8 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
   let totals = s.totals;
   let frameTypes = s.frameTypes;
   let pcapFrames = s.pcapFrames;
+  let pcapUl = s.pcapUl;
+  let pcapDl = s.pcapDl;
   let rateSamples = s.rateSamples;
   let cell = s.cell;
   let hello = s.hello;
@@ -186,8 +192,13 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
         break;
       case "frames":
         // Live count of MAC records in the final pcap (backend polls the file
-        // on disk every ~2 s). Authoritative frame count — DCIs overcount.
+        // on disk every ~2 s). Authoritative frame count — the DCI-derived
+        // grant counters overcount because a scheduled grant may never decode.
+        // ul/dl are the real captured (CRC-OK, written-to-pcap) frames, split
+        // by direction — the ground truth vs the "grants scheduled" counters.
         pcapFrames = ev.count;
+        if (ev.ul != null) pcapUl = ev.ul;
+        if (ev.dl != null) pcapDl = ev.dl;
         break;
       case "stats":
         stats = ev;
@@ -314,6 +325,8 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
           totals = { dci: 0, dci_dl: 0, dci_ul: 0, tbs: 0, rb: 0, sf: 0 };
           frameTypes = { mib: 0, sib: 0, paging: 0, rar: 0, dl_data: 0, ul_data: 0 };
           pcapFrames = 0;
+          pcapUl = 0;
+          pcapDl = 0;
           rateSamples = [];
           cell = null;
           hello = null;
@@ -366,7 +379,8 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
   if (
     sfAppended === 0 && dciAppended === 0 && logsAppended === 0 && identitiesAppended === 0 &&
     !addedRntis && cell === s.cell && hello === s.hello && mib === s.mib && stats === s.stats &&
-    lifecycle === s.lifecycle && frameTypes === s.frameTypes && pcapFrames === s.pcapFrames
+    lifecycle === s.lifecycle && frameTypes === s.frameTypes && pcapFrames === s.pcapFrames &&
+    pcapUl === s.pcapUl && pcapDl === s.pcapDl
   ) {
     return s;
   }
@@ -377,7 +391,7 @@ function applyEvents(prev: AppState, evs: Event[]): AppState {
     latestSf, sfHistory,
     rntis: rntis ?? s.rntis,
     identities, logs, recentDci,
-    totals, frameTypes, pcapFrames, rateSamples,
+    totals, frameTypes, pcapFrames, pcapUl, pcapDl, rateSamples,
     lifecycle, pid, argv,
     monotonic,
     startedAt: s.startedAt,

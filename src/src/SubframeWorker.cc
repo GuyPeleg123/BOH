@@ -138,6 +138,13 @@ SubframeWorker::SubframeWorker(uint32_t idx,
       ERROR("Error initiating ENB UL");
       return;
     }
+    /* From-scratch calibrated-window UL decode (env UL_DENSE2 / GUI Dense Test).
+       Uses radio-A's initialized enb_ul + the shared snapshot scratch, in place
+       of puschdecoder->decode() when enabled. */
+    if (UlDenseDecoder::enabled())
+      densedecoder = new UlDenseDecoder(enb_ul, ul_sf, ul_cfg, ulsche,
+                                        sfb.sf_buffer_b, sfb.sf_buffer_offset,
+                                        pcapwriter, mcs_tracking);
     break;
   default:
     break;
@@ -151,6 +158,8 @@ SubframeWorker::~SubframeWorker()
   srsran_ue_dl_free(falcon_ue_dl.q);
   delete pdschdecoder;
   pdschdecoder = nullptr;
+  delete densedecoder;
+  densedecoder = nullptr;
   srsran_filesink_free(&filesink);
 }
 
@@ -428,6 +437,17 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
       ulsche->pushULSche(tti, dci_ul);
       /*Push current RAR grant to database to decode 4ms later*/
       ulsche->push_rar_ULSche(tti, rar_dci_ul_vector);
+      if (densedecoder) {
+        /* Calibrated-window from-scratch UL decode (UL_DENSE2). Replaces the
+           legacy per-grant decode; PRACH still handled by the legacy path. */
+        densedecoder->init(ulsche->getULSche(tti),
+                           ulsche->get_rar_ULSche(tti),
+                           ul_sf,
+                           &subframeInfo.getSubframePower());
+        densedecoder->decode();
+        // PRACH intentionally skipped in v1 dense mode (legacy PRACH state is not
+        // initialized on this path); PUSCH-window recovery is the focus here.
+      } else {
       puschdecoder->init_pusch_decoder(ulsche->getULSche(tti),
                                        ulsche->get_rar_ULSche(tti),
                                        ul_sf,
@@ -438,6 +458,7 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
       //                                  &subframeInfo.getSubframePower());
       puschdecoder->decode();         // decode PUSCH
       puschdecoder->work_prach();     // decode PRACH
+      }
       // puschdecoder_b->decode();         // decode PUSCH
       // puschdecoder_b->work_prach();     // decode PRACH
       ulsche->deleteULSche(tti);      // delete current DCI0 list and uplink grant in the database after decoding

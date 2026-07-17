@@ -24,6 +24,7 @@ using namespace rrc;
 
 #include <iostream>
 #include <fstream>
+#include <unordered_map>
 
 // include C-only headers
 #ifdef __cplusplus
@@ -61,6 +62,14 @@ public:
                             srsran_ul_sf_cfg_t &ul_sf,
                             SubframePower* sf_power);
     void decode();
+
+    /* Grant-keyed raw-IQ capture of the NOMINAL-window decode (env UL_IQ_REC).
+       Called once per grant right after the pass-1 decode, before any offset
+       retry mutates sf_symbols, so the stored IQ + config + result form a
+       self-consistent set that the offline replay tool reproduces exactly. */
+    void maybe_capture_iq(DCI_UL &decoding_mem, bool crc,
+                          float nominal_snr, float nominal_ta_us,
+                          bool offset_retry_enabled);
 
     int  decode_rrc_connection_request(DCI_UL &decoding_mem, uint8_t* sdu_ptr, int length);
     int  decode_ul_dcch(DCI_UL &decoding_mem, uint8_t* sdu_ptr, int length);
@@ -119,6 +128,31 @@ private:
        clean pre-FFT snapshot in sf_buffer_offset[0]. Returns false if the offset
        would read outside the available buffer. */
     bool refft_at_offset(int sample_offset);
+
+    /* Env-gated (UL_SYNC_ADAPTER) grant-specific UplinkSyncAdapter fallback: runs
+       the staged per-UE timing/CFO estimator on the pre-FFT snapshot and, if it
+       accepts, decodes on the corrected symbols. Uses a PRIVATE enb_ul scratch so
+       the wide search never touches the shared raw buffer. Lazily initialized. */
+    void ensure_sync_adapter();
+    class UplinkSyncAdapter* sync_adapter_ = nullptr;
+    srsran_enb_ul_t*         adapter_enb_ul_ = nullptr;
+    std::vector<cf_t>        adapter_in_buf_;
+
+    /* HARQ soft-combining (env UL_HARQ_COMBINE). Persistent per-(RNTI, HARQ
+       process) rx softbuffers: on a NEW transmission the buffer is reset; on a
+       retransmission the soft bits ACCUMULATE across TTIs (srsRAN de-rate-matches
+       additively), so a grant that fails single-shot can decode once combined.
+       Applied to the NOMINAL-window decode only; the offset-retry / adapter use
+       the default scratch buffer so alternate-window probes never pollute HARQ. */
+    srsran_softbuffer_rx_t* harq_get(uint16_t rnti, uint32_t pid, bool is_new_tx);
+    std::unordered_map<uint64_t, srsran_softbuffer_rx_t*> harq_buffers_;
+    // Per-(RNTI,HARQ-process) last DCI0 NDI. A grant whose NDI matches the stored
+    // value for its process is a RETRANSMISSION of the same TB (NDI only toggles
+    // on new data); that is how we detect retx (the is_retx field is unused).
+    std::unordered_map<uint64_t, int> harq_last_ndi_;
+    srsran_softbuffer_rx_t* default_sb_ = nullptr;
+    bool harq_on_       = false;
+    bool harq_no_reset_ = false;   // read by decode_run to skip the per-call reset
 
     bool        decoder_a = false;
     bool        decoder_b = false;

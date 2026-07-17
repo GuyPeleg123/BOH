@@ -11,6 +11,7 @@
 #include "ULSchedule.h"
 #include "falcon/prof/Lifetime.h"
 #include "UL_Sniffer_PUSCH.h"
+#include "UlDenseDecoder.h"
 #include "srsran/phy/io/filesink.h"
 #include "Sniffer_dependency.h"
 
@@ -82,6 +83,7 @@ private:
   srsran_enb_ul_t       enb_ul_b = {};
   PUSCH_Decoder         *puschdecoder;
   PUSCH_Decoder         *puschdecoder_b;
+  UlDenseDecoder        *densedecoder = nullptr;   // from-scratch calibrated-window UL path (UL_DENSE2)
   srsran_ul_sf_cfg_t    ul_sf;
   srsran_ul_cfg_t       ul_cfg = {};
   UL_HARQ               *ul_harq;

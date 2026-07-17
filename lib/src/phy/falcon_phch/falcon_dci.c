@@ -229,6 +229,19 @@ int srsran_dci_msg_to_trace_timestamp(srsran_dci_msg_t *msg,
           INFO("Invalid uplink resource allocation\n");
           return ret;
         }
+        /* srsran_ra_ul_dci_to_grant() copies mcs/rv/RB alloc but NOT the DMRS
+           cyclic shift, so grant->n_dmrs stayed 0 and every UE's DMRS was
+           extracted with cyclic shift 0 regardless of the value the eNB signalled
+           in the DCI0 "cyclic shift for DM RS" field. Propagate it here so the
+           per-grant DMRS sequence matches the transmitted one. */
+        /* A/B toggle: UL_NO_DMRS_FIX=1 reverts to the old (buggy) behavior of
+           leaving n_dmrs=0, so the fix's effect can be measured back-to-back. */
+        static int dmrs_fix_off = -1;
+        if (dmrs_fix_off < 0) { const char* e = getenv("UL_NO_DMRS_FIX"); dmrs_fix_off = (e && *e) ? 1 : 0; }
+        if (!dmrs_fix_off) {
+          container->ran_ul_grant->n_dmrs     = container->ran_ul_dci->n_dmrs;
+          container->ran_ul_grant_256->n_dmrs = container->ran_ul_dci->n_dmrs;
+        }
         convert_ul_grant(container->ran_ul_grant, container->ul_grant);
 
         if (crc_is_crnti == true) {

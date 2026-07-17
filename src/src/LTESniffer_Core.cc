@@ -521,6 +521,28 @@ bool LTESniffer_Core::run(){
 
 #ifndef DISABLE_RF
   if (args.input_file_name == "") {
+    /* Common-epoch latch for the dual-radio case. Before streaming, latch BOTH
+       radios' time registers to the SAME shared-1PPS edge. Previously each radio
+       free-ran on its own epoch (~2.3s apart), so the recv-wrapper's UL/DL sample
+       realignment — gated on time_sec_a == time_sec_b — was permanently dormant,
+       leaving the UL FFT window at a random per-run offset from the true UL
+       subframe (wildly variable / mostly-zero UL yield regardless of signal).
+       Both handles are already open, so these two calls fall inside the same 1PPS
+       window and schedule the reset on the same next edge; we then wait one full
+       PPS period for it to take before starting the streams. Requires a shared
+       external 1PPS on both B210s (the dual-mode hardware prerequisite). */
+    if (rf_b_open && !getenv("LTESNIFFER_NO_PPS_SYNC")) {
+      srsran_rf_sync(&rf_a);
+      srsran_rf_sync(&rf_b);
+      usleep(1100000); // let the next common PPS edge latch on both radios
+      time_t sa = 0, sb = 0; double fa = 0, fb = 0;
+      srsran_rf_get_time(&rf_a, &sa, &fa);
+      srsran_rf_get_time(&rf_b, &sb, &fb);
+      printf("[PPS-SYNC] post-latch device time: A=%ld.%06.0f B=%ld.%06.0f | diff=%.1f us (secs_eq=%d)\n",
+             (long)sa, fa * 1e6, (long)sb, fb * 1e6,
+             ((double)(sa - sb) + (fa - fb)) * 1e6, (int)(sa == sb));
+      fflush(stdout);
+    }
     if (rf_b_open) srsran_rf_start_rx_stream(&rf_b, false);
     srsran_rf_start_rx_stream(&rf_a, false);
   }
@@ -952,52 +974,71 @@ int srsran_rf_recv_multi_usrp_wrapper( void* rf_a,
 
   nof_sf++;
 
-  /*If time stamp from usrp a == usrp b in second resolution, but different in fraction of second */
-  if ((time_sec_a == time_sec_b) && !uhd_stop ){ //&& (nof_sf > 2000)
-    /*calculate the time difference*/
-    // fabs, not abs: abs() is the int overload here (only <math.h>/<stdlib.h>
-    // are included), so abs(0.0003)==0 made diff_time always 0 and the entire
-    // rf_a/rf_b re-align below a dead no-op. Real UL timing alignment needs it.
-    double diff_time = fabs(rev_frac_secs_a - rev_frac_secs_b);
-    /*if the time difference higher than 1 micro second*/
-    if ((diff_time > 0.000001) && (diff_time < 0.001)){
-      /*Convert time difference to number of samples*/
+  /* RF capture-integrity diagnostic (opt-in UL_TS_DIAG). Logs the FULL radio-A vs
+     radio-B hardware-timestamp difference every ~1000 subframes — UNCONDITIONALLY,
+     i.e. NOT gated on the seconds matching. This verifies whether radio B stays
+     sample-aligned with radio A over the whole capture, and whether the two device
+     clocks even share a second boundary (they only do when the shared PPS re-latch
+     ran; set_time_unknown_pps is skipped for single-antenna radios). Full diff =
+     (secs_a - secs_b) + (frac_a - frac_b), reported in us and samples. */
+  if (getenv("UL_TS_DIAG")) {
+    static uint64_t ts_n = 0, ts_realign = 0; static double ts_absmax_us = 0.0;
+    double full_diff_s = (double)(rev_secs_a - rev_secs_b) + (rev_frac_secs_a - rev_frac_secs_b);
+    double us = full_diff_s * 1e6, samp = full_diff_s * nsamples * 1000.0;
+    if (fabs(rev_frac_secs_a - rev_frac_secs_b) > 0.000001) ts_realign++;
+    if (fabs(us) > ts_absmax_us) ts_absmax_us = fabs(us);
+    if ((ts_n++ % 1000) == 0)
+      printf("[ULTS] sf=%llu | secs_eq=%d | A-B full diff = %.3f us (%.0f samples) | |max|=%.3f us | frac-realigns=%llu\n",
+             (unsigned long long)ts_n, (int)(time_sec_a == time_sec_b), us, samp,
+             ts_absmax_us, (unsigned long long)ts_realign);
+    fflush(stdout);
+  }
+
+  /* Sub-second SAMPLE alignment between the two radios.
+     Now that the Pi emits a REAL, coherent 1-PPS (the old pps.sh never toggled
+     GPIO18 at all), the two radios' FRACTIONAL second counters differ only by the
+     true sub-second sample skew (~sub-ms, stable), plus a CONSTANT integer-second
+     offset because each radio latches a different 1-PPS edge. That integer offset
+     does NOT affect subframe/sample alignment. Previously this whole block was
+     gated on time_sec_a == time_sec_b — which never held (radios ~2s apart) — so
+     the realign was a permanent no-op and the UL FFT window sat at a random per-run
+     offset from the true UL subframe (the root cause of low/variable UL yield).
+     Align on the WRAP-AWARE fractional skew, independent of the integer offset. */
+  {
+    double frac_diff = rev_frac_secs_a - rev_frac_secs_b;   // signed sub-second skew
+    if (frac_diff >  0.5) frac_diff -= 1.0;                 // wrap when fracs straddle a second boundary
+    if (frac_diff < -0.5) frac_diff += 1.0;
+    double diff_time  = fabs(frac_diff);
+    bool   a_ahead    = (frac_diff > 0.0);                  // A's frac later => A faster => trim B
+    /*if the time difference higher than 1 micro second, below 1 ms: fine trim*/
+    if (!uhd_stop && (diff_time > 0.000001) && (diff_time < 0.001)){
       int nof_offset_sample = diff_time * nsamples * 1000;
-      /*if the number of samples higher than 1 subframe samples*/
       nof_offset_sample = (nof_offset_sample > nsamples)? nsamples:nof_offset_sample;
-      /*prepare dummy buffer to adjust samples*/
       void* dummy_ptr[SRSRAN_MAX_PORTS];
-      for (int i = 0; i < SRSRAN_MAX_PORTS; i++) {
-        dummy_ptr[i] = uhd_dummy_buffer[i];
-      }
-      if (rev_frac_secs_a > rev_frac_secs_b){ //if usrp a is faster than usrp b
-        std::cout << "[USRP] Re-align samples from USRP B" << " -- time_a = " << rev_frac_secs_a << " -- time_b= " << rev_frac_secs_b << " -- diff = " << diff_time << " -- nof_sample = " << nof_offset_sample << std::endl;
+      for (int i = 0; i < SRSRAN_MAX_PORTS; i++) dummy_ptr[i] = uhd_dummy_buffer[i];
+      if (a_ahead){
+        std::cout << "[USRP] Re-align samples from USRP B -- frac_a = " << rev_frac_secs_a << " -- frac_b= " << rev_frac_secs_b << " -- diff = " << diff_time << " -- nof_sample = " << nof_offset_sample << std::endl;
         srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_b, dummy_ptr, nof_offset_sample, true, NULL, NULL);
-      }else{ // usrp b is faster than usrp a
-        std::cout << "[USRP] Re-align samples from USRP A" << " -- time_a = " << rev_frac_secs_a << " -- time_b= " << rev_frac_secs_b << " -- diff = " << diff_time << " -- nof_sample = " << nof_offset_sample << std::endl;
+      }else{
+        std::cout << "[USRP] Re-align samples from USRP A -- frac_a = " << rev_frac_secs_a << " -- frac_b= " << rev_frac_secs_b << " -- diff = " << diff_time << " -- nof_sample = " << nof_offset_sample << std::endl;
         srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_a, dummy_ptr, nof_offset_sample, true, NULL, NULL);
       }
     }
-    else if (diff_time >= 0.001 && align_usrp){
+    /*coarse (>= 1 ms): consume whole subframes, one-shot*/
+    else if (!uhd_stop && diff_time >= 0.001 && align_usrp){
       int nof_loop = std::round(diff_time*1000);
       void* dummy_ptr[SRSRAN_MAX_PORTS];
-      for (int i = 0; i < SRSRAN_MAX_PORTS; i++) {
-        dummy_ptr[i] = uhd_dummy_buffer[i];
-      }
-      std::string usrp_name = (rev_frac_secs_a > rev_frac_secs_b)? "B":"A";
-      std::cout << "[USRP] Re-align USRP " << usrp_name <<" in multiple subframes (frac_second) = " << diff_time << " -- nof_loop = " << nof_loop << std::endl;
+      for (int i = 0; i < SRSRAN_MAX_PORTS; i++) dummy_ptr[i] = uhd_dummy_buffer[i];
+      std::cout << "[USRP] Re-align USRP " << (a_ahead?"B":"A") << " in multiple subframes (frac_second) = " << diff_time << " -- nof_loop = " << nof_loop << std::endl;
       for (int dm_loop = 0; dm_loop < nof_loop; dm_loop++){
-        if ((rev_frac_secs_a > rev_frac_secs_b) && !uhd_stop){ //adjust usrp b
+        if (a_ahead && !uhd_stop){
           srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_b, dummy_ptr, nsamples, true, NULL, NULL);
-        }else if ((rev_frac_secs_a < rev_frac_secs_b) && !uhd_stop){
+        }else if (!a_ahead && !uhd_stop){
           srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_a, dummy_ptr, nsamples, true, NULL, NULL);
         }
       }
       align_usrp = false;
     }
-  //if timestamp are different in many seconds, then adjust until they are equal in second
-  }else if ((time_sec_a != time_sec_b) && align_usrp){
-    //not implemented yet
   }
 
   return SRSRAN_SUCCESS;

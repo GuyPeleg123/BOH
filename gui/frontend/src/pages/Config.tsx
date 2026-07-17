@@ -51,6 +51,8 @@ const SECTIONS: Section[] = [
       { key: "rf_freq",       label: "DL frequency (MHz)", flag: "-f", widget: "freq" },
       { key: "ul_freq",       label: "UL frequency (MHz)", flag: "-u", widget: "freq" },
       { key: "rf_gain",       label: "RX gain (dB, -1 = AGC)", flag: "-g" },
+      { key: "ul_rf_gain",    label: "UL gain (dB, -G)", flag: "-G",
+        hint: "No LNA → 50.  With LNA → 30 (lower gain protects the USRP from the LNA)." },
       { key: "rf_nof_rx_ant", label: "RX antennas", flag: "-A" },
       { key: "clock_source",  label: "Clock / time source", flag: "clock=", widget: "select",
         hint: "Injected as clock=… into the USRP args (overrides any clock= you type below). internal = onboard oscillator; gpsdo = onboard GPSDO (10 MHz + 1 PPS from GPS); external = REF IN (10 MHz) + PPS IN (1 PPS) shared reference. For dual-USRP UL sync, feed one shared external reference into both radios and pick 'external'." },

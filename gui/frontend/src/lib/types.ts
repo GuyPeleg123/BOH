@@ -31,7 +31,7 @@ export type Event =
       sample_rate: number;
     }
   | { t: "mib"; ts: number; sfn: number; sfn_offset: number }
-  | { t: "frames"; ts: number; count: number }
+  | { t: "frames"; ts: number; count: number; ul?: number; dl?: number }
   | { t: "sf_tick"; ts: number; sfn: number; sf: number; cfi: number; dl_n: number; ul_n: number }
   | {
       t: "sf";
@@ -75,6 +75,7 @@ export interface SnifferConfig {
   rf_freq: number;
   ul_freq: number;
   rf_gain: number;
+  ul_rf_gain: number;
   rf_nof_rx_ant: number;
   rf_args: string;
   usrp_a_args: string;

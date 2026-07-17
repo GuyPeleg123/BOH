@@ -1,7 +1,13 @@
 #include "include/UL_Sniffer_PUSCH.h"
+#include "include/RawIQRecorder.h"
+#include "include/UlIqCapture.h"
+#include "include/UplinkSyncAdapter.h"
 #include <cassert>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
+#include <vector>
+#include <cmath>
 
 bool valid_prb_ul[101] = {true, true, true, true, true, true, true, false, true, true, true, false, true,
                           false, false, true, true, false, true, false, true, false, false, false, true, true,
@@ -11,6 +17,12 @@ bool valid_prb_ul[101] = {true, true, true, true, true, true, true, false, true,
                           false, false, false, false, false, false, false, true, false, false, true, false, false,
                           false, false, true, true, false, false, false, false, false, false, false, false, true,
                           false, false, false, false, false, true, false, false, false, true};
+
+/* Process-wide UplinkSyncAdapter live counters (all worker threads), reported by
+   the UL_RATE_DIAG summary so the adapter's live contribution is visible. */
+static std::atomic<uint64_t> g_sync_fired{0}, g_sync_recovered{0};
+/* HARQ soft-combining: retransmissions seen, and those that decoded at nominal. */
+static std::atomic<uint64_t> g_harq_recovered{0}, g_harq_retx_seen{0};
 
 PUSCH_Decoder::PUSCH_Decoder(srsran_enb_ul_t &enb_ul,
                              srsran_ul_sf_cfg_t &ul_sf,
@@ -39,6 +51,8 @@ PUSCH_Decoder::PUSCH_Decoder(srsran_enb_ul_t &enb_ul,
     pusch_res.data = srsran_vec_u8_malloc(2000 * 8);
     ul_cfg.pusch.softbuffers.rx = new srsran_softbuffer_rx_t;
     srsran_softbuffer_rx_init(ul_cfg.pusch.softbuffers.rx, SRSRAN_MAX_PRB);
+    default_sb_ = ul_cfg.pusch.softbuffers.rx;
+    harq_on_ = (getenv("UL_HARQ_COMBINE") != nullptr);
 
     /* Scratch for the nominal-window symbols (used by the offset-retry pass).
        enb_ul.sf_symbols is allocated for max_prb=110, CP normal. */
@@ -58,6 +72,63 @@ PUSCH_Decoder::~PUSCH_Decoder()
     srsran_softbuffer_rx_free(ul_cfg.pusch.softbuffers.rx);
     if (sf_symbols_nominal) { free(sf_symbols_nominal); sf_symbols_nominal = nullptr; }
     if (sf_symbols_ant1)    { free(sf_symbols_ant1);    sf_symbols_ant1 = nullptr; }
+    if (sync_adapter_)  { delete sync_adapter_;  sync_adapter_ = nullptr; }
+    if (adapter_enb_ul_){ srsran_enb_ul_free(adapter_enb_ul_); delete adapter_enb_ul_; adapter_enb_ul_ = nullptr; }
+    for (auto& kv : harq_buffers_) { srsran_softbuffer_rx_free(kv.second); delete kv.second; }
+    harq_buffers_.clear();
+}
+
+/* Fetch (or create) the persistent rx softbuffer for this UE's HARQ process.
+   Reset it only on a new transmission; on a retransmission it keeps the prior
+   soft bits so srsran_pusch_decode accumulates. Bounded map with FIFO eviction
+   so a long capture with many RNTIs cannot grow without limit. */
+srsran_softbuffer_rx_t* PUSCH_Decoder::harq_get(uint16_t rnti, uint32_t pid, bool is_new_tx)
+{
+    uint64_t key = ((uint64_t)rnti << 8) | (pid & 0xff);
+    auto it = harq_buffers_.find(key);
+    srsran_softbuffer_rx_t* sb;
+    if (it == harq_buffers_.end()) {
+        if (harq_buffers_.size() >= 128) {  // bound live HARQ buffers (each ~MAX_PRB)
+            auto victim = harq_buffers_.begin();
+            srsran_softbuffer_rx_free(victim->second); delete victim->second;
+            harq_buffers_.erase(victim);
+        }
+        sb = new srsran_softbuffer_rx_t;
+        srsran_softbuffer_rx_init(sb, SRSRAN_MAX_PRB);
+        harq_buffers_[key] = sb;
+        is_new_tx = true;  // first sighting => treat as a fresh transmission
+    } else {
+        sb = it->second;
+    }
+    if (is_new_tx) srsran_softbuffer_rx_reset(sb);
+    return sb;
+}
+
+/* Lazily build the UplinkSyncAdapter and its PRIVATE enb_ul (own FFT + input
+   buffer) so the wide per-grant search runs entirely on scratch — the live
+   original_buffer / enb_ul are never mutated by the search. Cell + DMRS are copied
+   from the live enb_ul / ul_cfg exactly as the nominal decoder was configured. */
+void PUSCH_Decoder::ensure_sync_adapter()
+{
+    if (sync_adapter_) return;
+    adapter_in_buf_.assign(3 * SRSRAN_SF_LEN_PRB(100), cf_t{});
+    adapter_enb_ul_ = new srsran_enb_ul_t;
+    memset(adapter_enb_ul_, 0, sizeof(*adapter_enb_ul_));
+    if (srsran_enb_ul_init(adapter_enb_ul_, adapter_in_buf_.data(), 110)) {
+        delete adapter_enb_ul_; adapter_enb_ul_ = nullptr; return;
+    }
+    srsran_enb_ul_set_cell(adapter_enb_ul_, enb_ul.cell, &ul_cfg.dmrs, NULL);
+
+    UplinkSyncConfig scfg;
+    scfg.search_range   = []{ const char* e = getenv("UL_SYNC_RANGE");   return e ? atoi(e) : 1024; }();
+    scfg.coarse_step    = []{ const char* e = getenv("UL_SYNC_STEP");    return e ? atoi(e) : 16;   }();
+    scfg.max_candidates = []{ const char* e = getenv("UL_SYNC_CAND");    return e ? atoi(e) : 3;    }();
+    scfg.timing_mode    = TimingMode::FULL;
+
+    sync_adapter_ = new UplinkSyncAdapter();
+    if (!sync_adapter_->configure(adapter_enb_ul_, enb_ul.cell, ul_cfg.dmrs, scfg)) {
+        delete sync_adapter_; sync_adapter_ = nullptr;
+    }
 }
 
 int PUSCH_Decoder::decode_rrc_connection_request(DCI_UL &decoding_mem, uint8_t *sdu_ptr, int length)
@@ -266,7 +337,10 @@ int PUSCH_Decoder::decode_nas_ul(DCI_UL &decoding_mem, uint8_t *sdu_ptr, int len
 void PUSCH_Decoder::decode_run(std::string info, DCI_UL &decoding_mem, std::string modulation_mode, float falcon_signal_power)
 {
     int mcs_idx = ul_cfg.pusch.grant.tb.mcs_idx;
-    srsran_softbuffer_rx_reset_tbs(ul_cfg.pusch.softbuffers.rx, ul_cfg.pusch.grant.tb.tbs);
+    // HARQ combining: on a retransmission we must NOT reset — the soft bits from
+    // prior transmissions must remain so this decode accumulates onto them.
+    if (!harq_no_reset_)
+        srsran_softbuffer_rx_reset_tbs(ul_cfg.pusch.softbuffers.rx, ul_cfg.pusch.grant.tb.tbs);
 
     /*Do channel estimation to calculate timing difference between UL & DL subframes, because of diffrent propagation times*/
     int ret = srsran_chest_ul_estimate_pusch(&enb_ul.chest, &ul_sf, &ul_cfg.pusch, enb_ul.sf_symbols, &enb_ul.chest_res);
@@ -276,6 +350,36 @@ void PUSCH_Decoder::decode_run(std::string info, DCI_UL &decoding_mem, std::stri
     if (ret == SRSRAN_SUCCESS)
     {
         ret = srsran_pusch_decode(&enb_ul.pusch, &ul_sf, &ul_cfg.pusch, &enb_ul.chest_res, enb_ul.sf_symbols, &pusch_res);
+    }
+
+    /* Reject all-zero transport blocks (turbo-on-noise false positives).
+       At low SNR the turbo decoder converges to the all-zeros codeword; since
+       CRC-24 of all-zeros is all-zeros, that TB PASSES CRC and would be written
+       as a spurious frame (Wireshark dissects an all-zero UL-CCCH as
+       rrcConnectionReestablishmentRequest with zero identity). A valid MAC PDU is
+       never all-zero — even a CCCH message carries a non-zero RRC SDU, and any
+       data/padding subheader byte is non-zero — so an all-zero TB is always noise.
+       Force CRC=fail so it is excluded from the pcap, the yield counter, HARQ
+       combining and the offset-retry alike. Disable with UL_KEEP_ZERO_TB=1. */
+    if (pusch_res.crc && ul_cfg.pusch.grant.tb.tbs > 0)
+    {
+        static const bool keep_zero = (getenv("UL_KEEP_ZERO_TB") != nullptr);
+        if (!keep_zero)
+        {
+            const int nbytes = ul_cfg.pusch.grant.tb.tbs / 8;
+            bool all_zero = true;
+            for (int b = 0; b < nbytes; b++) { if (pusch_res.data[b] != 0) { all_zero = false; break; } }
+            if (all_zero)
+            {
+                pusch_res.crc = false;
+                static std::atomic<uint64_t> zc{0};
+                uint64_t n = zc.fetch_add(1) + 1;
+                if (getenv("UL_RATE_DIAG") && (n <= 5 || n % 100 == 0))
+                    printf("[ZEROTB] rejected all-zero TB #%llu (rnti=0x%x tti=%u tbs=%u snr=%.1f) — noise false positive\n",
+                           (unsigned long long)n, ul_cfg.pusch.rnti, ul_sf.tti,
+                           ul_cfg.pusch.grant.tb.tbs, enb_ul.chest_res.snr_db);
+            }
+        }
     }
 
     /*Only print debug when SNR of RNTI >= 1 */
@@ -729,8 +833,118 @@ bool PUSCH_Decoder::decode_grant(DCI_UL &decoding_mem)
     return pusch_res.crc;
 }
 
+void PUSCH_Decoder::maybe_capture_iq(DCI_UL &decoding_mem, bool crc,
+                                     float nominal_snr, float nominal_ta_us,
+                                     bool offset_retry_enabled)
+{
+    /* Store the pre-FFT snapshot the NOMINAL decode used (buffer_offset[0], valid
+       only when offset retry / UL mode is on) plus this grant's exact config and
+       the nominal result. The offline replay tool reruns the same nominal FFT ->
+       chest -> decode and must reproduce chest_sinr + CRC bit-for-bit; the timing
+       search / estimator variants are then explored offline, not here. */
+    if (!RawIQRecorder::instance().enabled() || !offset_retry_enabled ||
+        buffer_offset[0] == nullptr || RawIQRecorder::instance().quota_reached())
+        return;
+
+    // Chest-independent energy SNR: mean allocated-RB power minus the
+    // 10th-percentile RB-power floor (SubframePower is already in dB).
+    float e_snr = -100.0f, p_alloc = 0.0f, floor_db = 0.0f;
+    {
+        const auto& rbpow = sf_power->getRBPowerUL();
+        uint32_t np = ul_cfg.pusch.grant.n_prb[0], L = ul_cfg.pusch.grant.L_prb;
+        if (L > 0 && rbpow.size() >= (size_t)np + L) {
+            for (uint32_t k = 0; k < L; k++) p_alloc += rbpow[np + k];
+            p_alloc /= (float)L;
+            std::vector<float> tmp(rbpow.begin(), rbpow.end());
+            size_t p10 = tmp.size() / 10;
+            std::nth_element(tmp.begin(), tmp.begin() + p10, tmp.end());
+            floor_db = tmp[p10];
+            e_snr = p_alloc - floor_db;
+        }
+    }
+    const bool nan_chest = !std::isfinite(nominal_snr);
+
+    // Bounded policy: keep the scientifically useful cases in full — successes,
+    // retransmissions, REAL timing outliers (|ta|>5us on a VALID finite chest),
+    // strong failures, and high-energy chest failures. Everything driven by the
+    // weak RF bulk — including NaN-chest bursts with garbage TA, which must NOT
+    // be mislabelled timing outliers — is subsampled so the quota is spent on
+    // boundary cases, not thousands of sub-2 dB failures.
+    static std::atomic<uint64_t> pol_ctr{0};
+    uint64_t c = pol_ctr.fetch_add(1);
+    bool cap = false; const char* cat = "weak_fail";
+    if      (crc)                                    { cap = true;           cat = "crc_ok"; }
+    else if (decoding_mem.is_retx == 1)              { cap = true;           cat = "retx"; }
+    else if (nan_chest && e_snr >= 4.f)              { cap = true;           cat = "chest_nan"; }
+    else if (nan_chest)                              { cap = (c % 50 == 0);  cat = "chest_nan_weak"; }
+    else if (fabsf(nominal_ta_us) > 5.0f)            { cap = true;           cat = "timing_outlier"; }
+    else if (e_snr >= 4.f)                           { cap = true;           cat = "strong_fail"; }
+    else if (e_snr >= 2.f)                           { cap = (c % 10 == 0);  cat = "moderate_fail"; }
+    else if (e_snr >= 0.f)                           { cap = (c % 50 == 0);  cat = "weak_fail"; }
+    else                                             { cap = (c % 200 == 0); cat = "weak_fail"; }
+    if (!cap) return;
+
+    CaptureMeta m;
+    m.category = cat;
+    m.nof_prb  = enb_ul.cell.nof_prb;
+    m.cell_id  = enb_ul.cell.id;
+    m.cp       = (int)enb_ul.cell.cp;
+    m.tti = ul_sf.tti; m.sfn = ul_sf.tti / 10; m.sf_idx = ul_sf.tti % 10;
+    m.dmrs_cyclic_shift = ul_cfg.dmrs.cyclic_shift;
+    m.delta_ss          = ul_cfg.dmrs.delta_ss;
+    m.group_hop         = ul_cfg.dmrs.group_hopping_en ? 1 : 0;
+    m.seq_hop           = ul_cfg.dmrs.sequence_hopping_en ? 1 : 0;
+    m.rnti    = ul_cfg.pusch.rnti;
+    m.mcs_idx = ul_cfg.pusch.grant.tb.mcs_idx;
+    m.mod     = (int)ul_cfg.pusch.grant.tb.mod;
+    m.tbs     = ul_cfg.pusch.grant.tb.tbs;
+    m.rv      = ul_cfg.pusch.grant.tb.rv;
+    m.n_prb0  = ul_cfg.pusch.grant.n_prb[0];
+    m.L_prb   = ul_cfg.pusch.grant.L_prb;
+    m.n_dmrs  = ul_cfg.pusch.grant.n_dmrs;
+    m.is_retx = decoding_mem.is_retx;
+    m.energy_snr = e_snr;         m.chest_sinr = nominal_snr;
+    m.p_alloc = p_alloc;          m.noise_floor = floor_db;
+    m.ta_us = nominal_ta_us;      m.cfo_hz = enb_ul.chest_res.cfo_hz;
+    m.crc = crc ? 1 : 0;
+    // Internally-consistent rate for the stored snapshot: the decoder FFTs
+    // SRSRAN_SF_LEN_PRB(nof_prb) samples/subframe; the snapshot is 100-PRB sized.
+    const uint32_t snap_len = 3 * SRSRAN_SF_LEN_PRB(100);
+    m.requested_samples  = snap_len;
+    m.pusch_start_sample = 0; // target subframe begins at the snapshot start
+    m.sample_rate = (double)SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb) * 1000.0;
+
+    // Exact decode context (POD) so the burst replays bit-for-bit.
+    DecodeCtxBlob ctx{};
+    ctx.magic = UL_IQ_CTX_MAGIC; ctx.version = UL_IQ_CTX_VERSION;
+    ctx.cell_id = enb_ul.cell.id; ctx.nof_prb = enb_ul.cell.nof_prb;
+    ctx.cp = (int32_t)enb_ul.cell.cp; ctx.nof_ports = enb_ul.cell.nof_ports;
+    ctx.tti = ul_sf.tti; ctx.rnti = ul_cfg.pusch.rnti;
+    ctx.enable_64qam = ul_cfg.pusch.enable_64qam ? 1 : 0;
+    ctx.grant = ul_cfg.pusch.grant;
+    ctx.dmrs = ul_cfg.dmrs;
+    ctx.hopping = ul_cfg.hopping;
+    ctx.uci_cfg = ul_cfg.pusch.uci_cfg;
+    ctx.uci_offset = ul_cfg.pusch.uci_offset;
+    ctx.live_crc = crc ? 1 : 0;
+    ctx.live_snr_db = nominal_snr; ctx.live_ta_us = nominal_ta_us;
+    ctx.live_noise_estimate = enb_ul.chest_res.noise_estimate;
+    // Hash the live-decoded transport block so replay can prove byte-exact
+    // payload equivalence. pusch_res.data holds the TB from the nominal decode.
+    ctx.live_payload_hash = (crc && ul_cfg.pusch.grant.tb.tbs > 0)
+        ? ul_iq_fnv1a(pusch_res.data, ul_cfg.pusch.grant.tb.tbs / 8) : 0;
+    const uint8_t* cb = reinterpret_cast<const uint8_t*>(&ctx);
+    m.ctx_blob.assign(cb, cb + sizeof(ctx));
+
+    RawIQRecorder::instance().request_capture(buffer_offset[0], snap_len, m);
+}
+
 void PUSCH_Decoder::decode()
 {
+    // One-time init of the raw-IQ recorder (env-gated; no-op unless UL_IQ_REC set).
+    static std::once_flag iqrec_once;
+    std::call_once(iqrec_once, [] { RawIQRecorder::instance().configure(); });
+
     if (decoder_a){
         enb_ul.in_buffer = original_buffer[0]; // 0 for downlink, 1 for uplink, now 0 because there are 2 separate buffers
     }else if (decoder_b){
@@ -808,8 +1022,32 @@ void PUSCH_Decoder::decode()
             if (((decoding_mem.rnti == target_rnti) || (valid_ul_grant == SRSRAN_SUCCESS))&&decoding_mem.rnti != 0)
             {
                 /* PASS 1: nominal FFT window (sf_symbols already holds the
-                   nominal FFT). Behaves exactly as before. */
+                   nominal FFT). Behaves exactly as before, except that when HARQ
+                   combining is on this decode goes into the UE's per-HARQ-process
+                   softbuffer and accumulates across retransmissions. */
+                if (harq_on_)
+                {
+                    uint32_t pid = ul_sf.tti % 8;             // FDD UL: 8 processes, 8 ms RTT
+                    uint64_t key = ((uint64_t)decoding_mem.rnti << 8) | (pid & 0xff);
+                    int ndi = decoding_mem.ran_ul_dci ? decoding_mem.ran_ul_dci->tb.ndi : 0;
+                    auto it = harq_last_ndi_.find(key);
+                    bool new_tx = (it == harq_last_ndi_.end()) || (it->second != ndi);
+                    harq_last_ndi_[key] = ndi;
+                    if (!new_tx) g_harq_retx_seen.fetch_add(1, std::memory_order_relaxed);
+                    ul_cfg.pusch.softbuffers.rx = harq_get(decoding_mem.rnti, pid, new_tx);
+                    harq_no_reset_ = !new_tx;                 // retx => accumulate, don't reset
+                }
                 bool crc = decode_grant(decoding_mem);
+                if (harq_on_)
+                {
+                    // Count retransmissions that decoded (the combining payoff), then
+                    // hand the offset-retry / adapter back the default scratch buffer
+                    // so their alternate-window probes never corrupt HARQ state.
+                    if (crc && decoding_mem.is_retx == 1)
+                        g_harq_recovered.fetch_add(1, std::memory_order_relaxed);
+                    ul_cfg.pusch.softbuffers.rx = default_sb_;
+                    harq_no_reset_ = false;
+                }
 
                 /* Capture the nominal channel-estimate outcome for statistics and
                    for steering the retry. ta_us gives the signed residual timing
@@ -817,6 +1055,12 @@ void PUSCH_Decoder::decode()
                    present. */
                 float nominal_snr   = enb_ul.chest_res.snr_db;
                 float nominal_ta_us = enb_ul.chest_res.ta_us;
+
+                /* Grant-keyed raw-IQ capture of THIS nominal-window decode, taken
+                   before any offset retry mutates sf_symbols so the stored burst
+                   replays bit-for-bit. Env-gated (UL_IQ_REC); no-op otherwise. */
+                maybe_capture_iq(decoding_mem, crc, nominal_snr, nominal_ta_us,
+                                 offset_retry_enabled);
 
                 /* PASS 2: FFT-window-offset retry. Only for grants that FAILED
                    CRC at the nominal window AND only when offset retry is enabled
@@ -828,13 +1072,76 @@ void PUSCH_Decoder::decode()
                 {
                     const uint32_t sf_len = SRSRAN_SF_LEN_PRB(enb_ul.cell.nof_prb);
 
-                    /* Build candidate sample offsets, most-likely first:
-                       1) the measured residual ta_us -> samples (and its
-                          negation, to be robust to sign convention) when the
-                          nominal estimate was usable (snr >= ~0 dB);
-                       2) a small fixed fallback set spanning roughly +/- one CP
-                          for grants whose DMRS was too misaligned to give a
-                          reliable ta. */
+                    /* PER-UE TIMING: a passive sniffer sees every UE's UL with its
+                       OWN geometry-dependent arrival offset (measured spread here:
+                       +/-10 us). A real eNB avoids this — it commands each UE's
+                       Timing Advance so all UL arrives ALIGNED at the eNB, so one
+                       FFT window fits everyone. We can't command TA, so ~1/3 of UEs
+                       land OUTSIDE the CP (~4.7 us) and cannot decode at the nominal
+                       window at ANY SNR. srsRAN's ta_us is a phase-SLOPE estimate,
+                       only valid WITHIN the CP, so it cannot steer us to a beyond-CP
+                       UE (chicken-and-egg). The fix below is the software equivalent
+                       of per-UE TA: for grants that actually carry energy, scan a
+                       WIDE window range and center on the chest-SNR peak for THAT UE. */
+
+                    // Chest-free allocated-RB energy (dB above the 10th-pctile floor)
+                    // — gates the expensive wide search so noise grants stay cheap
+                    // (the RT thread must never fall behind; a blind wide sweep on
+                    // every grant drops subframes).
+                    float e_snr = -100.0f;
+                    {
+                        const auto& rbpow = sf_power->getRBPowerUL();
+                        uint32_t np = ul_cfg.pusch.grant.n_prb[0], L = ul_cfg.pusch.grant.L_prb;
+                        if (L > 0 && rbpow.size() >= (size_t)np + L) {
+                            float pa = 0.0f;
+                            for (uint32_t k = 0; k < L; k++) pa += rbpow[np + k];
+                            pa /= (float)L;
+                            std::vector<float> tmp(rbpow.begin(), rbpow.end());
+                            size_t p10 = tmp.size() / 10;
+                            std::nth_element(tmp.begin(), tmp.begin() + p10, tmp.end());
+                            e_snr = pa - tmp[p10];
+                        }
+                    }
+
+                    // Wide per-UE timing acquisition — opt-in (UL_TIMING_ACQ), and
+                    // only for grants clearing UL_TIMING_ACQ_MINDB of energy so it
+                    // costs nothing on the ~99% of grants that are noise.
+                    static const bool  acq_on    = (getenv("UL_TIMING_ACQ") != nullptr);
+                    static const int   acq_max    = []{ const char* e=getenv("UL_TIMING_ACQ_MAX");
+                        int v = e?atoi(e):240; return v<48?48:(v>720?720:v); }();
+                    static const float acq_mindb  = []{ const char* e=getenv("UL_TIMING_ACQ_MINDB");
+                        return e?(float)atof(e):3.0f; }();
+
+                    if (acq_on && e_snr >= acq_mindb)
+                    {
+                        // Stage 1: coarse scan (chest only) for the SNR peak window.
+                        int   best_off = 0; float best_s = -1e9f;
+                        const int coarse = 48;
+                        for (int off = -acq_max; off <= acq_max; off += coarse) {
+                            if (!refft_at_offset(off)) continue;
+                            if (srsran_chest_ul_estimate_pusch(&enb_ul.chest, &ul_sf, &ul_cfg.pusch,
+                                    enb_ul.sf_symbols, &enb_ul.chest_res) != SRSRAN_SUCCESS) continue;
+                            float s = enb_ul.chest_res.snr_db;
+                            if (std::isfinite(s) && s > best_s) { best_s = s; best_off = off; }
+                        }
+                        // Stage 2: fine scan +/- one coarse step around the peak.
+                        for (int off = best_off - coarse; off <= best_off + coarse; off += 8) {
+                            if (!refft_at_offset(off)) continue;
+                            if (srsran_chest_ul_estimate_pusch(&enb_ul.chest, &ul_sf, &ul_cfg.pusch,
+                                    enb_ul.sf_symbols, &enb_ul.chest_res) != SRSRAN_SUCCESS) continue;
+                            float s = enb_ul.chest_res.snr_db;
+                            if (std::isfinite(s) && s > best_s) { best_s = s; best_off = off; }
+                        }
+                        // Decode at the per-UE peak window.
+                        if (refft_at_offset(best_off)) {
+                            crc = decode_grant(decoding_mem);
+                            if (crc) { nominal_snr = enb_ul.chest_res.snr_db; nominal_ta_us = enb_ul.chest_res.ta_us; }
+                        }
+                    }
+                    else
+                    {
+                    /* Default (baseline) narrow retry: the measured ta_us candidate
+                       plus a small +/- one-CP fallback set. */
                     int  cand[8];
                     int  ncand = 0;
                     if (nominal_snr >= 0.0f && nominal_ta_us != 0.0f)
@@ -843,10 +1150,7 @@ void PUSCH_Decoder::decode()
                         int meas = (int)lroundf(nominal_ta_us * (float)sf_len / 1000.0f);
                         if (meas != 0) { cand[ncand++] = meas; cand[ncand++] = -meas; }
                     }
-                    // Fixed fallback offsets (samples). At 15.36 Msps: 16->~1us,
-                    // 32->~2us, 64->~4us (~ one normal CP). Skip any that already
-                    // equal the measured candidate so we don't re-FFT+decode an
-                    // identical window for nothing.
+                    // Fixed fallback offsets (samples).
                     static const int fixed_off[] = {32, -32, 64, -64, 16, -16};
                     for (uint32_t i = 0; i < sizeof(fixed_off)/sizeof(fixed_off[0]) &&
                                          ncand < (int)(sizeof(cand)/sizeof(cand[0])); i++)
@@ -865,6 +1169,45 @@ void PUSCH_Decoder::decode()
                             // Keep the successful estimate for statistics below.
                             nominal_snr   = enb_ul.chest_res.snr_db;
                             nominal_ta_us = enb_ul.chest_res.ta_us;
+                        }
+                    }
+                    }
+
+                    /* Grant-specific UplinkSyncAdapter fallback (env UL_SYNC_ADAPTER).
+                       Runs the staged per-UE timing/CFO estimator on the pre-FFT
+                       snapshot when the nominal window AND the narrow/acq retry both
+                       failed and the grant carries real energy (UL_SYNC_MINDB). Uses
+                       a PRIVATE enb_ul scratch (own FFT + input buffer), so the wide
+                       search never mutates the shared raw buffer; on acceptance it
+                       leaves corrected symbols we copy into the live enb_ul and
+                       decode with the standard MCS-table sequence. Accept-CRC-only,
+                       so it can never turn a nominal success into a failure. */
+                    {
+                        static const bool  sync_on    = (getenv("UL_SYNC_ADAPTER") != nullptr);
+                        static const float sync_mindb = []{ const char* e=getenv("UL_SYNC_MINDB"); return e?(float)atof(e):4.0f; }();
+                        if (!crc && sync_on && e_snr >= sync_mindb && buffer_offset[0] != nullptr)
+                        {
+                            ensure_sync_adapter();
+                            if (sync_adapter_)
+                            {
+                                g_sync_fired.fetch_add(1, std::memory_order_relaxed);
+                                ul_cfg.pusch.rnti  = decoding_mem.rnti;
+                                ul_cfg.pusch.grant = *decoding_mem.ran_ul_grant;
+                                UplinkSyncResult sr = sync_adapter_->run(buffer_offset[0],
+                                        3 * SRSRAN_SF_LEN_PRB(100), sf_len, ul_sf, ul_cfg);
+                                if (sr.corrected_iq_available)
+                                {
+                                    memcpy(enb_ul.sf_symbols, adapter_enb_ul_->sf_symbols,
+                                           sizeof(cf_t) * sf_symbols_len);
+                                    crc = decode_grant(decoding_mem);
+                                    if (crc)
+                                    {
+                                        g_sync_recovered.fetch_add(1, std::memory_order_relaxed);
+                                        nominal_snr   = enb_ul.chest_res.snr_db;
+                                        nominal_ta_us = enb_ul.chest_res.ta_us;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -941,11 +1284,16 @@ void PUSCH_Decoder::decode()
                         int bsnr = win_best_snr_mdb.exchange(-100000);
                         int bta  = win_best_ta_mus.load();
                         printf("[ULRATE] t=%llds tti=%u | last1s: attempts=%llu success=%llu"
-                               " peakSNR=%.1fdB ta@peak=%.1fus | cum: att=%llu suc=%llu\n",
+                               " peakSNR=%.1fdB ta@peak=%.1fus | cum: att=%llu suc=%llu"
+                               " | adapter: fired=%llu recovered=%llu | harq_retx_seen=%llu ok=%llu\n",
                                (now_ms - t0_ms.load()) / 1000, ul_sf.tti,
                                (unsigned long long)da, (unsigned long long)ds,
                                bsnr / 1000.0f, bta / 1000.0f,
-                               (unsigned long long)a, (unsigned long long)s);
+                               (unsigned long long)a, (unsigned long long)s,
+                               (unsigned long long)g_sync_fired.load(),
+                               (unsigned long long)g_sync_recovered.load(),
+                               (unsigned long long)g_harq_retx_seen.load(),
+                               (unsigned long long)g_harq_recovered.load());
                         fflush(stdout);
                     }
                 }
@@ -991,6 +1339,71 @@ void PUSCH_Decoder::decode()
                                (unsigned long long)wk,100.0*wk/tot, (unsigned long long)ti,100.0*ti/tot,
                                (unsigned long long)st,100.0*st/tot, (unsigned long long)rx);
                         fflush(stdout);
+                    }
+                }
+
+                /* ===== INDEPENDENT energy-domain SNR (opt-in UL_ENERGY_DIAG) =====
+                   The chest SINR (nominal_snr) is derived from the SAME DMRS
+                   channel estimate used for equalization, so a mis-estimated
+                   channel is indistinguishable from low SNR. This metric bypasses
+                   the estimator entirely: it uses the post-FFT per-RB POWER only.
+                     P_alloc = mean power (dB) in the grant's allocated RBs
+                     floor   = MEDIAN power (dB) of all RBs (most are unused/noise
+                               in a lightly-loaded UL) -> a chest-free noise floor
+                     ENERGY_SNR = P_alloc - floor
+                   For grants with real energy (ENERGY_SNR >= 5 dB) we print the
+                   chest SINR beside it. If chest_SINR is far BELOW ENERGY_SNR, the
+                   signal power was there but the estimator/timing lost it = real
+                   implementation loss, NOT RF. If chest tracks ENERGY_SNR, the
+                   grant is genuinely weak = RF-limited. */
+                if (getenv("UL_ENERGY_DIAG"))
+                {
+                    const auto& rbpow = sf_power->getRBPowerUL();
+                    uint32_t np = ul_cfg.pusch.grant.n_prb[0], L = ul_cfg.pusch.grant.L_prb;
+                    if (L > 0 && rbpow.size() >= (size_t)np + L)
+                    {
+                        float p_alloc = 0.0f;
+                        for (uint32_t k = 0; k < L; k++) p_alloc += rbpow[np + k];
+                        p_alloc /= L;
+                        // Noise floor = 10th-percentile RB power (robust to a busy
+                        // cell where the median RB is occupied, not noise).
+                        std::vector<float> tmp(rbpow.begin(), rbpow.end());
+                        size_t p10 = tmp.size() / 10;
+                        std::nth_element(tmp.begin(), tmp.begin() + p10, tmp.end());
+                        float floor_db = tmp[p10];
+                        float e_snr = p_alloc - floor_db;
+                        // Aggregate chest_SINR binned by energy_SNR: if chest tracks
+                        // energy -> RF-limited; if chest stays low while energy is
+                        // high -> estimator loss. Bins: [ -,2,4,6,8,+ ].
+                        static std::atomic<uint64_t> bn[6]{}; static std::atomic<long long> bs[6]{};
+                        static std::atomic<uint64_t> n_e3{0}, n_lost{0};
+                        static std::atomic<long long> t0e{0}, laste{0};
+                        int bi = e_snr < 2 ? 0 : e_snr < 4 ? 1 : e_snr < 6 ? 2 : e_snr < 8 ? 3 : e_snr < 12 ? 4 : 5;
+                        bn[bi].fetch_add(1, std::memory_order_relaxed);
+                        bs[bi].fetch_add((long long)lroundf(nominal_snr * 100), std::memory_order_relaxed);
+                        if (e_snr >= 3.0f) {
+                            n_e3.fetch_add(1, std::memory_order_relaxed);
+                            if (nominal_snr < e_snr - 3.0f) n_lost.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        // per-grant line for clearly-energetic grants
+                        if (e_snr >= 5.0f)
+                            printf("[ULNRG] SF %d.%d RNTI %d L=%u | P_alloc=%.1f floor=%.1f | "
+                                   "ENERGY_SNR=%.1f  chest_SINR=%.1f  ta=%.1fus crc=%d %s\n",
+                                   ul_sf.tti/10, ul_sf.tti%10, ul_cfg.pusch.rnti, L, p_alloc, floor_db,
+                                   e_snr, nominal_snr, nominal_ta_us, (int)crc,
+                                   (nominal_snr < e_snr-3.0f) ? "<< SIGNAL PRESENT, chest LOSES it" : "");
+                        // periodic binned summary (the decisive scatter)
+                        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        long long e0 = 0; t0e.compare_exchange_strong(e0, now);
+                        long long lm = laste.load();
+                        if (now - lm >= 5000 && laste.compare_exchange_strong(lm, now)) {
+                            printf("[ULNRGBIN] energy_SNR bin -> [count, mean chest_SINR]:");
+                            const char* lb[6]={"<2","2-4","4-6","6-8","8-12","12+"};
+                            for (int i=0;i<6;i++){uint64_t c=bn[i];double m=c?(double)bs[i]/c/100.0:0;printf(" %s:[%llu,%.1f]",lb[i],(unsigned long long)c,m);}
+                            printf(" | energy>=3dB=%llu chest-lost=%llu\n",(unsigned long long)n_e3.load(),(unsigned long long)n_lost.load());
+                            fflush(stdout);
+                        }
                     }
                 }
 

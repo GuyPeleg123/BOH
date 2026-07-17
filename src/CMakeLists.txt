@@ -9,6 +9,18 @@ target_link_libraries(LTESniffer DL_Sniffer_lib falcon_common falcon_phy falcon_
 target_compile_options(LTESniffer PUBLIC "-std=c++11")
 list(APPEND INSTALL_BUNDLE LTESniffer)
 
+# Offline replay / analysis tool for grant-keyed raw-IQ captures.
+add_executable(ul_iq_replay ul_iq_replay.cc)
+target_link_libraries(ul_iq_replay DL_Sniffer_lib falcon_common falcon_phy falcon_util falcon_prof)
+target_compile_options(ul_iq_replay PUBLIC "-std=c++11")
+list(APPEND INSTALL_BUNDLE ul_iq_replay)
+
+# Ground-truth validation of the UplinkSyncAdapter (synthetic PUSCH injection).
+add_executable(ul_sync_test ul_sync_test.cc)
+target_link_libraries(ul_sync_test DL_Sniffer_lib falcon_common falcon_phy falcon_util falcon_prof)
+target_compile_options(ul_sync_test PUBLIC "-std=c++14")
+list(APPEND INSTALL_BUNDLE ul_sync_test)
+
 # nested install targets are not supported by old Cmake on Ubuntu 18
 #list (APPEND INSTALL_BUNDLE
 #    falcon_capture_probe
