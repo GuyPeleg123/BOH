@@ -90,6 +90,12 @@ UlDenseDecoder::UlDenseDecoder(srsran_enb_ul_t   &enb_ul,
     srsran_softbuffer_rx_init(own_sb_, SRSRAN_MAX_PRB);
     nominal_sym_len_ = SRSRAN_SF_LEN_RE(110, SRSRAN_CP_NORM);
     nominal_sym_ = srsran_vec_cf_malloc(nominal_sym_len_);
+    sf_sym_ant1_ = srsran_vec_cf_malloc(nominal_sym_len_);
+    ce0_         = srsran_vec_cf_malloc(nominal_sym_len_);
+    mrc_dry_data_ = srsran_vec_u8_malloc(2000 * 8);
+    mrc_dry_sb_   = new srsran_softbuffer_rx_t;
+    srsran_softbuffer_rx_init(mrc_dry_sb_, SRSRAN_MAX_PRB);
+    mrc_on_      = (getenv("UL_DENSE2_MRC") != nullptr);
     read_env_once();
 }
 
@@ -97,6 +103,10 @@ UlDenseDecoder::~UlDenseDecoder()
 {
     if (pusch_res_.data) free(pusch_res_.data);
     if (nominal_sym_) free(nominal_sym_);
+    if (sf_sym_ant1_) free(sf_sym_ant1_);
+    if (ce0_) free(ce0_);
+    if (mrc_dry_data_) free(mrc_dry_data_);
+    if (mrc_dry_sb_) { srsran_softbuffer_rx_free(mrc_dry_sb_); delete mrc_dry_sb_; }
     if (own_sb_) { srsran_softbuffer_rx_free(own_sb_); delete own_sb_; }
     for (auto& kv : harq_buffers_) { srsran_softbuffer_rx_free(kv.second); delete kv.second; }
 }
@@ -235,16 +245,10 @@ float UlDenseDecoder::grant_energy_db(DCI_UL &g)
     return p_alloc - tmp[p10];
 }
 
-// ---- decode at the symbols currently in sf_symbols -------------------------
-bool UlDenseDecoder::decode_current(DCI_UL &g, srsran_pusch_cfg_t &pusch)
+// ---- PUSCH turbo decode of whatever is in sf_symbols + chest_res.ce, plus the
+//      false-positive guards and pcap write. Chest must already be done. --------
+bool UlDenseDecoder::decode_tb(DCI_UL &g, srsran_pusch_cfg_t &pusch)
 {
-    // On a HARQ retransmission we must NOT reset — prior soft bits must remain so
-    // this decode accumulates onto them. harq_no_reset_ is set by the caller.
-    if (!harq_no_reset_)
-        srsran_softbuffer_rx_reset_tbs(pusch.softbuffers.rx, pusch.grant.tb.tbs);
-    if (srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch,
-                                       enb_ul_.sf_symbols, &enb_ul_.chest_res) != SRSRAN_SUCCESS)
-        return false;
     pusch_res_.crc = false;
     if (srsran_pusch_decode(&enb_ul_.pusch, &ul_sf_, &pusch, &enb_ul_.chest_res,
                             enb_ul_.sf_symbols, &pusch_res_) != SRSRAN_SUCCESS)
@@ -278,6 +282,129 @@ bool UlDenseDecoder::decode_current(DCI_UL &g, srsran_pusch_cfg_t &pusch)
         return true;
     }
     return false;
+}
+
+// ---- single-antenna decode of whatever is in sf_symbols --------------------
+bool UlDenseDecoder::decode_current(DCI_UL &g, srsran_pusch_cfg_t &pusch)
+{
+    // On a HARQ retransmission we must NOT reset — prior soft bits must remain so
+    // this decode accumulates onto them. harq_no_reset_ is set by the caller.
+    if (!harq_no_reset_)
+        srsran_softbuffer_rx_reset_tbs(pusch.softbuffers.rx, pusch.grant.tb.tbs);
+    if (srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch,
+                                       enb_ul_.sf_symbols, &enb_ul_.chest_res) != SRSRAN_SUCCESS)
+        return false;
+    return decode_tb(g, pusch);
+}
+
+// ---- 2-RX maximal-ratio combine at the nominal window, then decode ---------
+// Estimates the channel on each antenna (ant0 = nominal_sym_, ant1 = sf_sym_ant1_),
+// then builds the "equivalent single antenna": ce_eff = sqrt(|h0|^2+|h1|^2),
+// y_eff = (conj(h0)*y0 + conj(h1)*y1)/ce_eff. Feeding (y_eff, ce_eff) to the
+// single-antenna equalizer inside srsran_pusch_decode yields the exact MRC output
+// x = (conj(h0)y0+conj(h1)y1)/(|h0|^2+|h1|^2+noise). Falls back to ant0-only if
+// ant1's estimate is unusable, so it can never do worse than single-antenna.
+bool UlDenseDecoder::mrc_decode(DCI_UL &g, srsran_pusch_cfg_t &pusch)
+{
+    if (!harq_no_reset_)
+        srsran_softbuffer_rx_reset_tbs(pusch.softbuffers.rx, pusch.grant.tb.tbs);
+
+    const uint32_t N = nominal_sym_len_;
+    // ant0 channel estimate
+    memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * N);
+    if (srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch,
+                                       enb_ul_.sf_symbols, &enb_ul_.chest_res) != SRSRAN_SUCCESS)
+        return false;
+    memcpy(ce0_, enb_ul_.chest_res.ce, sizeof(cf_t) * N);
+    float noise0  = enb_ul_.chest_res.noise_estimate;
+    float snr0_db = enb_ul_.chest_res.snr_db;
+
+    // A/B (env UL_DENSE2_MRC_DIAG): does ant0 ALONE decode this grant? Dry decode
+    // on the current (ant0) symbols + chest with a scratch softbuffer — no HARQ
+    // touch, no pcap. Counts grants MRC recovers that ant0 alone cannot = the real,
+    // decode-level MRC benefit (traffic-independent, immune to interference-corr.).
+    static const bool mrc_diag = (getenv("UL_DENSE2_MRC_DIAG") != nullptr);
+    bool crc0_ab = false;
+    if (mrc_diag) {
+        srsran_softbuffer_rx_reset_tbs(mrc_dry_sb_, pusch.grant.tb.tbs);
+        srsran_softbuffer_rx_t* sv = pusch.softbuffers.rx;
+        pusch.softbuffers.rx = mrc_dry_sb_;
+        srsran_pusch_res_t dr; memset(&dr, 0, sizeof(dr)); dr.data = mrc_dry_data_;
+        if (srsran_pusch_decode(&enb_ul_.pusch, &ul_sf_, &pusch, &enb_ul_.chest_res,
+                                enb_ul_.sf_symbols, &dr) == SRSRAN_SUCCESS && dr.crc &&
+            pusch.grant.tb.tbs >= 8) {
+            int nb = pusch.grant.tb.tbs / 8; bool az = true;
+            for (int b = 0; b < nb; b++) if (dr.data[b]) { az = false; break; }
+            uint8_t b0 = dr.data[0]; int lc = b0 & 0x1F;
+            crc0_ab = !az && (b0 & 0xC0) == 0 && !(lc >= 11 && lc <= 23);
+        }
+        pusch.softbuffers.rx = sv;
+    }
+
+    // ant1 channel estimate (leaves ce in chest_res.ce)
+    memcpy(enb_ul_.sf_symbols, sf_sym_ant1_, sizeof(cf_t) * N);
+    if (srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch,
+                                       enb_ul_.sf_symbols, &enb_ul_.chest_res) != SRSRAN_SUCCESS) {
+        // ant1 bad -> plain ant0 decode
+        memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * N);
+        memcpy(enb_ul_.chest_res.ce, ce0_, sizeof(cf_t) * N);
+        enb_ul_.chest_res.noise_estimate = noise0;
+        return decode_tb(g, pusch);
+    }
+
+    float snr1_db = enb_ul_.chest_res.snr_db;
+    // MRC gain diagnostic: theoretical MRC SNR ~ 10log10(lin(snr0)+lin(snr1)).
+    if (mrc_diag && std::isfinite(snr0_db) && std::isfinite(snr1_db) && snr0_db > -20 && snr0_db < 40) {
+        float mrc_snr = 10.0f * log10f(powf(10.f, snr0_db/10) + powf(10.f, snr1_db/10));
+        float gain = mrc_snr - snr0_db;
+        static std::atomic<uint64_t> mn{0};
+        static std::atomic<long long> gsum{0}, s0s{0}, s1s{0};
+        uint64_t k = mn.fetch_add(1) + 1;
+        gsum.fetch_add((long long)lroundf(gain*1000));
+        s0s.fetch_add((long long)lroundf(snr0_db*1000));
+        s1s.fetch_add((long long)lroundf(snr1_db*1000));
+        if (k <= 40 || k % 50 == 0)
+            printf("[DENSE2-MRC] ant0=%.1f ant1=%.1f mrc=%.1f gain=%+.1f dB | mean: ant0=%.2f ant1=%.2f gain=%+.2f (n=%llu)\n",
+                   snr0_db, snr1_db, mrc_snr, gain, s0s.load()/1000.0/k, s1s.load()/1000.0/k,
+                   gsum.load()/1000.0/k, (unsigned long long)k);
+    }
+
+    cf_t* ce1 = enb_ul_.chest_res.ce;   // ant1 channel (== chest_res.ce; combined in place below)
+    cf_t* out = enb_ul_.sf_symbols;     // write y_eff here
+    for (uint32_t k = 0; k < N; k++) {
+        float h0r = __real__ (ce0_[k]), h0i = __imag__ (ce0_[k]);
+        float h1r = __real__ (ce1[k]),  h1i = __imag__ (ce1[k]);
+        float m   = h0r*h0r + h0i*h0i + h1r*h1r + h1i*h1i;   // |h0|^2 + |h1|^2
+        if (m > 1e-12f) {
+            float mag = sqrtf(m);
+            float y0r = __real__ (nominal_sym_[k]), y0i = __imag__ (nominal_sym_[k]);
+            float y1r = __real__ (sf_sym_ant1_[k]), y1i = __imag__ (sf_sym_ant1_[k]);
+            // conj(h)*y = (hr - j hi)(yr + j yi) = (hr yr + hi yi) + j(hr yi - hi yr)
+            float nr = (h0r*y0r + h0i*y0i) + (h1r*y1r + h1i*y1i);
+            float ni = (h0r*y0i - h0i*y0r) + (h1r*y1i - h1i*y1r);
+            cf_t ye; __real__ ye = nr / mag; __imag__ ye = ni / mag;
+            out[k] = ye;
+            cf_t ceff; __real__ ceff = mag; __imag__ ceff = 0.0f;
+            ce1[k] = ceff;   // ce_eff (real) into chest_res.ce
+        } else {
+            cf_t z; __real__ z = 0.0f; __imag__ z = 0.0f;
+            out[k] = z; ce1[k] = z;
+        }
+    }
+    enb_ul_.chest_res.noise_estimate = noise0;   // MRC preserves per-antenna noise variance
+    bool crc = decode_tb(g, pusch);
+    if (mrc_diag) {
+        static std::atomic<uint64_t> rec{0}, lost{0}, both{0};
+        if (crc && !crc0_ab) {
+            uint64_t r = rec.fetch_add(1) + 1;
+            printf("[DENSE2-MRC-AB] MRC recovered a grant ant0 could NOT (rnti=0x%04x mcs=%d) "
+                   "| mrc_only=%llu ant0_only=%llu both=%llu\n",
+                   g.rnti, g.ran_ul_grant->tb.mcs_idx, (unsigned long long)r,
+                   (unsigned long long)lost.load(), (unsigned long long)both.load());
+        } else if (!crc && crc0_ab) lost.fetch_add(1);   // regression — should stay ~0
+        else if (crc && crc0_ab)    both.fetch_add(1);
+    }
+    return crc;
 }
 
 // ---- calibration state -----------------------------------------------------
@@ -326,6 +453,15 @@ void UlDenseDecoder::decode()
     srsran_enb_ul_fft(&enb_ul_);
     if (sf_power_) sf_power_->computePower(enb_ul_.sf_symbols);
     memcpy(nominal_sym_, enb_ul_.sf_symbols, sizeof(cf_t) * nominal_sym_len_);
+    // 2-RX MRC: FFT the 2nd UL antenna at the nominal window too (needs rf_b opened
+    // with 2 channels). ant1 samples in original_buffer_[1]; enb_ul_fft consumes it
+    // in place but it is not used elsewhere. The window search stays single-antenna.
+    if (mrc_on_) {
+        enb_ul_.in_buffer = original_buffer_[1];
+        srsran_enb_ul_fft(&enb_ul_);
+        memcpy(sf_sym_ant1_, enb_ul_.sf_symbols, sizeof(cf_t) * nominal_sym_len_);
+        enb_ul_.in_buffer = original_buffer_[0];
+    }
 
     std::vector<DCI_UL> grants = dci_ul_;
     grants.insert(grants.end(), rar_dci_ul_.begin(), rar_dci_ul_.end());
@@ -432,9 +568,17 @@ void UlDenseDecoder::decode()
                 pusch.softbuffers.rx = own_sb_;
                 harq_no_reset_ = false;
             }
-            if (off == 0) memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * nominal_sym_len_);
-            else if (!fft_at_offset(off)) continue;
-            crc = decode_current(g, pusch);
+            if (off == 0) {
+                if (mrc_on_) {
+                    crc = mrc_decode(g, pusch);    // 2-RX MRC at the nominal window
+                } else {
+                    memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * nominal_sym_len_);
+                    crc = decode_current(g, pusch);
+                }
+            } else {
+                if (!fft_at_offset(off)) continue;
+                crc = decode_current(g, pusch);
+            }
             if (crc) crc_off = off;
         }
         pusch.softbuffers.rx = own_sb_;

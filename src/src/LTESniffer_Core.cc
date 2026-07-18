@@ -322,6 +322,15 @@ bool LTESniffer_Core::run(){
         }
         srsran_rf_set_rx_gain(&rf_b, srsran_rf_get_rx_gain(&rf_b));
       }
+      // 2-RX: antenna 1 currently has NO LNA, so give it its own (higher) gain to
+      // range the ADC — srsran_rf_set_rx_gain sets ALL channels the same, so we
+      // override channel 1 here. UL_ANT1_GAIN default 76 (B210 max).
+      if (ul_nof_rx_ant > 1) {
+        double g1 = getenv("UL_ANT1_GAIN") ? atof(getenv("UL_ANT1_GAIN")) : 76.0;
+        srsran_rf_set_rx_gain_ch(&rf_b, 1, g1);
+        printf("UL 2-RX gains: ant0=%.1f dB (LNA), ant1=%.1f dB (no LNA)\n",
+               (double)args.ul_rf_gain, g1);
+      }
     }
 
     /* set receiver frequency */

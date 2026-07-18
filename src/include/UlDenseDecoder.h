@@ -122,6 +122,21 @@ private:
     srsran_softbuffer_rx_t *own_sb_ = nullptr;      // this decoder's private rx softbuffer
     cf_t*               nominal_sym_ = nullptr;     // nominal-window FFT symbols, saved once/subframe + reused for every grant's nominal decode (shared, like legacy)
     uint32_t            nominal_sym_len_ = 0;
+
+    // ---- 2-RX maximal-ratio combining (env UL_DENSE2_MRC) -----------------
+    // Coherently combines the two UL antennas at the nominal window before decode
+    // (the "equivalent single antenna" pre-combine, so srsran_pusch_decode is
+    // reused unchanged). Right technique for an UNBALANCED pair (ant0=LNA,
+    // ant1=no LNA): coherent combining still extracts the weaker antenna's SNR,
+    // whereas selection diversity would just always pick ant0. Needs rf_b opened
+    // with 2 channels (UL_DIVERSITY / nof_rx_ant=2); ant1 samples in original_buffer_[1].
+    bool  mrc_on_       = false;
+    cf_t* sf_sym_ant1_  = nullptr;                  // ant1 nominal-window FFT symbols
+    cf_t* ce0_          = nullptr;                  // saved ant0 channel estimate
+    bool  mrc_decode(DCI_UL &g, srsran_pusch_cfg_t &pusch);   // chest both ants + MRC + decode
+    bool  decode_tb(DCI_UL &g, srsran_pusch_cfg_t &pusch);    // pusch_decode + guards + pcap (chest already done)
+    srsran_softbuffer_rx_t* mrc_dry_sb_ = nullptr;           // scratch for the ant0-alone A/B dry decode
+    uint8_t* mrc_dry_data_ = nullptr;
     uint16_t            target_rnti_ = 0xFFFF;
     bool                cfg_read_ = false;
     void read_env_once();
