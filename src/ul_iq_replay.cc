@@ -124,13 +124,20 @@ int main(int argc, char** argv)
     // frequency-domain averaging denoises the estimate on tiny allocations at low
     // SNR. UL_CHEST_SMOOTH=<len> uses a Gaussian filter of that length (2..63).
     if (const char* sm = getenv("UL_CHEST_SMOOTH")) {
-        int len = atoi(sm); if (len < 2) len = 2; if (len > 63) len = 63;
+        int len = atoi(sm); if (len < 1) len = 1; if (len > 63) len = 63;
+        float sigma = getenv("UL_CHEST_SIGMA") ? (float)atof(getenv("UL_CHEST_SIGMA")) : 2.0f;
         enb_ul.chest.smooth_filter_len = (uint32_t)len;
-        srsran_chest_set_smooth_filter_gauss(enb_ul.chest.smooth_filter, (uint32_t)len, 2.0f);
+        if (len == 1) { enb_ul.chest.smooth_filter[0] = 1.0f; }      // len 1 = no averaging
+        else if (getenv("UL_CHEST_RECT")) {                          // rectangular (equal weights)
+            for (int k = 0; k < len; k++) enb_ul.chest.smooth_filter[k] = 1.0f / (float)len;
+        } else srsran_chest_set_smooth_filter_gauss(enb_ul.chest.smooth_filter, (uint32_t)len, sigma);
     }
     ul_cfg.hopping = ctx.hopping; ul_cfg.pusch.rnti = ctx.rnti; ul_cfg.pusch.grant = ctx.grant;
     ul_cfg.pusch.enable_64qam = ctx.enable_64qam != 0; ul_cfg.pusch.uci_cfg = ctx.uci_cfg;
     ul_cfg.pusch.uci_offset = ctx.uci_offset; ul_cfg.pusch.meas_ta_en = true;
+    // Experiment: turbo-decoder max iterations (default 0 => srsRAN's 5). More
+    // iterations can decode marginally weaker TBs at extra CPU (diminishing).
+    if (const char* it = getenv("UL_MAX_ITER")) ul_cfg.pusch.max_nof_iterations = (uint32_t)atoi(it);
     srsran_softbuffer_rx_t softbuffer; srsran_softbuffer_rx_init(&softbuffer, SRSRAN_MAX_PRB);
     ul_cfg.pusch.softbuffers.rx = &softbuffer;
     srsran_pusch_res_t pusch_res; memset(&pusch_res, 0, sizeof(pusch_res));
@@ -143,6 +150,27 @@ int main(int argc, char** argv)
     enb_ul.in_buffer = in_buffer.data();
     srsran_enb_ul_fft(&enb_ul);
     int cret = srsran_chest_ul_estimate_pusch(&enb_ul.chest, &ul_sf, &ul_cfg.pusch, enb_ul.sf_symbols, &enb_ul.chest_res);
+    // Experiment: per-UE CFO correction. srsRAN estimates chest_res.cfo_hz but never
+    // applies it; de-rotate each OFDM symbol by its time phase and re-chest.
+    if (cret == SRSRAN_SUCCESS && getenv("UL_REPLAY_CFO")) {
+        float cfo = enb_ul.chest_res.cfo_hz;
+        if (std::isfinite(cfo) && fabsf(cfo) > 15.0f && fabsf(cfo) < 950.0f) {
+            uint32_t nsc = cell.nof_prb * SRSRAN_NRE, nsymb = SRSRAN_CP_NORM_SF_NSYMB;
+            float Tsym = 1e-3f / (float)nsymb;
+            for (uint32_t m = 0; m < nsymb; m++) {
+                float ph = -2.0f * (float)M_PI * cfo * (float)m * Tsym, cr = cosf(ph), ci = sinf(ph);
+                cf_t* s = &enb_ul.sf_symbols[(size_t)m * nsc];
+                for (uint32_t k = 0; k < nsc; k++) {
+                    float xr = __real__ s[k], xi = __imag__ s[k];
+                    __real__ s[k] = xr*cr - xi*ci; __imag__ s[k] = xr*ci + xi*cr;
+                }
+            }
+            cret = srsran_chest_ul_estimate_pusch(&enb_ul.chest, &ul_sf, &ul_cfg.pusch, enb_ul.sf_symbols, &enb_ul.chest_res);
+        }
+    }
+    // Experiment: scale the noise estimate (LLR / MMSE calibration). >1 = assume
+    // more noise (softer LLRs), <1 = harder LLRs.
+    if (const char* ns = getenv("UL_NOISE_SCALE")) enb_ul.chest_res.noise_estimate *= (float)atof(ns);
     pusch_res.crc = false;
     if (cret == SRSRAN_SUCCESS)
         srsran_pusch_decode(&enb_ul.pusch, &ul_sf, &ul_cfg.pusch, &enb_ul.chest_res, enb_ul.sf_symbols, &pusch_res);

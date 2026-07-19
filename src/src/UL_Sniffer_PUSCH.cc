@@ -873,7 +873,18 @@ void PUSCH_Decoder::maybe_capture_iq(DCI_UL &decoding_mem, bool crc,
     static std::atomic<uint64_t> pol_ctr{0};
     uint64_t c = pol_ctr.fetch_add(1);
     bool cap = false; const char* cat = "weak_fail";
-    if      (crc)                                    { cap = true;           cat = "crc_ok"; }
+    // Chest-priority mode (UL_IQ_CHEST_MIN=<dB>): capture only decodable-ish grants
+    // — those whose NOMINAL chest SINR clears the threshold — plus every CRC. This
+    // avoids the default policy flooding the quota with low-SNR "timing_outlier"
+    // grants (|ta_us|>5us is noise at low SNR), so an offline config sweep gets a
+    // batch rich in marginal/strong grants where decoder tweaks actually matter.
+    static const float chest_min = []{ const char* e=getenv("UL_IQ_CHEST_MIN"); return e?(float)atof(e):-1000.f; }();
+    if (chest_min > -999.f) {
+        if (crc)                                     { cap = true; cat = "crc_ok"; }
+        else if (!nan_chest && nominal_snr >= chest_min) { cap = true; cat = "chest_ok_fail"; }
+        else return;
+    }
+    else if (crc)                                    { cap = true;           cat = "crc_ok"; }
     else if (decoding_mem.is_retx == 1)              { cap = true;           cat = "retx"; }
     else if (nan_chest && e_snr >= 4.f)              { cap = true;           cat = "chest_nan"; }
     else if (nan_chest)                              { cap = (c % 50 == 0);  cat = "chest_nan_weak"; }
