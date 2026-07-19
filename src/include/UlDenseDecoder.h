@@ -135,6 +135,19 @@ private:
     cf_t* ce0_          = nullptr;                  // saved ant0 channel estimate
     bool  mrc_decode(DCI_UL &g, srsran_pusch_cfg_t &pusch);   // chest both ants + MRC + decode
     bool  decode_tb(DCI_UL &g, srsran_pusch_cfg_t &pusch);    // pusch_decode + guards + pcap (chest already done)
+
+    // ---- per-UE CFO correction (env UL_DENSE2_CFO) ------------------------
+    // srsRAN's UL chest ESTIMATES per-grant CFO (chest_res.cfo_hz from the two
+    // DMRS symbols) but NEVER applies it — the data symbols stay rotated relative
+    // to the DMRS-based channel estimate, so a UE with residual frequency offset
+    // (Doppler / imperfect DL-lock) fails decode at good DMRS SINR. This is the
+    // eNB-vs-passive gap (the eNB closed-loop tracks each UE's frequency). We
+    // estimate CFO from the nominal chest, de-rotate every OFDM symbol by its true
+    // time phase, re-chest, and decode. A/B (UL_DENSE2_CFO_DIAG) counts grants CFO
+    // recovers that the uncorrected decode cannot.
+    bool  cfo_on_ = false;
+    cf_t* cfo_work_ = nullptr;                               // de-rotated symbol scratch
+    bool  cfo_decode(DCI_UL &g, srsran_pusch_cfg_t &pusch);
     srsran_softbuffer_rx_t* mrc_dry_sb_ = nullptr;           // scratch for the ant0-alone A/B dry decode
     uint8_t* mrc_dry_data_ = nullptr;
     uint16_t            target_rnti_ = 0xFFFF;

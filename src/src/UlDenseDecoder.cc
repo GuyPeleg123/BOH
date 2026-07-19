@@ -49,6 +49,35 @@ void dump_ue_stats() {
     }
     printf("[DENSE2-UESTATS] undecoded-UE energy: <4dB(weak)=%d 4-8dB=%d >=8dB=%d\n", weak, midE, strong);
 }
+
+// ---- decode curve: decode rate vs NOMINAL chest-SINR, per modulation class ---
+// The key measurement for implementation loss: a good receiver decodes QPSK near
+// ~0 dB SINR. If our decode rate only reaches ~1.0 well above 0 dB, the gap is
+// recoverable software loss (noise/channel est, timing). Env UL_DENSE2_CURVE.
+namespace curve {
+constexpr int LO = -8, HI = 22, NB = HI - LO;   // 1 dB bins
+std::atomic<uint32_t> att[NB][2];               // [snr bin][0=QPSK(mcs<=10),1=16QAM(11-20)]
+std::atomic<uint32_t> dec[NB][2];
+void record(float chest_snr, int mcs, bool crc) {
+    if (!std::isfinite(chest_snr) || mcs < 0 || mcs > 20) return;
+    int b = (int)floorf(chest_snr) - LO;
+    if (b < 0) b = 0; if (b >= NB) b = NB - 1;
+    int c = (mcs <= 10) ? 0 : 1;
+    att[b][c].fetch_add(1, std::memory_order_relaxed);
+    if (crc) dec[b][c].fetch_add(1, std::memory_order_relaxed);
+}
+void dump() {
+    for (int c = 0; c < 2; c++) {
+        printf("[DENSE2-CURVE] %s decode-rate vs nominal chest-SINR:\n", c == 0 ? "QPSK(mcs<=10)" : "16QAM(11-20)");
+        for (int b = 0; b < NB; b++) {
+            uint32_t a = att[b][c].load(), d = dec[b][c].load();
+            if (a == 0) continue;
+            printf("   SINR %+3d..%+3d dB : %5u att  %5u dec  %5.1f%%\n",
+                   LO + b, LO + b + 1, a, d, 100.0 * d / a);
+        }
+    }
+}
+} // namespace curve
 } // namespace
 
 #ifdef __cplusplus
@@ -95,7 +124,9 @@ UlDenseDecoder::UlDenseDecoder(srsran_enb_ul_t   &enb_ul,
     mrc_dry_data_ = srsran_vec_u8_malloc(2000 * 8);
     mrc_dry_sb_   = new srsran_softbuffer_rx_t;
     srsran_softbuffer_rx_init(mrc_dry_sb_, SRSRAN_MAX_PRB);
+    cfo_work_    = srsran_vec_cf_malloc(nominal_sym_len_);
     mrc_on_      = (getenv("UL_DENSE2_MRC") != nullptr);
+    cfo_on_      = (getenv("UL_DENSE2_CFO") != nullptr);
     read_env_once();
 }
 
@@ -107,6 +138,7 @@ UlDenseDecoder::~UlDenseDecoder()
     if (ce0_) free(ce0_);
     if (mrc_dry_data_) free(mrc_dry_data_);
     if (mrc_dry_sb_) { srsran_softbuffer_rx_free(mrc_dry_sb_); delete mrc_dry_sb_; }
+    if (cfo_work_) free(cfo_work_);
     if (own_sb_) { srsran_softbuffer_rx_free(own_sb_); delete own_sb_; }
     for (auto& kv : harq_buffers_) { srsran_softbuffer_rx_free(kv.second); delete kv.second; }
 }
@@ -282,6 +314,78 @@ bool UlDenseDecoder::decode_tb(DCI_UL &g, srsran_pusch_cfg_t &pusch)
         return true;
     }
     return false;
+}
+
+// ---- per-UE CFO correction at the nominal window, then decode --------------
+bool UlDenseDecoder::cfo_decode(DCI_UL &g, srsran_pusch_cfg_t &pusch)
+{
+    if (!harq_no_reset_)
+        srsran_softbuffer_rx_reset_tbs(pusch.softbuffers.rx, pusch.grant.tb.tbs);
+    const uint32_t N = nominal_sym_len_;
+
+    // 1) nominal chest -> CFO estimate (+ uncorrected decode for the A/B).
+    memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * N);
+    if (srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch,
+                                       enb_ul_.sf_symbols, &enb_ul_.chest_res) != SRSRAN_SUCCESS)
+        return false;
+    float cfo = enb_ul_.chest_res.cfo_hz;
+    float snr0 = enb_ul_.chest_res.snr_db;
+
+    static const bool cfo_diag = (getenv("UL_DENSE2_CFO_DIAG") != nullptr);
+    bool crc0_ab = false;
+    if (cfo_diag) {   // dry uncorrected decode on scratch (no HARQ / pcap)
+        srsran_softbuffer_rx_reset_tbs(mrc_dry_sb_, pusch.grant.tb.tbs);
+        srsran_softbuffer_rx_t* sv = pusch.softbuffers.rx; pusch.softbuffers.rx = mrc_dry_sb_;
+        srsran_pusch_res_t dr; memset(&dr, 0, sizeof(dr)); dr.data = mrc_dry_data_;
+        if (srsran_pusch_decode(&enb_ul_.pusch, &ul_sf_, &pusch, &enb_ul_.chest_res,
+                                enb_ul_.sf_symbols, &dr) == SRSRAN_SUCCESS && dr.crc && pusch.grant.tb.tbs >= 8) {
+            int nb = pusch.grant.tb.tbs/8; bool az=true; for(int b=0;b<nb;b++) if(dr.data[b]){az=false;break;}
+            uint8_t b0=dr.data[0]; int lc=b0&0x1F; crc0_ab = !az && (b0&0xC0)==0 && !(lc>=11&&lc<=23);
+        }
+        pusch.softbuffers.rx = sv;
+    }
+
+    // 2) if CFO is negligible or unusable, decode as-is (never worse than nominal).
+    if (!std::isfinite(cfo) || fabsf(cfo) < 20.0f || fabsf(cfo) > 950.0f) {
+        memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * N);
+        (void)srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch, enb_ul_.sf_symbols, &enb_ul_.chest_res);
+        return decode_tb(g, pusch);
+    }
+
+    // 3) de-rotate every OFDM symbol by its true time phase, then re-chest+decode.
+    const uint32_t nsc   = enb_ul_.cell.nof_prb * SRSRAN_NRE;        // subcarriers/symbol
+    const uint32_t nsymb = SRSRAN_CP_NORM_SF_NSYMB;                  // 14
+    const float    Tsym  = 1e-3f / (float)nsymb;                     // ~71.4 us/symbol
+    for (uint32_t m = 0; m < nsymb; m++) {
+        float ph = -2.0f * (float)M_PI * cfo * (float)m * Tsym;      // remove CFO ramp
+        float cr = cosf(ph), ci = sinf(ph);
+        cf_t* src = nominal_sym_ + (size_t)m * nsc;
+        cf_t* dst = cfo_work_    + (size_t)m * nsc;
+        for (uint32_t k = 0; k < nsc; k++) {
+            float xr = __real__ (src[k]), xi = __imag__ (src[k]);
+            cf_t v; __real__ v = xr*cr - xi*ci; __imag__ v = xr*ci + xi*cr;
+            dst[k] = v;
+        }
+    }
+    memcpy(enb_ul_.sf_symbols, cfo_work_, sizeof(cf_t) * N);
+    if (srsran_chest_ul_estimate_pusch(&enb_ul_.chest, &ul_sf_, &pusch,
+                                       enb_ul_.sf_symbols, &enb_ul_.chest_res) != SRSRAN_SUCCESS)
+        return false;
+    bool crc = decode_tb(g, pusch);
+
+    if (cfo_diag) {
+        static std::atomic<uint64_t> rec{0}, lost{0}, both{0}; static std::atomic<long long> cfosum{0}, cn{0};
+        cfosum.fetch_add((long long)lroundf(fabsf(cfo))); cn.fetch_add(1);
+        if (crc && !crc0_ab) {
+            uint64_t r = rec.fetch_add(1)+1;
+            printf("[DENSE2-CFO-AB] CFO recovered a grant plain-decode could NOT (rnti=0x%04x mcs=%d cfo=%.0fHz snr0=%.1f) "
+                   "| cfo_only=%llu plain_only=%llu both=%llu mean|cfo|=%lldHz\n",
+                   g.rnti, g.ran_ul_grant->tb.mcs_idx, cfo, snr0, (unsigned long long)r,
+                   (unsigned long long)lost.load(), (unsigned long long)both.load(), cn.load()?cfosum.load()/cn.load():0);
+        } else if (!crc && crc0_ab) lost.fetch_add(1);
+        else if (crc && crc0_ab)    both.fetch_add(1);
+    }
+    return crc;
 }
 
 // ---- single-antenna decode of whatever is in sf_symbols --------------------
@@ -475,7 +579,7 @@ void UlDenseDecoder::decode()
                (unsigned long long)g_calls.load(), (unsigned long long)g_raw.load(),
                (unsigned long long)g_seen.load(), min_energy_db_, (unsigned long long)g_gated.load(),
                (unsigned long long)g_crc.load(), c_fixed_, (int)c_seeded_, c_samples_.size());
-    if (g_calls.load() % 20000 == 0) dump_ue_stats();   // per-UE decode-yield table
+    if (g_calls.load() % 20000 == 0) { dump_ue_stats(); if (getenv("UL_DENSE2_CURVE")) curve::dump(); }
 
     if (grants.empty()) return;
 
@@ -546,6 +650,7 @@ void UlDenseDecoder::decode()
         if (do_search && n > 0) cands[nc++] = best_off;
 
         bool crc = false; int crc_off = 0;
+        float chest0 = NAN;   // nominal-window chest SINR, for the decode curve
         for (int i = 0; i < nc && !crc; i++) {
             int off = cands[i];
             // Geometric guard: reject far-POSITIVE windows (real UL arrives near/
@@ -575,12 +680,23 @@ void UlDenseDecoder::decode()
                     memcpy(enb_ul_.sf_symbols, nominal_sym_, sizeof(cf_t) * nominal_sym_len_);
                     crc = decode_current(g, pusch);
                 }
+                chest0 = enb_ul_.chest_res.snr_db;  // nominal chest SINR for the curve
             } else {
                 if (!fft_at_offset(off)) continue;
                 crc = decode_current(g, pusch);
             }
             if (crc) crc_off = off;
         }
+        // Additive CFO fallback: only if plain decode FAILED. Purely additive —
+        // tries a per-UE CFO-corrected decode; can recover a grant but never lose one.
+        if (!crc && cfo_on_ && !mrc_on_) {
+            if (harq_on_) { pusch.softbuffers.rx = own_sb_; harq_no_reset_ = false; }
+            crc = cfo_decode(g, pusch);
+            if (crc) crc_off = 0;
+        }
+
+        static const bool curve_on = (getenv("UL_DENSE2_CURVE") != nullptr);
+        if (curve_on) curve::record(chest0, g.ran_ul_grant->tb.mcs_idx, crc);
         pusch.softbuffers.rx = own_sb_;
         harq_no_reset_ = false;
         if (crc) g_crc.fetch_add(1, std::memory_order_relaxed);

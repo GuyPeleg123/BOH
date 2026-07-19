@@ -330,6 +330,18 @@ class SnifferRunner:
         if diag and argv[:2] == ["sudo", "-n"]:
             argv = argv[2:]
 
+        # Dense Test: lower the FALCON RNTI-histogram threshold to 2 (default 5).
+        # A UE's grants are only trusted after its RNTI is seen >=threshold times, so
+        # threshold 5 SUPPRESSES brief UEs' initial-access uplink (RRC ConnectionRequest
+        # / SetupComplete — the strong, identity-rich frames from nearby phones that
+        # connect quickly). Measured back-to-back in the same traffic: -H 2 gave ~3x the
+        # UL frames (343 vs 116), 2x the UEs, 2x the RRC ConnReqs, 0 false frames, at a
+        # moderate CPU cost (a few % elevated subframe-skip on this 14-core box). Only
+        # applied to Dense Test; Start keeps the stable default. Don't override an
+        # explicit user-set -H.
+        if diag and "-H" not in argv:
+            argv += ["-H", "2"]
+
         # Each run gets its own timestamped subdirectory so captures never
         # overwrite each other.  LTESniffer always uses hardcoded filenames
         # (ltesniffer_dl_mode.pcap, api_collector.pcap, …) relative to CWD,
