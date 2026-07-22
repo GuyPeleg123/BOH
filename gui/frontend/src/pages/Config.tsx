@@ -496,7 +496,7 @@ export function ConfigPage() {
                 <div className="h-1.5 flex-1 bg-border rounded overflow-hidden">
                   <div className="h-full w-1/3 bg-accent" style={{ animation: "pinbar 1.2s ease-in-out infinite" }} />
                 </div>
-                <button className="btn !px-2 !py-0.5 !text-xs" onClick={stopPin}>✕ Stop</button>
+                <button className="btn !px-3 !py-1.5 !text-sm" onClick={stopPin}>✕ Stop</button>
               </div>
             )}
             {pinMsg && <div className="text-xs font-mono mt-1 text-slate-100">{pinMsg}</div>}
@@ -525,7 +525,7 @@ export function ConfigPage() {
         <div className="flex items-baseline justify-between mb-2 gap-3">
           <span className="label">Known cells — one-click load</span>
           <button
-            className="btn btn-ok !px-3 !py-1 !text-xs"
+            className="btn btn-ok !px-3.5 !py-1.5 !text-sm"
             disabled={busy || !cfg}
             onClick={saveCurrentAsKnownCell}
             title="Snapshot the current config (freq, mode, USRP, gain) as a new known cell"
@@ -544,7 +544,7 @@ export function ConfigPage() {
             {knownCells.map((c, i) => (
               <div key={i} className="flex items-center gap-3 p-2 rounded border border-border bg-bg">
                 <button
-                  className="btn btn-primary !px-3 !py-1 !text-xs"
+                  className="btn btn-primary !px-3.5 !py-1.5 !text-sm"
                   disabled={busy}
                   onClick={() => loadKnownCell(i)}
                   title="Copy these settings into the config form below"
@@ -566,7 +566,7 @@ export function ConfigPage() {
                   <span className="text-[10px] text-muted font-mono whitespace-nowrap">{c.last_success_iso}</span>
                 )}
                 <button
-                  className="btn btn-danger !px-2 !py-0.5 !text-[10px]"
+                  className="btn btn-danger !px-2.5 !py-1 !text-xs"
                   disabled={busy}
                   onClick={() => deleteKnownCell(i)}
                   title="Remove this cell from the registry"

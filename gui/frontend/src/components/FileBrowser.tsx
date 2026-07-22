@@ -50,12 +50,12 @@ export function FileBrowser({
       <div className="panel w-full max-w-2xl max-h-[85vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center mb-2">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Select a pcap</h2>
-          <button className="btn !px-2 !py-0.5 !text-xs ml-auto" onClick={onClose}>✕ close</button>
+          <button className="btn !px-3 !py-1.5 !text-sm ml-auto" onClick={onClose}>✕ close</button>
         </div>
 
         {/* path bar: up, manual path, jump to captures default */}
         <div className="flex items-center gap-2 mb-2">
-          <button className="btn !px-2 !py-0.5 !text-xs" title="Up one level"
+          <button className="btn !px-3 !py-1.5 !text-sm" title="Up one level"
                   disabled={!resp?.parent} onClick={() => resp?.parent && go(resp.parent)}>↑ up</button>
           <input
             className="input !text-xs font-mono flex-1"
@@ -65,9 +65,9 @@ export function FileBrowser({
             onKeyDown={(e) => { if (e.key === "Enter") go(manual.trim() || undefined); }}
             placeholder="/path/to/folder"
           />
-          <button className="btn !px-2 !py-0.5 !text-xs" onClick={() => go(manual.trim() || undefined)}>Go</button>
+          <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => go(manual.trim() || undefined)}>Go</button>
           {resp?.default && (
-            <button className="btn !px-2 !py-0.5 !text-xs" title="Jump to the captures folder"
+            <button className="btn !px-3 !py-1.5 !text-sm" title="Jump to the captures folder"
                     onClick={() => go(resp.default!)}>📁 captures</button>
           )}
         </div>
@@ -90,7 +90,7 @@ export function FileBrowser({
                   <td className="px-2 py-1 text-right text-muted w-28">{e.is_dir ? "" : fmtBytes(e.size)}</td>
                   <td className="px-2 py-1 text-right w-16">
                     {!e.is_dir && (
-                      <button className="btn btn-primary !px-2 !py-0.5 !text-[10px]"
+                      <button className="btn btn-primary !px-2.5 !py-1 !text-xs"
                               onClick={(ev) => { ev.stopPropagation(); onPick(e.path, e.name); }}>pick</button>
                     )}
                   </td>

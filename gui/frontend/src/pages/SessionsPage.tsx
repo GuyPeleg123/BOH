@@ -218,13 +218,13 @@ export function SessionsPage() {
       <div className="flex items-center gap-2 mb-3 text-xs bg-bg border border-border rounded px-2 py-1.5 flex-wrap">
         <span className="text-muted uppercase text-[10px] shrink-0">Capture</span>
         <span className="font-mono text-slate-100 truncate" title={path ?? ""}>{name}</span>
-        <button className="btn !px-2 !py-0.5 !text-xs" onClick={() => setBrowsing(true)}>📁 Browse…</button>
-        <button className="btn !px-2 !py-0.5 !text-xs" onClick={() => { setPath(null); setName("(latest capture)"); }}>↺ latest</button>
+        <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => setBrowsing(true)}>📁 Browse…</button>
+        <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => { setPath(null); setName("(latest capture)"); }}>↺ latest</button>
         <label className="flex items-center gap-1 cursor-pointer ml-2">
           <input type="checkbox" checked={decrypt} onChange={(e) => setDecrypt(e.target.checked)} />
           <span>Decrypt (use saved keys)</span>
         </label>
-        <button className="btn btn-primary !px-3 !py-1 !text-xs ml-auto" disabled={running} onClick={run}>
+        <button className="btn btn-primary !px-3.5 !py-1.5 !text-sm ml-auto" disabled={running} onClick={run}>
           {running ? "Analyzing…" : "Analyze sessions"}
         </button>
       </div>

@@ -36,7 +36,7 @@ export function StatusBar() {
   const tab = (path: string, label: string) => (
     <Link
       to={path}
-      className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+      className={`px-4 py-2 rounded-md text-[15px] font-medium whitespace-nowrap transition-colors ${
         loc.pathname === path
           ? "bg-border text-slate-100"
           : "text-muted hover:text-slate-200 hover:bg-border/40"
@@ -49,16 +49,16 @@ export function StatusBar() {
   const running = state.lifecycle === "running";
 
   return (
-    <header className="flex items-center gap-4 px-4 py-2 border-b border-border bg-panel">
+    <header className="flex items-center gap-5 px-5 py-2.5 border-b border-border bg-panel">
       {/* Logo + name */}
       <div className="flex items-center gap-2 shrink-0">
-        <svg width="22" height="22" viewBox="0 0 16 16" aria-hidden>
+        <svg width="26" height="26" viewBox="0 0 16 16" aria-hidden>
           <path d="M2 12 L5 6 L8 10 L11 4 L14 8" stroke="#6cb6ff" strokeWidth="1.5" fill="none" />
         </svg>
-        <span className="font-semibold tracking-tight">LTESniffer</span>
+        <span className="font-semibold tracking-tight text-lg">LTESniffer</span>
       </div>
 
-      <nav className="flex gap-1">
+      <nav className="flex gap-1.5 shrink-0">
         {tab("/", "Dashboard")}
         {tab("/ues", "UEs")}
         {tab("/sessions", "Sessions")}
@@ -69,13 +69,13 @@ export function StatusBar() {
         {tab("/help", "Help")}
       </nav>
 
-      <div className="ml-auto flex items-center gap-3 text-xs">
+      <div className="ml-auto flex items-center gap-3.5 text-sm">
         {/* Connection state */}
         <span
           className={`flex items-center gap-1.5 ${state.connected ? "text-ok" : "text-bad"}`}
           title={state.connected ? "WebSocket connected" : "WebSocket disconnected — backend may be down"}
         >
-          <span className={`inline-block w-1.5 h-1.5 rounded-full ${state.connected ? "bg-ok" : "bg-bad"} ${state.connected ? "animate-pulse" : ""}`} />
+          <span className={`inline-block w-2 h-2 rounded-full ${state.connected ? "bg-ok" : "bg-bad"} ${state.connected ? "animate-pulse" : ""}`} />
           {state.connected ? "connected" : "disconnected"}
         </span>
 
@@ -84,13 +84,13 @@ export function StatusBar() {
           className={`flex items-center gap-1.5 ${running ? "text-ok" : "text-muted"}`}
           title={running ? `Sniffer running (pid ${state.pid})` : "Sniffer stopped"}
         >
-          <span className={`inline-block w-1.5 h-1.5 rounded-full ${running ? "bg-ok animate-pulse" : "bg-muted"}`} />
+          <span className={`inline-block w-2 h-2 rounded-full ${running ? "bg-ok animate-pulse" : "bg-muted"}`} />
           {running ? <span>running <span className="text-muted">· pid {state.pid}</span></span> : "stopped"}
         </span>
 
         {/* Cell identity */}
         {state.cell && (
-          <span className="text-muted hidden md:inline">
+          <span className="text-muted hidden md:inline whitespace-nowrap">
             PCI <span className="text-slate-100 font-mono">{state.cell.pci}</span> ·{" "}
             <span className="font-mono">{state.cell.nof_prb}</span>&nbsp;PRB ·{" "}
             <span className="font-mono">{(state.cell.dl_freq / 1e6).toFixed(1)}</span>&nbsp;MHz
@@ -105,7 +105,7 @@ export function StatusBar() {
             </span>
           )}
           <button
-            className="px-2 py-1 rounded-md text-muted hover:text-bad hover:bg-bad/10 transition-colors"
+            className="px-2.5 py-1.5 rounded-md text-base text-muted hover:text-bad hover:bg-bad/10 transition-colors"
             onClick={handleLogout}
             title="Log out (clears the session cookie and returns to the login page)"
           >

@@ -99,29 +99,54 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
   const toggle = (p: string) =>
     setExpanded((s) => { const n = new Set(s); n.has(p) ? n.delete(p) : n.add(p); return n; });
 
+  const expandAll = () => {
+    const all = new Set<string>();
+    const walk = (n: FolderNode) => { all.add(n.path); n.folders.forEach(walk); };
+    forest.forEach(walk);
+    setExpanded(all);
+  };
+  const collapseAll = () => setExpanded(new Set(forest.map((t) => t.path)));
+
+  // Indent step per tree depth (px). Bigger than before for clearer nesting.
+  const INDENT = 20;
+
   function fileRow(c: CaptureFile, depth: number) {
+    const empty = c.size === 0;
     return (
       <div key={c.path}
-        className="flex items-center gap-2 border-b border-border/20 hover:bg-panel/50 py-1 pr-2"
-        style={{ paddingLeft: 8 + depth * 16 }}>
+        className="group flex items-center gap-3 border-b border-border/20 hover:bg-panel/70 py-2.5 pr-3 transition-colors"
+        style={{ paddingLeft: 12 + depth * INDENT }}>
         {c.active
-          ? <span className="inline-block w-1.5 h-1.5 rounded-full bg-ok animate-pulse shrink-0" title="Active capture" />
-          : <span className="w-1.5 shrink-0" />}
-        <span className="shrink-0">📄</span>
-        <span className="text-slate-100 truncate" title={c.path}>{c.name}</span>
-        <span className="text-muted text-[10px] ml-auto shrink-0 w-20 text-right">{fmtBytes(c.size)}</span>
-        <span className="text-muted text-[10px] shrink-0 w-16 text-right">{fmtAge(c.mtime)}</span>
-        <span className="shrink-0 w-16 text-right">
-          {c.size > 0
-            ? <a className="btn !px-1.5 !py-0.5 !text-[10px] btn-primary" href={api.downloadCaptureUrl(c.path)} download={c.name}>↓</a>
-            : <span className="text-muted text-[10px]">empty</span>}
+          ? <span className="inline-block w-2.5 h-2.5 rounded-full bg-ok animate-pulse shrink-0" title="Active capture" />
+          : <span className="w-2.5 shrink-0" />}
+        <span className="shrink-0 text-lg leading-none">📄</span>
+        <span className="text-slate-100 font-mono text-sm truncate" title={c.path}>{c.name}</span>
+        {c.active && (
+          <span className="shrink-0 text-[11px] font-semibold text-ok bg-ok/10 border border-ok/30 rounded px-1.5 py-0.5">
+            LIVE
+          </span>
+        )}
+        <span className={`ml-auto shrink-0 w-28 text-right text-sm tabular-nums ${empty ? "text-muted" : "text-slate-300"}`}>
+          {empty ? "—" : fmtBytes(c.size)}
         </span>
-        <span className="shrink-0 w-16 text-right">
-          {c.size > 0
-            ? <button className="btn !px-1.5 !py-0.5 !text-[10px]" title="Decrypt with PDCP keys"
-                      onClick={() => { setDecryptTarget(c); setDecryptOpen(true); }}>🔓</button>
-            : <span className="text-muted text-[10px]">—</span>}
-        </span>
+        <span className="shrink-0 w-24 text-right text-sm text-muted tabular-nums">{fmtAge(c.mtime)}</span>
+        <div className="shrink-0 flex items-center justify-end gap-2 w-[210px]">
+          {empty ? (
+            <span className="text-muted text-xs italic pr-2">writing…</span>
+          ) : (
+            <>
+              <a className="btn btn-secondary !px-3 !py-1.5 !text-xs !gap-1.5"
+                 href={api.downloadCaptureUrl(c.path)} download={c.name} title="Download this pcap">
+                <span aria-hidden>↓</span><span className="hidden lg:inline">Download</span>
+              </a>
+              <button className="btn btn-primary !px-3 !py-1.5 !text-xs !gap-1.5"
+                      title="Decrypt with PDCP keys"
+                      onClick={() => { setDecryptTarget(c); setDecryptOpen(true); }}>
+                <span aria-hidden>🔓</span><span className="hidden lg:inline">Decrypt</span>
+              </button>
+            </>
+          )}
+        </div>
       </div>
     );
   }
@@ -130,18 +155,23 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
     const open = expanded.has(n.path);
     const subfolders = [...n.folders].sort((a, b) => latestMtime(b) - latestMtime(a));
     const files = [...n.files].sort((a, b) => b.mtime - a.mtime);
+    const count = countFiles(n);
     return (
       <div key={n.path}>
-        <div className="flex items-center gap-2 border-b border-border/30 hover:bg-panel/40 py-1 pr-2 cursor-pointer"
-          style={{ paddingLeft: 8 + depth * 16 }} onClick={() => toggle(n.path)}>
-          <span className="text-muted w-3 shrink-0">{open ? "▾" : "▸"}</span>
+        <div className={`flex items-center gap-3 border-b border-border/40 hover:bg-panel/60 py-2.5 pr-3 cursor-pointer transition-colors ${isTop ? "bg-panel/40" : ""}`}
+          style={{ paddingLeft: 12 + depth * INDENT }} onClick={() => toggle(n.path)}>
+          <span className="text-muted w-4 shrink-0 text-sm select-none">{open ? "▾" : "▸"}</span>
           {hasActive(n)
-            ? <span className="inline-block w-1.5 h-1.5 rounded-full bg-ok animate-pulse shrink-0" title="Contains an active capture" />
-            : <span className="w-1.5 shrink-0" />}
-          <span className="shrink-0">📁</span>
-          <span className="text-slate-200 truncate" title={n.path}>{isTop ? n.path : n.name}</span>
-          <span className="text-muted text-[10px] shrink-0">({countFiles(n)} pcap{countFiles(n) === 1 ? "" : "s"})</span>
-          <span className="text-muted text-[10px] ml-auto shrink-0">{fmtAge(latestMtime(n))}</span>
+            ? <span className="inline-block w-2.5 h-2.5 rounded-full bg-ok animate-pulse shrink-0" title="Contains an active capture" />
+            : <span className="w-2.5 shrink-0" />}
+          <span className="shrink-0 text-lg leading-none">{open ? "📂" : "📁"}</span>
+          <span className={`truncate ${isTop ? "font-mono text-sm text-slate-200" : "text-sm font-medium text-slate-100"}`} title={n.path}>
+            {isTop ? n.path : n.name}
+          </span>
+          <span className="shrink-0 text-[11px] text-muted bg-border/50 rounded-full px-2 py-0.5 tabular-nums">
+            {count} pcap{count === 1 ? "" : "s"}
+          </span>
+          <span className="text-muted text-sm ml-auto shrink-0 tabular-nums">{fmtAge(latestMtime(n))}</span>
         </div>
         {open && (
           <div>
@@ -153,34 +183,61 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
     );
   }
 
-  const flat = (resp?.captures ?? []);
+  const flat = [...(resp?.captures ?? [])].sort((a, b) => b.mtime - a.mtime);
+  const totalCount = resp?.captures.length ?? 0;
+  const totalSize = (resp?.captures ?? []).reduce((s, c) => s + c.size, 0);
 
   const body = (
     <div className="flex flex-col min-h-0 flex-1">
-      <div className="flex items-center gap-3 mb-2 flex-wrap text-xs">
-        <span className="text-muted">
-          Active dir: <span className="font-mono text-slate-200">{resp?.captures_dir ?? "…"}</span>
-        </span>
-        <span className="text-muted">
-          Searching: <span className="font-mono text-slate-300">{resp?.roots.length ?? 0} root(s)</span>
-        </span>
-        <div className="ml-auto flex items-center gap-1">
-          <button className={`btn !px-2 !py-0.5 !text-xs ${view === "tree" ? "btn-primary" : ""}`} onClick={() => setView("tree")}>🗂 Tree</button>
-          <button className={`btn !px-2 !py-0.5 !text-xs ${view === "flat" ? "btn-primary" : ""}`} onClick={() => setView("flat")}>☰ Flat</button>
+      {/* toolbar */}
+      <div className="flex items-center gap-3 mb-3 flex-wrap">
+        <div className="flex items-center gap-x-5 gap-y-1 text-sm flex-wrap">
+          <span className="text-muted">
+            Active dir <span className="font-mono text-slate-200 ml-1">{resp?.captures_dir ?? "…"}</span>
+          </span>
+          <span className="text-muted">
+            <span className="text-slate-200 font-semibold tabular-nums">{totalCount}</span> pcap{totalCount === 1 ? "" : "s"}
+            <span className="mx-1.5 text-border">·</span>
+            <span className="text-slate-200 tabular-nums">{fmtBytes(totalSize)}</span>
+            <span className="mx-1.5 text-border">·</span>
+            <span className="tabular-nums">{resp?.roots.length ?? 0}</span> root{(resp?.roots.length ?? 0) === 1 ? "" : "s"}
+          </span>
         </div>
-        <button className="btn !px-2 !py-0.5 !text-xs" title="Pick any pcap on the machine to decrypt (opens in the captures folder)"
-                onClick={() => { setDecryptTarget(null); setDecryptOpen(true); }}>🔓 Decrypt a file…</button>
-        <button className="btn !px-2 !py-0.5 !text-xs" onClick={refresh}>↻ refresh</button>
+
+        <div className="ml-auto flex items-center gap-2 flex-wrap">
+          {/* view toggle — segmented control */}
+          <div className="inline-flex rounded-md border border-border overflow-hidden">
+            <button
+              className={`px-3 py-1.5 text-sm transition-colors ${view === "tree" ? "bg-accent/15 text-accent" : "text-muted hover:bg-border/40"}`}
+              onClick={() => setView("tree")}>🗂 Tree</button>
+            <button
+              className={`px-3 py-1.5 text-sm transition-colors border-l border-border ${view === "flat" ? "bg-accent/15 text-accent" : "text-muted hover:bg-border/40"}`}
+              onClick={() => setView("flat")}>☰ Flat</button>
+          </div>
+
+          {view === "tree" && (
+            <div className="inline-flex rounded-md border border-border overflow-hidden">
+              <button className="px-3 py-1.5 text-sm text-muted hover:bg-border/40 transition-colors"
+                      title="Expand every folder" onClick={expandAll}>⊕ Expand</button>
+              <button className="px-3 py-1.5 text-sm text-muted hover:bg-border/40 transition-colors border-l border-border"
+                      title="Collapse to the top-level roots" onClick={collapseAll}>⊖ Collapse</button>
+            </div>
+          )}
+
+          <button className="btn btn-secondary" title="Pick any pcap on the machine to decrypt (opens in the captures folder)"
+                  onClick={() => { setDecryptTarget(null); setDecryptOpen(true); }}>🔓 Decrypt a file…</button>
+          <button className="btn btn-secondary" title="Reload the capture list now" onClick={refresh}>↻ Refresh</button>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-auto bg-bg border border-border rounded text-xs font-mono">
+      {/* listing */}
+      <div className="flex-1 overflow-auto bg-bg border border-border rounded-lg">
         {/* header row */}
-        <div className="flex items-center gap-2 sticky top-0 bg-bg z-10 border-b border-border text-[10px] uppercase text-muted py-1.5 px-2">
-          <span>Name</span>
-          <span className="ml-auto w-20 text-right">Size</span>
-          <span className="w-16 text-right">Modified</span>
-          <span className="w-16 text-right">DL</span>
-          <span className="w-16 text-right">Decrypt</span>
+        <div className="flex items-center gap-3 sticky top-0 bg-bg/95 backdrop-blur z-10 border-b border-border text-xs uppercase tracking-wide text-muted font-semibold py-2.5 px-3">
+          <span className="pl-8">Name</span>
+          <span className="ml-auto w-28 text-right">Size</span>
+          <span className="w-24 text-right">Modified</span>
+          <span className="w-[210px] text-right pr-2">Actions</span>
         </div>
 
         {view === "tree"
@@ -188,12 +245,15 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
           : flat.map((c) => fileRow(c, 0))}
 
         {resp && resp.captures.length === 0 && (
-          <div className="text-center text-muted py-6">
-            No pcap files in <span className="font-mono">{resp.captures_dir}</span> or its known siblings.
-            Start a capture to generate one.
+          <div className="text-center text-muted py-12 px-4">
+            <div className="text-3xl mb-2">📭</div>
+            <div className="text-sm">
+              No pcap files in <span className="font-mono text-slate-300">{resp.captures_dir}</span> or its known siblings.
+            </div>
+            <div className="text-xs mt-1">Start a capture to generate one.</div>
           </div>
         )}
-        {err && <div className="text-center text-bad py-4 font-mono">{err}</div>}
+        {err && <div className="text-center text-bad py-4 font-mono text-sm">{err}</div>}
       </div>
 
       {decryptOpen && (
@@ -204,8 +264,8 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
 
   if (embedded) return body;
   return (
-    <div className="panel p-4 flex flex-col min-h-0">
-      <h2 className="text-sm font-semibold uppercase tracking-wide text-muted mb-3">Captures</h2>
+    <div className="panel p-5 flex flex-col min-h-0">
+      <h2 className="text-base font-semibold text-slate-100 mb-4">Captures</h2>
       {body}
     </div>
   );

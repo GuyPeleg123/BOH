@@ -39,8 +39,8 @@ export function Dashboard() {
       {/* row 4: tabbed log footer — expands to fill remaining height */}
       <div className="panel p-3 flex flex-col min-h-0 flex-1">
         <div className="flex gap-1 mb-2">
-          <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "logs" ? "btn-primary" : ""}`} onClick={() => setBottomTab("logs")}>Logs</button>
-          <button className={`btn !px-2 !py-0.5 !text-xs ${bottomTab === "identities" ? "btn-primary" : ""}`} onClick={() => setBottomTab("identities")}>Identities</button>
+          <button className={`btn !px-3 !py-1.5 !text-sm ${bottomTab === "logs" ? "btn-primary" : ""}`} onClick={() => setBottomTab("logs")}>Logs</button>
+          <button className={`btn !px-3 !py-1.5 !text-sm ${bottomTab === "identities" ? "btn-primary" : ""}`} onClick={() => setBottomTab("identities")}>Identities</button>
         </div>
         <div className="flex-1 min-h-0 flex flex-col">
           {bottomTab === "logs" ? <LogPanel embedded /> : <IdentitiesPanel embedded />}

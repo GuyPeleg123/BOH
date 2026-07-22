@@ -44,10 +44,10 @@ export function HelpPage() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <a className="btn btn-secondary !px-3 !py-1 !text-xs" href={GUIDE_PATH} download="LTESniffer_USER_GUIDE.txt">
+        <a className="btn btn-secondary !px-3.5 !py-1.5 !text-sm" href={GUIDE_PATH} download="LTESniffer_USER_GUIDE.txt">
           ⬇ Download .txt
         </a>
-        <a className="btn btn-secondary !px-3 !py-1 !text-xs" href={GUIDE_PATH} target="_blank" rel="noopener">
+        <a className="btn btn-secondary !px-3.5 !py-1.5 !text-sm" href={GUIDE_PATH} target="_blank" rel="noopener">
           ↗ Open raw
         </a>
         <span className="text-[10px] text-muted ml-auto font-mono">{GUIDE_PATH}</span>

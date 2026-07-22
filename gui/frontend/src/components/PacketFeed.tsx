@@ -53,7 +53,7 @@ export function PacketFeed() {
 
   const FilterBtn = ({ v, label }: { v: Filter; label: string }) => (
     <button
-      className={`btn !px-2 !py-0.5 !text-xs ${filter === v ? "btn-primary" : ""}`}
+      className={`btn !px-3 !py-1.5 !text-sm ${filter === v ? "btn-primary" : ""}`}
       onClick={() => setFilter(v)}
     >
       {label}
@@ -83,7 +83,7 @@ export function PacketFeed() {
             onChange={(e) => setRntiFilter(e.target.value)}
           />
           <button
-            className={`btn !px-2 !py-0.5 !text-xs ${paused ? "btn-danger" : ""}`}
+            className={`btn !px-3 !py-1.5 !text-sm ${paused ? "btn-danger" : ""}`}
             onClick={() => setPaused((p) => !p)}
             title="Pause / resume. Hovering also pauses automatically."
           >

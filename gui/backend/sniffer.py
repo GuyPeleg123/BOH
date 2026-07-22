@@ -44,7 +44,7 @@ _PCAP_MAGIC_BE = (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d")
 
 
 def count_pcap_by_direction(path: Path) -> tuple[int, int]:
-    """Count MAC-LTE records split into (uplink, downlink) actually written.
+    """Count DEDICATED (per-UE) MAC-LTE records split into (uplink, downlink).
 
     These are the frames that DECODED (CRC-OK) and reached the pcap — the
     ground truth. This is deliberately NOT the same as the live "grants"
@@ -54,11 +54,20 @@ def count_pcap_by_direction(path: Path) -> tuple[int, int]:
     monitor the two differ enormously (e.g. 118 UL grants scheduled vs 4 UL
     PUSCH captured), so the dashboard must show both, not conflate them.
 
+    Only C-RNTI (rntiType == 3) records are counted here — the connection-
+    oriented per-UE traffic (CCCH / DCCH / DTCH). Broadcast and paging
+    (SI-RNTI, P-RNTI) and RACH responses (RA-RNTI) are EXCLUDED: they already
+    have their own dashboard rows, and counting them again would swamp the
+    per-UE signal (a real DL capture is ~76% paging+SIB). The full untyped
+    frame total is still reported separately by count_pcap_records().
+
     Format: DLT_MAC_LTE (147). Each record payload starts with
     radioType(1) | direction(1) | rntiType(1) | tags…, so byte offset 1 is the
-    direction: 0 = uplink, 1 = downlink. Verified byte-exact against
-    `tshark -Y 'mac-lte.direction==0/1'`. Returns (0, 0) on any error so a
-    mid-run read of a freshly-opened pcap is harmless.
+    direction (0 = uplink, 1 = downlink) and byte offset 2 is the rntiType
+    (1 = P-RNTI, 2 = RA-RNTI, 3 = C-RNTI, 4 = SI-RNTI). Verified byte-exact
+    against `tshark -Y 'mac-lte.direction==0/1 && mac-lte.rnti-type==3'`.
+    Returns (0, 0) on any error so a mid-run read of a freshly-opened pcap is
+    harmless.
     """
     ul = dl = 0
     try:
@@ -78,8 +87,11 @@ def count_pcap_by_direction(path: Path) -> tuple[int, int]:
                     break
                 caplen = struct.unpack(endian + "IIII", rh)[2]
                 payload = f.read(caplen)
-                if len(payload) >= 2:
+                if len(payload) >= 3:
                     d = payload[1]          # byte 1 = direction: 0=UL, 1=DL
+                    rt = payload[2]         # byte 2 = rntiType: 3 = C-RNTI (dedicated)
+                    if rt != 3:             # skip SI/P/RA-RNTI (SIB, paging, RAR)
+                        continue
                     if d == 0:
                         ul += 1
                     elif d == 1:

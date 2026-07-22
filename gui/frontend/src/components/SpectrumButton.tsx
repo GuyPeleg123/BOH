@@ -364,7 +364,7 @@ export function SpectrumButton() {
               ].map((p) => (
                 <button
                   key={p.mhz}
-                  className={`btn !px-1.5 !py-0.5 !text-[10px] ${spanMhz === p.mhz ? "btn-primary" : ""}`}
+                  className={`btn !px-2.5 !py-1 !text-xs ${spanMhz === p.mhz ? "btn-primary" : ""}`}
                   onClick={() => setSpanMhz(p.mhz)}
                   title={`Set sample rate to ${p.mhz} MHz`}
                 >

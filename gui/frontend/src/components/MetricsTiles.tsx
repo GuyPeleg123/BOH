@@ -63,18 +63,12 @@ export function MetricsTiles() {
       totals: state.totals,
       bytes_s: rates.tbs / 8,
       elapsedSec,
-      // Authoritative MAC frame count of the final pcap (backend counts the
-      // file on disk every ~2 s). Distinct from totals.dci, which overcounts:
-      // grants can be decoded but fail PDSCH and never get written.
-      pcapFrames: state.pcapFrames,
-      // Sum of the live packet-type counters (MIB/SIB/paging/RAR/DL/UL data).
-      // This is the *classified sample*, not the full pcap total — the rich
-      // per-frame stream is throttled to ~20 ms, so it tallies a subset of the
-      // same one cell's frames. Shown next to `pcapFrames` for comparison.
-      typedFrames: (() => {
-        const f = state.frameTypes;
-        return f.mib + f.sib + f.paging + f.rar + f.dl_data + f.ul_data;
-      })(),
+      // Real per-UE frames actually decoded (CRC-OK) and written to the pcap,
+      // split by direction. C-RNTI only (CCCH/DCCH/DTCH) — the backend excludes
+      // SIB/paging/RAR, so these are genuine cell<->UE communication, not
+      // broadcast noise. Backend polls the pcap on disk every ~2 s.
+      pcapUl: state.pcapUl,
+      pcapDl: state.pcapDl,
       health: (() => {
         const s = state.stats;
         if (!s) return null;
@@ -87,7 +81,7 @@ export function MetricsTiles() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
 
-  const { totals, health, bytes_s, elapsedSec, pcapFrames, typedFrames } = snap;
+  const { totals, health, bytes_s, elapsedSec, pcapUl, pcapDl } = snap;
 
   function fmtElapsed(sec: number): string {
     const h = Math.floor(sec / 3600);
@@ -122,16 +116,16 @@ export function MetricsTiles() {
         accent={healthAccent}
       />
       <Tile
-        label="Frames"
-        value={pcapFrames.toLocaleString()}
-        sub="MAC frames in pcap (live)"
-        accent={pcapFrames > 0 ? "ok" : undefined}
+        label="UL"
+        value={pcapUl.toLocaleString()}
+        sub="real cell↔UE frames (pcap)"
+        accent={pcapUl > 0 ? "ok" : undefined}
       />
       <Tile
-        label="Typed frames"
-        value={typedFrames.toLocaleString()}
-        sub="Σ packet types (live sample)"
-        accent={typedFrames > 0 ? "accent" : undefined}
+        label="DL"
+        value={pcapDl.toLocaleString()}
+        sub="real cell↔UE frames, no broadcast"
+        accent={pcapDl > 0 ? "accent" : undefined}
       />
     </div>
   );

@@ -201,8 +201,8 @@ export function KeysPage() {
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Loaded keys</h2>
             <div className="flex gap-2">
-              <button className="btn !px-2 !py-0.5 !text-xs" onClick={refresh}>↻ refresh</button>
-              <button className="btn btn-primary !px-2 !py-0.5 !text-xs" disabled={busy} onClick={saveAndRestart}>
+              <button className="btn !px-3 !py-1.5 !text-sm" onClick={refresh}>↻ refresh</button>
+              <button className="btn btn-primary !px-3 !py-1.5 !text-sm" disabled={busy} onClick={saveAndRestart}>
                 Save & restart capture
               </button>
             </div>
@@ -238,8 +238,8 @@ export function KeysPage() {
                     </td>
                     <td className="px-2 py-1 text-right">{e.hfn_hint ?? 0}</td>
                     <td className="px-2 py-1 text-right">
-                      <button className="btn !px-2 !py-0.5 !text-[10px]" onClick={() => startEdit(i)}>edit</button>
-                      <button className="btn btn-danger !px-2 !py-0.5 !text-[10px] ml-1" onClick={() => deleteEntry(i)}>del</button>
+                      <button className="btn !px-2.5 !py-1 !text-xs" onClick={() => startEdit(i)}>edit</button>
+                      <button className="btn btn-danger !px-2.5 !py-1 !text-xs ml-1" onClick={() => deleteEntry(i)}>del</button>
                     </td>
                   </tr>
                 ))}
@@ -258,7 +258,7 @@ export function KeysPage() {
               {editingExisting ? `Edit RNTI ${draft.rntiText}` : "Add a key"}
             </h2>
             {editingExisting && (
-              <button className="btn !px-2 !py-0.5 !text-xs" onClick={startNew}>+ new</button>
+              <button className="btn !px-3 !py-1.5 !text-sm" onClick={startNew}>+ new</button>
             )}
           </div>
           <div className="space-y-3">
@@ -275,9 +275,9 @@ export function KeysPage() {
             <div>
               <div className="label mb-1">Key source</div>
               <div className="flex gap-2 mb-2">
-                <button className={`btn !px-2 !py-0.5 !text-xs ${draft.mode === "kenb" ? "btn-primary" : ""}`}
+                <button className={`btn !px-3 !py-1.5 !text-sm ${draft.mode === "kenb" ? "btn-primary" : ""}`}
                         onClick={() => set("mode", "kenb")}>K_eNB (direct)</button>
-                <button className={`btn !px-2 !py-0.5 !text-xs ${draft.mode === "kasme" ? "btn-primary" : ""}`}
+                <button className={`btn !px-3 !py-1.5 !text-sm ${draft.mode === "kasme" ? "btn-primary" : ""}`}
                         onClick={() => set("mode", "kasme")}>KASME + NAS count</button>
               </div>
               {draft.mode === "kenb" ? (

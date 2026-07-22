@@ -51,6 +51,8 @@ interface Row {
   builtin: boolean;
   /** Removal key for custom types (the tracked `from` string). */
   removeKey?: string;
+  /** Optional hover tooltip explaining what the row counts. */
+  hint?: string;
 }
 
 function loadTypes(): string[] {
@@ -109,12 +111,18 @@ export function PacketTypeCounter() {
       count: frameTypes[m.key] ?? 0,
       builtin: true,
     }));
-    // Real decoded/captured frames from the pcap (direction-split). Shown
-    // alongside the "grants (scheduled)" rows so the gap between what the tower
-    // scheduled and what we actually received is visible at a glance.
+    // Real decoded/captured frames from the pcap (direction-split), restricted
+    // to C-RNTI (dedicated per-UE traffic: CCCH/DCCH/DTCH). Broadcast/paging/
+    // RACH are excluded here because they already have their own rows above and
+    // would otherwise swamp the per-UE signal (a real DL capture is ~76%
+    // paging+SIB). Shown alongside the "grants (scheduled)" rows so the gap
+    // between what the tower scheduled and what we actually received is visible.
+    const dedicatedHint =
+      "Per-UE traffic only (CCCH / DCCH / DTCH — C-RNTI). Excludes SIB, paging and RAR, " +
+      "which are counted in their own rows above. The 'Frames' tile still shows the full total.";
     const capturedRows: Row[] = [
-      { name: "DL captured (pcap)", count: pcapDl, builtin: true },
-      { name: "UL captured (pcap)", count: pcapUl, builtin: true },
+      { name: "DL data captured (pcap)", count: pcapDl, builtin: true, hint: dedicatedHint },
+      { name: "UL data captured (pcap)", count: pcapUl, builtin: true, hint: dedicatedHint },
     ];
     const nasRows: Row[] = types.map((t) => ({
       name: t,
@@ -174,7 +182,7 @@ export function PacketTypeCounter() {
           <datalist id="pkt-type-suggestions">
             {suggestions.map((s) => <option key={s} value={s} />)}
           </datalist>
-          <button className="btn !px-2 !py-0.5 !text-xs btn-primary" onClick={handleAdd}>+</button>
+          <button className="btn !px-3 !py-1.5 !text-sm btn-primary" onClick={handleAdd}>+</button>
         </div>
       </div>
 
@@ -196,8 +204,9 @@ export function PacketTypeCounter() {
           <tbody>
             {rows.map((r) => (
               <tr key={(r.builtin ? "mac:" : "nas:") + r.name} className="border-b border-border/30 hover:bg-panel/50">
-                <td className="px-2 py-1 text-slate-100">
+                <td className="px-2 py-1 text-slate-100" title={r.hint}>
                   {r.name}
+                  {r.hint && <span className="ml-1 text-muted cursor-help" title={r.hint}>ⓘ</span>}
                   {r.builtin && <span className="ml-1.5 text-[9px] uppercase text-muted">MAC</span>}
                 </td>
                 <td className={`px-2 py-1 text-right font-semibold tabular-nums ${r.count > 0 ? "text-ok" : "text-muted"}`}>

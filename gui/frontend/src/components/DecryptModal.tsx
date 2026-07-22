@@ -245,7 +245,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
             {outMode === "organize" ? "Decrypt & Split per UE" : outMode === "split" ? "Split capture" : "Decrypt"}
           </h2>
-          <button className="btn !px-2 !py-0.5 !text-xs ml-auto" onClick={onClose}>✕ close</button>
+          <button className="btn !px-3 !py-1.5 !text-sm ml-auto" onClick={onClose}>✕ close</button>
         </div>
 
         {/* selected pcap + change-file. Defaults to the captures folder file; Browse can pick any pcap on the machine. */}
@@ -254,7 +254,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
           {selName
             ? <span className="font-mono text-slate-100 truncate" title={selPath}>{selName}<span className="text-muted"> — {selPath}</span></span>
             : <span className="text-warn">no file selected</span>}
-          <button className="btn !px-2 !py-0.5 !text-xs ml-auto shrink-0" onClick={() => setBrowsing(true)}>📁 Browse…</button>
+          <button className="btn !px-3 !py-1.5 !text-sm ml-auto shrink-0" onClick={() => setBrowsing(true)}>📁 Browse…</button>
         </div>
 
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 text-xs">
@@ -297,7 +297,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                 const sel = idx >= 0;
                 return (
                   <button key={d.id}
-                    className={`btn !px-2 !py-0.5 !text-[11px] ${sel ? "btn-primary" : ""}`}
+                    className={`btn !px-2.5 !py-1 !text-xs ${sel ? "btn-primary" : ""}`}
                     title={d.id}
                     onClick={() => setSplitDims((s) => sel ? s.filter((x) => x !== d.id) : [...s, d.id])}>
                     {sel ? `${idx + 1}. ` : "+ "}{d.label}
@@ -370,8 +370,8 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                           <label className="flex flex-col text-[10px] text-muted">NAS UL count <span className="text-muted/70">(or range 120-321)</span>
                             <input className="input !text-xs font-mono !w-36" placeholder="0  or  120-321" value={e.nas_count} onChange={(ev) => update(i, { nas_count: ev.target.value })} />
                           </label>
-                          <button className="btn btn-primary !px-2 !py-0.5 !text-xs" disabled={bruteBusy === i} onClick={() => deriveRow(i)}>Derive keys</button>
-                          <button className="btn !px-2 !py-0.5 !text-xs" disabled={bruteBusy === i}
+                          <button className="btn btn-primary !px-3 !py-1.5 !text-sm" disabled={bruteBusy === i} onClick={() => deriveRow(i)}>Derive keys</button>
+                          <button className="btn !px-3 !py-1.5 !text-sm" disabled={bruteBusy === i}
                                   title="Try every NAS count in the range against the selected pcap until one decrypts"
                                   onClick={() => bruteRow(i)}>
                             {bruteBusy === i ? "Brute-forcing…" : "Brute-force NAS"}
@@ -402,7 +402,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
                                     <td className="text-slate-100 break-all cursor-pointer select-all hover:text-primary"
                                         title="click to copy" onClick={() => val && copyKey(`${i}:${lbl}`, val)}>{val}</td>
                                     <td className="pl-2 align-top">
-                                      <button className="btn !px-1.5 !py-0 !text-[10px]" onClick={() => val && copyKey(`${i}:${lbl}`, val)}>
+                                      <button className="btn !px-2.5 !py-1 !text-xs" onClick={() => val && copyKey(`${i}:${lbl}`, val)}>
                                         {copied === `${i}:${lbl}` ? "✓" : "copy"}
                                       </button>
                                     </td>
@@ -423,7 +423,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
             </tbody>
           </table>
           <div className="flex items-center gap-3 mt-2">
-            <button className="btn !px-2 !py-0.5 !text-xs" onClick={addEntry}>＋ Add UE</button>
+            <button className="btn !px-3 !py-1.5 !text-sm" onClick={addEntry}>＋ Add UE</button>
             <span className="text-[10px] text-muted">Don't have K_RRCenc/K_UPenc? Click 🔑 on a row to derive them from K_ASME + NAS uplink count.</span>
           </div>
 
@@ -449,7 +449,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
               )}
               {result.ok && (
                 <div className="mt-2 flex gap-2">
-                  <button className="btn btn-primary !px-2 !py-0.5 !text-xs" onClick={downloadDecoded}>↓ decoded .txt</button>
+                  <button className="btn btn-primary !px-3 !py-1.5 !text-sm" onClick={downloadDecoded}>↓ decoded .txt</button>
                 </div>
               )}
               {result.ok && result.decoded_text && (
@@ -546,7 +546,7 @@ export function DecryptModal({ file, onClose, onDone }: { file: CaptureFile | nu
 
         <div className="flex items-center gap-2 mt-3 pt-2 border-t border-border">
           <span className="text-[11px] text-muted">Runs via tshark. Keys are remembered locally in this browser.</span>
-          <button className="btn btn-primary !px-3 !py-1 !text-xs ml-auto" disabled={running || !selPath} onClick={run}>
+          <button className="btn btn-primary !px-3.5 !py-1.5 !text-sm ml-auto" disabled={running || !selPath} onClick={run}>
             {running
               ? (outMode === "split" ? "Splitting…" : "Decrypting…")
               : (outMode === "split" ? "Split" : outMode === "organize" ? "Decrypt & Split" : "Run Decrypt")}
