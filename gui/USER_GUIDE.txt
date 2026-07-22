@@ -7,6 +7,11 @@ Everything the system can do, end-to-end. Reads top-to-bottom as a tour;
 also indexable by section header. Every feature here is in the multi-usrp
 branch at commit b468c97 or later.
 
+NOTE: this is the CAPTURE-ONLY build (branch sniffer-nodecrypt). All PDCP
+decryption / key-management features have been removed. Everything else —
+capturing pcaps, config, sessions, dashboard, spectrum, Wireshark, logs,
+and metrics — is unchanged.
+
 ------------------------------------------------------------------------------
 0. AT A GLANCE
 ------------------------------------------------------------------------------
@@ -23,8 +28,7 @@ a structured JSON event stream emitted by the C++ side.
             ▼                                     ▼
         MAC pcaps                       ~/.config/ltesniffer-gui/
         (in cwd =                          ├── config.json (active SnifferConfig)
-        captures_dir)                       ├── keys.json (per-RNTI K_eNB/KASME)
-                                            ├── known_cells.json (registry)
+        captures_dir)                       ├── known_cells.json (registry)
                                             └── token (bearer auth)
 
 What you get out:
@@ -135,7 +139,6 @@ binary directly. Flags are short options only (getopt).
                                        overridden per-mode by the writer).
   -D <file>        DCI text file output (default stdout).
   -E <file>        Stats CSV output.
-  -K <file>        PDCP decryption key file (JSON).
   -J <path>        JSON event output path (typically a FIFO; the GUI
                    creates it). This is the channel the dashboard reads.
   -X <args>        USRP A rfargs override (e.g. "clock=gpsdo,serial=XXX").
@@ -197,7 +200,7 @@ loopback (default). /api/health and /metrics are always open. /assets/* and
   -- Config --
   GET    /api/config                    → SnifferConfig
   PUT    /api/config (SnifferConfig)    persist (with server-side validation
-                                        of binary_path + keys_file paths).
+                                        of the binary_path).
 
   -- Capture lifecycle --
   POST   /api/capture/start             body: SnifferConfig | null
@@ -207,10 +210,6 @@ loopback (default). /api/health and /metrics are always open. /assets/* and
   -- USRPs --
   GET    /api/usrps                     uhd_find_devices result.
   GET    /api/usrps/autoconfig          suggested rfargs based on detected USRPs.
-
-  -- Decryption keys --
-  GET    /api/keys                      list KeyEntry + path on disk
-  PUT    /api/keys (KeysFile)           replace the on-disk keys.json
 
   -- Known cells (registry of working freqs) --
   GET    /api/known-cells               list cells
@@ -313,7 +312,7 @@ Every event has at minimum {"t":<type>}. Most include a monotonic "ts"
 ------------------------------------------------------------------------------
 
 7.1 Status bar (top)
-    - Logo + nav: Dashboard / Keys / Config (+ Help, when present)
+    - Logo + nav: Dashboard / Config (+ Help, when present)
     - Connection indicator (● connected / ○ disconnected)
     - Capture indicator (● running pid N / ○ stopped)
     - Sticky cell summary: PCI · PRB · DL freq
@@ -368,7 +367,6 @@ Every event has at minimum {"t":<type>}. Most include a monotonic "ts"
 
     i) Tabbed footer
        Logs       — every backend / stderr / state-tracker log event.
-                    Hex-key blobs auto-redacted to <redacted-256/128>.
                     Auto-scrolls to bottom; pauses on hover.
        Captures   — pcap files in captures_dir + ~/work/captures +
                     ~/work/LTESniffer/pcap_file_example. Download link
@@ -377,20 +375,12 @@ Every event has at minimum {"t":<type>}. Most include a monotonic "ts"
                     file modified in the last 20 s — see §10.4.
        Identities — IMSI/TMSI/GUTI/UECapa collected by API mode (-z).
 
-7.3 Keys page
-    For each per-RNTI entry: RNTI, label, source (K_eNB direct OR
-    KASME + NAS uplink count), optional cipher (EEA0..3) + integrity
-    (EIA0..3), optional HFN hint. CRUD: add / edit / delete. "Save"
-    persists to ~/.config/ltesniffer-gui/keys.json in the flat-string
-    format LTESniffer's -K parser expects. "Save & restart capture"
-    also POSTs /api/capture/restart so the new keys are picked up.
-
-7.4 Config page
+7.3 Config page
     Form covering every SnifferConfig field, grouped:
       RF / hardware   — freqs, gain, antennas, USRP rfargs, decimate, CPU mask
       Cell & mode     — sniffer mode, API mode, cell search, fixed cell ID, PRB, target RNTI
       Decoder         — workers, DCI split, shortcut, MCS tracking, debug
-      Output files    — pcap, DCI text, stats CSV, keys,
+      Output files    — pcap, DCI text, stats CSV,
                         pcap_stream_fifo (live Wireshark FIFO — see §10.2)
       GUI             — binary_path, captures_dir, sudo toggle
 
@@ -629,33 +619,7 @@ Publisher uses NOBLOCK send + SNDHWM=5000 — slow subscribers get
 drops, never back-pressure the producer.
 
 ------------------------------------------------------------------------------
-14. DECRYPTION KEYS (PDCP)
-------------------------------------------------------------------------------
-
-LTESniffer's KeyAttaching engine can decrypt PDCP DRBs in real time
-when given per-RNTI key material. The GUI's Keys page is the UI for it.
-
-Required minimum: rnti + (kenb OR kasme+nas_count).
-Optional: cipher_algo (EEA0..3), integ_algo (EIA0..3), hfn_hint,
-human label.
-
-Two input paths:
-  Path A — K_eNB direct
-    64 hex chars of K_eNB (256 bit). Useful when extracted from
-    MME debug logs or a test UE.
-
-  Path B — KASME + NAS uplink count
-    64 hex chars of KASME + the NAS uplink count value at the attach
-    that produced K_eNB. The C++ side derives K_eNB internally via
-    3GPP TS 33.401 §A.2.
-
-The Keys page persists to ~/.config/ltesniffer-gui/keys.json
-(mode 0600). The KeyStore also writes decrypted IP packets to
-<base>_decrypted_ip.pcap inside captures_dir — visible in the
-Captures tab with a download button.
-
-------------------------------------------------------------------------------
-15. PHASE-4 STATEFULNESS
+14. PHASE-4 STATEFULNESS
 ------------------------------------------------------------------------------
 
 Live per-RNTI state machine. Consumes the broadcast event stream
@@ -679,7 +643,7 @@ C-RNTI filter: 0x003D..0xFFF3 per 3GPP TS 36.321 §7.1. Non-C-RNTIs
 (SI, P, RA) are skipped.
 
 ------------------------------------------------------------------------------
-16. RNTI CHURN ANALYZER (offline)
+15. RNTI CHURN ANALYZER (offline)
 ------------------------------------------------------------------------------
 
 GET /api/analytics/rnti-churn?path=<sessions/*.jsonl.zst>
@@ -697,10 +661,10 @@ Returns JSON:
   }
 
 ------------------------------------------------------------------------------
-17. SECURITY & PERMISSIONS
+16. SECURITY & PERMISSIONS
 ------------------------------------------------------------------------------
 
-17.1 Bind + auth
+16.1 Bind + auth
   Default bind: 127.0.0.1 (loopback only).
   LAN: set LTESNIFFER_GUI_BIND=0.0.0.0; a 256-bit token is auto-created
   at ~/.config/ltesniffer-gui/token (mode 0600). Pass via Authorization:
@@ -712,30 +676,22 @@ Returns JSON:
   /api/health and /metrics stay open (so monitoring works without
   exposing the token).
 
-17.2 File permissions
-  All config / keys / token / known_cells / session files written 0600
+16.2 File permissions
+  All config / token / known_cells / session files written 0600
   with O_NOFOLLOW + parent mkdir 0700. Mode is enforced explicitly
   (chmod after write) so an unlucky umask can't widen them.
 
-17.3 Path allowlists
+16.3 Path allowlists
   binary_path  — must resolve to one of:
                    <repo>/build/src/LTESniffer
                    /usr/local/bin/LTESniffer
                    /usr/bin/LTESniffer
                  (otherwise 403 from PUT /api/config or capture/start).
-  keys_file    — must be under ~/.config/ltesniffer-gui/ (403 otherwise).
-                 Symlinks refused.
   pcap download — only files under captures_dir, ~/work/captures, or
                   ~/work/LTESniffer/pcap_file_example/ can be served.
                   Path-traversal blocked via .resolve() + relative_to().
 
-17.4 Log redaction
-  The stderr drain regex-replaces any standalone 64-hex blob
-  (K_eNB/KASME) → <redacted-256> and 32-hex (intermediate keys) →
-  <redacted-128> before broadcasting log events. Prevents accidental
-  key leakage into the rolling event buffer / WS clients.
-
-17.5 Sudo / orphan handling
+16.4 Sudo / orphan handling
   LTESniffer runs as root under sudo NOPASSWD (cfg.sudo). On backend
   shutdown the FastAPI lifespan calls runner.stop() which SIGINTs the
   child; if it doesn't exit within 5 s, the sudoers-whitelisted
@@ -748,7 +704,7 @@ Returns JSON:
   via pgrep + the kill-wrapper.
 
 ------------------------------------------------------------------------------
-18. OPERATIONAL TIPS & TROUBLESHOOTING
+17. OPERATIONAL TIPS & TROUBLESHOOTING
 ------------------------------------------------------------------------------
 
 Dashboard says "stopped" but events are clearly flowing
@@ -819,7 +775,7 @@ process: Permission denied"
     so the GUI surfaces the fix instead of failing silently in a dialog.
 
 ------------------------------------------------------------------------------
-19. CODE-ONLY FEATURES (LTESniffer C++ side, not surfaced in GUI)
+18. CODE-ONLY FEATURES (LTESniffer C++ side, not surfaced in GUI)
 ------------------------------------------------------------------------------
 
 These exist in the binary but the GUI doesn't expose them as form
@@ -857,7 +813,7 @@ implemented yet (full descriptions in TIER 5 of the v2 inspection report):
   - PHICH ACK/NACK decoding (F21, deferred 4.1) — srsran_phich_decode
     integration. Backend ready; C++ side untouched.
   - SCell inventory from RRC reconfig (F33, deferred 4.5) — needs ASN.1
-    decode beyond what KeyAttaching does today.
+    decode beyond what the C++ side does today.
   - CIF cross-carrier decoding (F3, deferred 4.6) — DCI bit-field parser
     addition.
   - Multi-cell aggregator (F2, deferred 4.7) — orchestration of N
@@ -868,14 +824,14 @@ implemented yet (full descriptions in TIER 5 of the v2 inspection report):
     UHD async-msg queue subscription in LTESniffer_Core.
 
 ------------------------------------------------------------------------------
-20. FILE LAYOUT
+19. FILE LAYOUT
 ------------------------------------------------------------------------------
 
 LTESniffer repo:
   src/
     include/      JSONEmitter.h, ArgManager.h, LTESniffer_Core.h, PcapWriter.h, …
     src/          JSONEmitter.cc, ArgManager.cc, LTESniffer_Core.cc,
-                  PcapWriter.cc, SubframeWorker.cc, KeyAttaching.cc, …
+                  PcapWriter.cc, SubframeWorker.cc, …
   build/          cmake build dir
   scripts/
     kill-ltesniffer.sh         sudoers-whitelisted kill wrapper
@@ -891,7 +847,6 @@ LTESniffer repo:
       sniffer.py         SnifferRunner — subprocess + FIFO reader
       mock.py            MockRunner — synthetic events
       config.py          SnifferConfig pydantic + argv builder
-      keys.py            KeyEntry + load/save (C++ flat format on disk)
       known_cells.py     KnownCell + load/save (Phase 5)
       captures.py        pcap discovery + safe download
       spectrum.py        uhd_fft launcher + preflight
@@ -904,7 +859,7 @@ LTESniffer repo:
       analytics.py       Phase 4 RNTI churn analyzer
     frontend/
       src/
-        pages/{Dashboard,Config,Keys,Help}.tsx
+        pages/{Dashboard,Config,Help}.tsx
         components/{StatusBar,CaptureControls,SpectrumButton,CellCard,
                     MetricsTiles,PacketFeed,RBWaterfall,RNTITable,
                     LogPanel,CapturesPanel,IdentitiesPanel}.tsx
@@ -914,7 +869,6 @@ LTESniffer repo:
 User config (mode 0600 on all):
   ~/.config/ltesniffer-gui/
     config.json        active SnifferConfig
-    keys.json          per-RNTI K_eNB/KASME
     known_cells.json   working freqs registry
     token              256-bit auth token
 
@@ -926,7 +880,6 @@ Default capture output:
   ~/ltesniffer-captures/                 (cfg.captures_dir)
     ltesniffer_<mode>_<ts>_<seq>.pcap    rotated MAC pcap
     api_collector.pcap                   API-mode pcap
-    *_decrypted_ip.pcap                  decrypted IP (when -K active)
     iq_sample_dl.bin, mcs_statistic.csv, ul_sample.raw  (misc C++ outputs)
 
 ==============================================================================

@@ -106,7 +106,6 @@ class SnifferConfig(BaseModel):
     # separated by per-run timestamped subdirectory (see sniffer.py).
     dci_file_name: str = Field("", description="-D (empty = stdout)")
     stats_file_name: str = Field("", description="-E")
-    keys_file: str = Field("", description="-K")
     pcap_stream_fifo: str = Field(
         "",
         description=(
@@ -214,8 +213,6 @@ class SnifferConfig(BaseModel):
             argv += ["-D", self.dci_file_name]
         if self.stats_file_name:
             argv += ["-E", self.stats_file_name]
-        if self.keys_file:
-            argv += ["-K", self.keys_file]
 
         argv += ["-J", json_output_path]
         return argv
@@ -233,7 +230,7 @@ def load() -> SnifferConfig:
 
 
 def save(cfg: SnifferConfig) -> None:
-    """Persist config with 0600 perms (it points at the keys file)."""
+    """Persist config with 0600 perms."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = cfg.model_dump_json(indent=2)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW

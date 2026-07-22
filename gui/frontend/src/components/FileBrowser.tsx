@@ -10,7 +10,7 @@ function fmtBytes(n: number): string {
 }
 
 /**
- * Pick a pcap to decrypt. Opens in the captures (pcap) folder by default, but
+ * Pick a pcap to analyze. Opens in the captures (pcap) folder by default, but
  * can navigate to any directory on the machine. onPick gets the absolute path
  * + display name of the chosen capture file.
  */

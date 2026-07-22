@@ -28,8 +28,6 @@ from usrp import find_devices, auto_config_patch, probe_all_gpsdo
 from spectrum import SpectrumLauncher
 import captures as captures_mod
 import runlogs
-import keys as keys_mod
-from keys import KeysFile, KEYS_PATH
 from auth import (
     BIND, AUTH_PATH, COOKIE_NAME, SESSION_TTL_S,
     require_session, require_session_ws,
@@ -344,13 +342,6 @@ async def get_config() -> SnifferConfig:
 async def put_config(cfg: SnifferConfig) -> SnifferConfig:
     # Security gate: anything that becomes argv to a root-owned process must
     # be validated server-side, not just sanitized client-side.
-    if cfg.keys_file:
-        try:
-            # validate_keys_path tolerates non-existing files (only blocks
-            # symlinks / escapes), so a not-yet-created keys.json is OK.
-            cfg.keys_file = str(keys_mod._validate_keys_path(Path(cfg.keys_file)))
-        except PermissionError as e:
-            raise HTTPException(403, f"keys_file rejected: {e}")
     if cfg.binary_path:
         try:
             from sniffer import _resolve_and_validate_binary
@@ -567,36 +558,6 @@ async def probe_usrps_gpsdo() -> dict[str, Any]:
     return {"devices": probed, "message": msg}
 
 
-@app.get("/api/keys")
-async def get_keys() -> dict[str, Any]:
-    kf = keys_mod.load()
-    return {
-        "entries": [e.model_dump() for e in kf.entries],
-        "path": str(KEYS_PATH),
-        "exists": KEYS_PATH.exists(),
-    }
-
-
-@app.put("/api/keys")
-async def put_keys(body: KeysFile) -> dict[str, Any]:
-    try:
-        path = keys_mod.save(body)
-    except PermissionError as e:
-        raise HTTPException(403, str(e))
-    # Auto-point the saved sniffer config at our keys file so the next
-    # capture launch will use it (only if the user hasn't set their own path).
-    cfg = config_mod.load()
-    if not cfg.keys_file or cfg.keys_file == str(KEYS_PATH):
-        cfg.keys_file = str(path)
-        config_mod.save(cfg)
-    return {
-        "ok": True,
-        "path": str(path),
-        "wired_into_config": cfg.keys_file == str(path),
-        "n_entries": len(body.entries),
-    }
-
-
 @app.get("/api/spectrum")
 async def spectrum_status() -> dict[str, Any]:
     return spectrum.status()
@@ -780,32 +741,8 @@ async def download_capture(path: str) -> FileResponse:
     return FileResponse(p, media_type="application/vnd.tcpdump.pcap", filename=p.name)
 
 
-class _BruteforceBody(BaseModel):
-    path: str
-    kasme: str
-    nas_lo: int
-    nas_hi: int
-    rnti: int | None = None
-    cipher_algo: str = "EEA2"
-    integ_algo: str = "EIA2"
-
-
-@app.post("/api/keys/bruteforce-nas")
-async def bruteforce_nas(body: _BruteforceBody) -> dict[str, Any]:
-    """Brute-force the NAS uplink COUNT over a range, deriving keys from K_ASME
-    and testing which count actually decrypts the target UE. Blocking (many
-    tshark runs) → off the event loop; bad input returns ok=False, not a 500."""
-    cfg = config_mod.load()
-    return await asyncio.to_thread(
-        captures_mod.bruteforce_nas, cfg, body.path, body.kasme,
-        body.nas_lo, body.nas_hi, body.rnti, body.cipher_algo, body.integ_algo,
-    )
-
-
 class _SessionsBody(BaseModel):
     path: str | None = None                  # None → latest/active capture
-    entries: list[_DecryptEntryBody] = []
-    decrypt: bool = False
 
 
 @app.post("/api/sessions")
@@ -815,9 +752,8 @@ async def analyze_sessions(body: _SessionsBody) -> dict[str, Any]:
     (tshark); off the event loop; failures return ok=False."""
     import sessions as sessions_mod
     cfg = config_mod.load()
-    entries = [e.model_dump() for e in body.entries]
     return await asyncio.to_thread(
-        sessions_mod.analyze_sessions, cfg, body.path, entries, body.decrypt
+        sessions_mod.analyze_sessions, cfg, body.path
     )
 
 
@@ -830,8 +766,6 @@ async def split_dims() -> dict[str, Any]:
 class _SplitBody(BaseModel):
     path: str
     dims: list[str]
-    entries: list[_DecryptEntryBody] = []
-    decrypt: bool = False
 
 
 @app.post("/api/captures/split")
@@ -840,102 +774,31 @@ async def split_capture(body: _SplitBody) -> dict[str, Any]:
     (RNTI / UE identity / direction / RNTI class / packet type / security).
     Blocking tshark work → off the event loop; failures return ok=False."""
     cfg = config_mod.load()
-    entries = [e.model_dump() for e in body.entries]
     return await asyncio.to_thread(
-        captures_mod.split_capture, cfg, body.path, body.dims, entries, body.decrypt
+        captures_mod.split_capture, cfg, body.path, body.dims
     )
 
 
 @app.get("/api/fs/browse")
 async def fs_browse(path: str | None = None) -> dict[str, Any]:
-    """Directory listing for the decrypt file picker. Defaults to captures_dir;
+    """Directory listing for the capture file picker. Defaults to captures_dir;
     can navigate anywhere on the machine (authenticated local admin GUI)."""
     cfg = config_mod.load()
     return await asyncio.to_thread(captures_mod.browse_dir, cfg, path)
 
 
-class _DecryptEntryBody(BaseModel):
-    rnti: int
-    # Supply the ciphering keys directly, OR a K_eNB, OR K_ASME + NAS uplink
-    # count — the backend derives K_RRCenc/K_UPenc (TS 33.401) when the raw
-    # keys are absent. Keys default to "" so a derive-only entry validates.
-    rrcenc_key: str = ""
-    upenc_key: str = ""
-    kasme: str | None = None
-    nas_count: int | None = None
-    kenb: str | None = None
-    cipher_algo: str = "EEA2"
-    integ_algo: str = "EIA2"
-
-
-class _DecryptBody(BaseModel):
-    path: str
-    entries: list[_DecryptEntryBody]
-
-
-@app.post("/api/captures/decrypt")
-async def decrypt_capture(body: _DecryptBody) -> dict[str, Any]:
-    """Post-capture PDCP decryption: per-RNTI keys -> readable decode + keyed
-    pcap + .uat sidecar. tshark/IO is blocking, so run it off the event loop.
-    Validation/tshark failures return ok=False (not a 500)."""
-    cfg = config_mod.load()
-    entries = [e.model_dump() for e in body.entries]
-    return await asyncio.to_thread(captures_mod.decrypt_pcap, cfg, body.path, entries)
-
-
-class _DeriveBody(BaseModel):
-    kasme: str | None = None
-    nas_count: int | None = None
-    kenb: str | None = None
-    cipher_algo: str = "EEA2"
-    integ_algo: str = "EIA2"
-
-
-@app.post("/api/keys/derive")
-async def derive_keys(body: _DeriveBody) -> dict[str, Any]:
-    """Derive the access-stratum keys (K_RRCenc/int, K_UPenc/int) from
-    K_ASME + NAS uplink COUNT, or from a K_eNB directly (3GPP TS 33.401).
-    Returns ok=False with an error message on bad input rather than a 500."""
-    import keyderiv
-    try:
-        d = keyderiv.derive_keys(
-            kasme=body.kasme, nas_count=body.nas_count, kenb=body.kenb,
-            cipher_algo=body.cipher_algo, integ_algo=body.integ_algo,
-        )
-        return {"ok": True, "error": None, **d}
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-
-
-class _OrganizeEntryBody(BaseModel):
-    # rnti optional: in auto mode keys are matched to UEs heuristically.
-    # Keys may be given directly or derived from K_eNB / (K_ASME + NAS count).
-    rnti: int | None = None
-    rrcenc_key: str = ""
-    upenc_key: str = ""
-    kasme: str | None = None
-    nas_count: int | None = None
-    kenb: str | None = None
-    cipher_algo: str = "EEA2"
-    integ_algo: str = "EIA2"
-
-
 class _OrganizeBody(BaseModel):
     path: str
-    entries: list[_OrganizeEntryBody] = []
-    mode: str = "auto"  # "auto" | "per-rnti"
 
 
 @app.post("/api/captures/organize")
 async def organize_session(body: _OrganizeBody) -> dict[str, Any]:
     """Build a per-session folder: full pcap + one sub-pcap per UE named by
-    TMSI/IMSI (else RNTI). Keys (optional) are matched to UEs in 'auto' mode by
-    best clean-decode heuristic, or by RNTI in 'per-rnti' mode. tshark/IO is
-    blocking → run off the event loop; failures return ok=False (not a 500)."""
+    TMSI/IMSI (else RNTI). Cleartext only. tshark/IO is blocking → run off the
+    event loop; failures return ok=False (not a 500)."""
     cfg = config_mod.load()
-    entries = [e.model_dump() for e in body.entries]
     return await asyncio.to_thread(
-        captures_mod.organize_session, cfg, body.path, entries, body.mode
+        captures_mod.organize_session, cfg, body.path
     )
 
 

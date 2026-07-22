@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KeyEntry, KeysResponse, KnownCellsResponse, DecryptEntry, DecryptResponse, OrganizeEntry, OrganizeResponse, DeriveResponse, BrowseResponse, BruteforceResponse, SplitDim, SplitResponse, SessionsResponse, CellIdResponse, PinCellResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KnownCellsResponse, BrowseResponse, SessionsResponse, CellIdResponse, PinCellResponse } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -91,12 +91,6 @@ export const api = {
   deleteKnownCell: (idx: number) =>
     req<{ ok: boolean; removed_label: string; n_remaining: number }>(
       `/api/known-cells/${idx}`, { method: "DELETE" }),
-  getKeys: () => req<KeysResponse>("/api/keys"),
-  putKeys: (entries: KeyEntry[]) =>
-    req<{ ok: boolean; path: string; wired_into_config: boolean; n_entries: number }>(
-      "/api/keys",
-      { method: "PUT", body: JSON.stringify({ entries }) }
-    ),
   captures: () => req<CapturesResponse>("/api/captures"),
   browseFs: (path?: string) =>
     req<BrowseResponse>(`/api/fs/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`),
@@ -105,36 +99,10 @@ export const api = {
       "/api/wireshark/open", { method: "POST" }),
   downloadCaptureUrl: (path: string) =>
     `/api/captures/download?path=${encodeURIComponent(path)}`,
-  decryptCapture: (path: string, entries: DecryptEntry[]) =>
-    req<DecryptResponse>("/api/captures/decrypt", {
-      method: "POST",
-      body: JSON.stringify({ path, entries }),
-    }),
-  organizeSession: (path: string, entries: OrganizeEntry[], mode: "auto" | "per-rnti") =>
-    req<OrganizeResponse>("/api/captures/organize", {
-      method: "POST",
-      body: JSON.stringify({ path, entries, mode }),
-    }),
-  deriveKeys: (body: { kasme?: string | null; nas_count?: number | null; kenb?: string | null; cipher_algo: string; integ_algo: string }) =>
-    req<DeriveResponse>("/api/keys/derive", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  bruteforceNas: (body: { path: string; kasme: string; nas_lo: number; nas_hi: number; rnti?: number | null; cipher_algo: string; integ_algo: string }) =>
-    req<BruteforceResponse>("/api/keys/bruteforce-nas", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  analyzeSessions: (path: string | null, entries: DecryptEntry[], decrypt: boolean) =>
+  analyzeSessions: (path: string | null) =>
     req<SessionsResponse>("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ path, entries, decrypt }),
-    }),
-  splitDims: () => req<{ dimensions: SplitDim[] }>("/api/captures/split-dims"),
-  splitCapture: (path: string, dims: string[], entries: DecryptEntry[], decrypt: boolean) =>
-    req<SplitResponse>("/api/captures/split", {
-      method: "POST",
-      body: JSON.stringify({ path, dims, entries, decrypt }),
+      body: JSON.stringify({ path }),
     }),
   logHistory: () =>
     req<{ runs: RunLog[] }>("/api/logs/history"),

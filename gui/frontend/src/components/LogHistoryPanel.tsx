@@ -65,7 +65,6 @@ function parseArgv(argvLine: string): Chip[] {
   }
   if (clock) chips.push({ label: "Clock", value: clock === "external" ? "External (shared)" : clock });
   if (radios.length) chips.push({ label: radios.length > 1 ? "Radios" : "Radio", value: radios.join(", ") });
-  if (val["-K"] !== undefined) chips.push({ label: "Decrypt", value: "on" });
   if (val["-l"] !== undefined || val["-N"] !== undefined) chips.push({ label: "PCI pin", value: "on" });
   return chips;
 }

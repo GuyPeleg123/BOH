@@ -1,34 +1,7 @@
 import { Fragment, useState } from "react";
 import { api } from "../lib/api";
-import type { DecryptEntry, SessionsResponse, SessionTa, UeSession } from "../lib/types";
+import type { SessionsResponse, SessionTa, UeSession } from "../lib/types";
 import { FileBrowser } from "../components/FileBrowser";
-
-const DECRYPT_LS = "ltesniffer-decrypt-entries";   // shared with the Decrypt modal
-
-// Pull saved keys from the Decrypt modal's localStorage so the user doesn't
-// re-enter them. Only rows with an RNTI + (raw keys OR kasme+nas) are usable.
-function savedKeys(): DecryptEntry[] {
-  try {
-    const arr = JSON.parse(localStorage.getItem(DECRYPT_LS) ?? "");
-    if (!Array.isArray(arr)) return [];
-    const out: DecryptEntry[] = [];
-    for (const e of arr) {
-      const r = String(e.rnti ?? "").trim().replace(/^0x/i, "");
-      const rnti = /^[0-9a-fA-F]+$/.test(r) ? parseInt(r, 16) : NaN;
-      if (!Number.isFinite(rnti)) continue;
-      const hasRaw = /^[0-9a-fA-F]{32}$/.test((e.rrcenc_key ?? "").trim()) && /^[0-9a-fA-F]{32}$/.test((e.upenc_key ?? "").trim());
-      const hasDer = /^[0-9a-fA-F]{64}$/.test((e.kasme ?? "").trim()) && String(e.nas_count ?? "").trim() !== "";
-      if (!hasRaw && !hasDer) continue;
-      out.push({
-        rnti, rrcenc_key: (e.rrcenc_key ?? "").trim(), upenc_key: (e.upenc_key ?? "").trim(),
-        kasme: hasDer ? (e.kasme ?? "").trim() : undefined,
-        nas_count: hasDer ? parseInt(String(e.nas_count).trim(), 10) : undefined,
-        cipher_algo: e.cipher_algo ?? "EEA2", integ_algo: e.integ_algo ?? "EIA2",
-      });
-    }
-    return out;
-  } catch { return []; }
-}
 
 function fmtRange(m: number | null): string {
   if (m == null) return "—";
@@ -91,7 +64,6 @@ export function SessionsPage() {
   const [path, setPath] = useState<string | null>(null);   // null = current/latest capture
   const [name, setName] = useState<string>("(latest capture)");
   const [browsing, setBrowsing] = useState(false);
-  const [decrypt, setDecrypt] = useState(false);
   const [running, setRunning] = useState(false);
   const [resp, setResp] = useState<SessionsResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -105,12 +77,7 @@ export function SessionsPage() {
   async function run() {
     setErr(null); setResp(null); setRunning(true);
     try {
-      const keys = decrypt ? savedKeys() : [];
-      if (decrypt && keys.length === 0) {
-        setErr("Decrypt is on but no usable keys are saved — set per-RNTI keys (or K_ASME+NAS) in the Captures → Decrypt panel first.");
-        setRunning(false); return;
-      }
-      const r = await api.analyzeSessions(path, keys, decrypt);
+      const r = await api.analyzeSessions(path);
       setResp(r);
       if (!r.ok) setErr(r.error);
     } catch (e) {
@@ -211,8 +178,7 @@ export function SessionsPage() {
       </div>
       <p className="text-[11px] text-muted mb-3">
         Each row is a UE session (a C-RNTI lifetime) with its identity and Timing-Advance distance from the cell.
-        The goal: attribute a TA location to a specific GUTI. Identities seen in the clear (RRC Connection Request, paging);
-        enable Decrypt to complete GUTI/IMSI from NAS.
+        The goal: attribute a TA location to a specific GUTI. Identities are read in the clear (RRC Connection Request, paging).
       </p>
 
       <div className="flex items-center gap-2 mb-3 text-xs bg-bg border border-border rounded px-2 py-1.5 flex-wrap">
@@ -220,10 +186,6 @@ export function SessionsPage() {
         <span className="font-mono text-slate-100 truncate" title={path ?? ""}>{name}</span>
         <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => setBrowsing(true)}>📁 Browse…</button>
         <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => { setPath(null); setName("(latest capture)"); }}>↺ latest</button>
-        <label className="flex items-center gap-1 cursor-pointer ml-2">
-          <input type="checkbox" checked={decrypt} onChange={(e) => setDecrypt(e.target.checked)} />
-          <span>Decrypt (use saved keys)</span>
-        </label>
         <button className="btn btn-primary !px-3.5 !py-1.5 !text-sm ml-auto" disabled={running} onClick={run}>
           {running ? "Analyzing…" : "Analyze sessions"}
         </button>
@@ -329,7 +291,7 @@ export function SessionsPage() {
                                 <div>MMEC: <span className="text-slate-100">{i.mmec ?? "—"}</span></div>
                                 <div>S-TMSI: <span className="text-slate-100">{i.s_tmsi ?? "—"}</span></div>
                                 <div>GUTI: <span className="text-slate-100">{i.guti ?? "— (needs PLMN+MMEC)"}</span></div>
-                                <div>IMSI: <span className="text-slate-100">{i.imsi ?? "— (needs decrypt)"}</span></div>
+                                <div>IMSI: <span className="text-slate-100">{i.imsi ?? "—"}</span></div>
                                 <div>PLMN: <span className="text-slate-100">{i.plmn ?? "—"}</span></div>
                                 <div className="text-muted">source: {i.source ?? "—"}</div>
                               </div>

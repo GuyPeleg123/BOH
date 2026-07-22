@@ -7,6 +7,10 @@
 מכיר ברשתות 4G/LTE או בקוד המערכת. כדאי לקרוא בסדר; הסעיפים בנויים זה
 על גבי זה. בסוף יש מילון מושגים מורחב לעיון מהיר.
 
+הערה: זוהי מהדורת לכידה-בלבד (ענף sniffer-nodecrypt). כל יכולות פענוח
+ה-PDCP וניהול המפתחות הוסרו. כל שאר היכולות — לכידת pcap, הגדרות,
+sessions, דשבורד, spectrum, Wireshark ולוגים — ללא שינוי.
+
 ------------------------------------------------------------------------------
 פרק 0 — תקציר מנהלים: מה המערכת הזאת בכלל עושה?
 ------------------------------------------------------------------------------
@@ -21,7 +25,7 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
   • איזה אופרטור / איזו תחנת בסיס מולנו (לפי PCI — מזהה תא)
   • כמה משתמשים (UE — User Equipment) פעילים, ובאיזה קצב הם מקבלים/שולחים
   • איזה מודולציה ומה גודל החבילות (MCS, TBS)
-  • את החבילות עצמן בפורמט Wireshark פתוח (לא מפוענחות אם מוצפנות)
+  • את החבילות עצמן בפורמט Wireshark פתוח (MAC PDUs)
 
 מה זה GUI? Graphical User Interface — ממשק גרפי בדפדפן שמציג את כל
 הנתונים שמאזין ה-C++ אוסף. במקום לעבוד עם שורת פקודה, פותחים דפדפן.
@@ -76,7 +80,7 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
 
     LTESniffer מפענח בעיקר את PDCCH (DCIs) כי משם רואים מי משתמש בתא ומה
     הם עושים. את PDSCH (הנתונים עצמם) הוא מנסה לפענח, אבל הם מוצפנים
-    ברמת PDCP — בלי המפתחות (K_eNB/KASME) רואים רק מטא-דאטה.
+    ברמת PDCP, ולכן רואים רק מטא-דאטה ולא את התוכן.
 
 1.7 מזהה משתמש זמני (RNTI)
     Radio Network Temporary Identifier — מזהה זמני שהתחנה נותנת לכל UE
@@ -143,7 +147,7 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
                 │                              │                              │
                 ▼                              ▼                              ▼
             קבצי pcap                  ~/.config/ltesniffer-gui/         מסך הדשבורד
-            (MAC PDUs)                     config.json, keys.json
+            (MAC PDUs)                     config.json,
                                             known_cells.json, token
 
 3.1 LTESniffer (C++)
@@ -161,7 +165,6 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
       • קריאה של ה-JSON FIFO ושידור בערוץ WebSocket לדפדפן
       • שמירת config (תדרים, gain, USRPs, וכו')
       • שמירת known_cells (תאים מוצלחים שגילית)
-      • שמירת keys (מפתחות הצפנה PDCP אם יש לך)
       • הפעלת Spectrum analyzer ו-Wireshark
       • Authentication (bearer token לגישה מרחוק)
 
@@ -269,13 +272,12 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
 
 7.1 שורת הסטטוס (סרגל עליון)
     ─────────────────────────────────────────────────────────────────────
-    LTESniffer  [Dashboard] [Keys] [Config] [Help]   ● connected
+    LTESniffer  [Dashboard] [Config] [Help]   ● connected
                                                       ● running pid 1234
                                                       PCI 325 · 100 PRB · 1845.0 MHz
     ─────────────────────────────────────────────────────────────────────
 
     "Dashboard" — המסך הראשי עם הטבלאות והגרפים
-    "Keys"      — ניהול מפתחות הצפנה (לפענוח PDCP)
     "Config"    — הגדרות (תדרים, USRPs, וכו')
     "Help"      — המדריך הזה (קצר) + קישור להורדה
 
@@ -322,8 +324,7 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
     [Logs] [Captures] [Identities]
 
     Logs        — שורות לוג מהיציאה הסטנדרטית של LTESniffer,
-                  מאירועי ה-state tracker, ומה-backend. מפתחות K_eNB
-                  ו-KASME מורצים (redacted) אוטומטית לפני הצגה.
+                  מאירועי ה-state tracker, ומה-backend.
     Captures    — רשימת קבצי pcap (MAC PDUs ב-DLT 147). כל קובץ עם גודלו
                   וזמן יצירתו. כפתור הורדה. תווית "live capture" ירוקה
                   מופיעה רק אם (capture רץ) AND (קובץ ב-captures_dir)
@@ -374,25 +375,7 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
 
     GUI מציג אזהרה אם הסדר לא תקין.
 
-7.5 מסך Keys — מפתחות הצפנה (PDCP)
-    LTE מצפינה את ה-PDCP (Packet Data Convergence Protocol) — מה שעובר
-    באוויר בין UE לתחנה. בלי המפתחות לא נראה את ה-IP-traffic אלא רק
-    מטא-דאטה.
-
-    אם יש לך מפתח (למשל מ-UE testing או מ-MME debug log):
-    • RNTI = ה-RNTI של ה-UE היעד (16-bit, hex)
-    • K_eNB (64 hex chars) - מפתח התחנה ל-UE
-        או
-    • KASME (64 hex chars) + NAS uplink count - המפתחות הגבוהים יותר,
-        ה-K_eNB יחושב מהם אוטומטית
-    • cipher_algo: EEA0/EEA1/EEA2/EEA3 (אלגוריתם הצפנה)
-    • integ_algo:  EIA0/EIA1/EIA2/EIA3 (אלגוריתם integrity)
-    • label: כל תיאור שעוזר לך (למשל "test SIM 12345")
-
-    בלחיצה על "Save & Restart Capture" — נטען מחדש את LTESniffer עם
-    המפתחות החדשים, ועיקרי IP מפוענחים נכתבים ל-<base>_decrypted_ip.pcap.
-
-7.6 מסך Config — הגדרות
+7.5 מסך Config — הגדרות
     טופס עם כל פרמטר שאפשר להגדיר. שדות עיקריים:
 
     RF / hardware:
@@ -418,7 +401,6 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
 
     Output files:
     • pcap_file            — שם קובץ pcap
-    • keys_file            — נתיב לקובץ keys.json
     • pcap_stream_fifo     — נתיב FIFO לזרם חי ל-Wireshark
                               (חייב להיות מתחת /tmp/ או ~/ltesniffer-captures/)
 
@@ -500,13 +482,6 @@ LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פ�
     2. ב-Dashboard, לחץ 🦈 Wireshark   ← נפתח Wireshark
     3. אם capture כבר רץ — לחץ ⟳ Restart
     4. אם capture לא רץ — לחץ ▶ Start
-
-9.4 התרחיש "החבילות מוצפנות (PDCP), יש לי את המפתחות"
-    1. עבור ל-Keys
-    2. + Add key, הזן RNTI + K_eNB (או KASME + NAS uplink count)
-    3. בחר algorithm (EEA2 ו-EIA2 הכי נפוצים ברשתות 4G עכשיו)
-    4. Save & restart capture
-    5. ה-IP packets המפוענחים יכתבו ל-<base>_decrypted_ip.pcap
 
 ------------------------------------------------------------------------------
 פרק 10 — אבחון תקלות נפוצות
@@ -592,9 +567,6 @@ CFO                — Carrier Frequency Offset. הפרש תדר בין השעו
 
 CINR / RSRP        — מדדי איכות אות RX.
 
-cipher_algo (EEA)  — אלגוריתם הצפנת PDCP. EEA0=null, EEA1=Snow3G, EEA2=AES,
-                     EEA3=ZUC. ברירת מחדל ברשתות 4G: EEA2.
-
 DCI                — Downlink Control Information. הודעה ב-PDCCH שאומרת
                      איזה UE מקבל איזה משאב ב-subframe הזה.
 
@@ -626,14 +598,6 @@ I/Q samples        — Inphase/Quadrature, זוגות מספרים מרוכבי�
 
 IMSI / IMEI / GUTI — מזהי משתמש סלולרי. IMSI הוא הקבוע, GUTI/TMSI זמני.
 
-integ_algo (EIA)   — אלגוריתם integrity של PDCP. EIA0=null, EIA1=Snow3G,
-                     EIA2=AES, EIA3=ZUC.
-
-K_eNB              — מפתח התחנה ל-UE. 256 ביט. בלעדיו אי אפשר לפענח PDCP.
-
-KASME              — מפתח הליבה (Core network). 256 ביט. ממנו מחושב K_eNB
-                     לפי 3GPP TS 33.401 §A.2.
-
 L (DCI)            — Aggregation Level. כמה CCEs (Control Channel Elements)
                      משולבים לקודד DCI. 1, 2, 4, 8. גבוה יותר = יותר עמיד.
 
@@ -655,8 +619,6 @@ MIB                — Master Information Block. כל 40ms על PBCH. מכיל:
 NAS                — Non-Access Stratum. ניהול mobility/security/session
                      בין UE לליבה. ה-NAS uplink count עולה בכל message NAS
                      שה-UE שולח.
-
-nas_count          — מונה הודעות NAS. נצרך לחישוב K_eNB מ-KASME.
 
 ncce               — מספר CCE התחלתי בפלט PDCCH. נחוץ לדיבוג.
 
@@ -684,7 +646,7 @@ PCI                — Physical Cell ID. 0-503. מזהה את התא ייחוד�
                      מתפענח מ-PSS+SSS.
 
 PDCP               — Packet Data Convergence Protocol. שכבת ההצפנה ב-LTE.
-                     בלי המפתחות לא מפענחים את התוכן.
+                     התוכן מוצפן; בלכידה פאסיבית רואים מטא-דאטה בלבד.
 
 PDSCH              — Physical Downlink Shared Channel. ערוץ הנתונים ב-DL.
                      איפה ה-MAC PDUs שלנו יושבים.

@@ -81,7 +81,7 @@ def _autodetect_lan_ip() -> str:
 
 
 def _resolve_bind() -> str:
-    """Default to loopback. The GUI is a root-capable admin/decryption console;
+    """Default to loopback. The GUI is a root-capable admin/capture console;
     it must not be reachable from the LAN unless the operator explicitly opts in.
     - LTESNIFFER_GUI_BIND=<ip>  : explicit bind (warned if not loopback)
     - LTESNIFFER_GUI_LAN=1       : auto-pick the LAN IP (warned)

@@ -8,13 +8,17 @@ A FALCON/srsRAN-based dual-mode LTE sniffer (this fork = `GuyPeleg123/BOH`,
 branch `multi-usrp`; local clone at `~/work/LTESniffer`). Captures DL+UL with two
 USRP B210s and writes MAC-LTE pcaps.
 
+**This branch (`sniffer-nodecrypt`) is CAPTURE-ONLY: all key-management and PDCP
+decryption/deciphering has been removed from the frontend, backend, and C++
+core.**
+
 ## Stack & layout
 - **C++ core** (`src/`, `lib/`, srsRAN/FALCON under `build/srsRAN-src`): PHY/MAC
-  decode, `PcapWriter`, `KeyAttaching` (TS 33.401 key derivation at capture time).
+  decode, `PcapWriter`.
 - **GUI backend** `gui/backend/` — FastAPI + uvicorn (HTTPS on 127.0.0.1:8443),
-  session-cookie auth. Key modules: `captures.py` (pcap discovery, decrypt,
-  organize, **split engine**), `keyderiv.py` (K_ASME→keys), `sniffer.py`
-  (subprocess lifecycle), `config.py`, `main.py` (routes).
+  session-cookie auth. Key modules: `captures.py` (pcap discovery, organize,
+  **split engine**), `sniffer.py` (subprocess lifecycle), `config.py`,
+  `main.py` (routes).
 - **GUI frontend** `gui/frontend/` — React + TypeScript + Vite + Tailwind.
   Build with `npm run build`; the backend serves `dist/`.
 - **Analysis**: `scripts/ta_report.py` (TA→distance). Post-capture work uses
@@ -23,11 +27,6 @@ USRP B210s and writes MAC-LTE pcaps.
 ## Hard-won facts (don't relearn these)
 - **tshark protocol filter for RRC is `lte_rrc` (underscore); FIELDS are
   `lte-rrc.*` (hyphen).** `lte-rrc` as a bare protocol errors out.
-- PDCP decryption: Wireshark `pdcp_lte_ue_keys` UAT is keyed by **UEId**;
-  LTESniffer tags UEId=0, so frames are rewritten UEId:=RNTI before decrypt.
-  tshark `-w` does NOT bake decryption — ship a `.uat` sidecar.
-- Key hierarchy (TS 33.401): K_ASME +NAS-UL-count → K_eNB → K_RRCenc/int,
-  K_UPenc/int. EEA/EIA use the **low 128 bits** (last 16 bytes) of each.
 - RNTI ≠ UE identity. Real UEs = recurring C-RNTIs (rnti-type 3) + any RNTI that
   announced a TMSI/IMSI. SI/P/RA are broadcast/paging/RACH, not UEs.
 - Dual-mode needs a shared 10 MHz **and** a shared 1 PPS; the recurring failure

@@ -16,7 +16,7 @@ Detailed, executable breakdown of the improvement plan from the v2 inspection re
 
 ## Phase 1 — Hygiene & safety
 
-**Goal of the phase:** the GUI can be left running on a research LAN without (a) handing out root, (b) leaking master keys to other users, or (c) silently wedging after a few hours.
+**Goal of the phase:** the GUI can be left running on a research LAN without (a) handing out root, or (b) silently wedging after a few hours.
 
 ### 1.1 — B1+B2: `O_NONBLOCK` FIFO + `stdout=DEVNULL` (deadlock fix)
 - **Files:** `src/include/JSONEmitter.h`, `src/src/JSONEmitter.cc`, `gui/backend/sniffer.py`
@@ -27,21 +27,19 @@ Detailed, executable breakdown of the improvement plan from the v2 inspection re
 - **Deps:** none.
 - **Effort:** Claude 15 min · your 5 min · hardware-time 0.
 
-### 1.2 — S1: allowlist `binary_path` + sanitize `keys_file`
-- **Files:** `gui/backend/config.py`, `gui/backend/sniffer.py`, `gui/backend/keys.py`
+### 1.2 — S1: allowlist `binary_path`
+- **Files:** `gui/backend/config.py`, `gui/backend/sniffer.py`
 - **Approach:**
   - Add `_ALLOWED_BINARY_PATHS` constant: repo `build/src/LTESniffer` (absolute) + `/usr/local/bin/LTESniffer`. In `SnifferRunner.start`, resolve `cfg.binary_path` to absolute; reject with 403 if not in allowlist.
-  - Add a `_KEYS_DIR` constant `~/.config/ltesniffer-gui/`. In `keys.save`, resolve target path, refuse if not under `_KEYS_DIR`. Use `os.open` with `O_NOFOLLOW | O_CREAT | O_EXCL` when first creating.
-- **Validation:** `PUT /api/config` with `binary_path: "/usr/bin/id"` → 403. Symlink `keys.json` → `/tmp/foo` and try to PUT → rejected.
+- **Validation:** `PUT /api/config` with `binary_path: "/usr/bin/id"` → 403.
 - **Deps:** none.
 - **Effort:** Claude 30 min · your 10 min · hardware-time 0.
 
-### 1.3 — S3: keys/config 0600 + redact hex from stderr drain
-- **Files:** `gui/backend/keys.py`, `gui/backend/config.py`, `gui/backend/sniffer.py`
+### 1.3 — S3: config 0600 file permissions
+- **Files:** `gui/backend/config.py`
 - **Approach:**
-  - After `path.write_text()` in `keys.save` and `config.save`, `os.chmod(path, 0o600)`. `mkdir(mode=0o700)` for parents.
-  - In `sniffer._drain_stderr`, before broadcasting the line, `re.sub(r"\b[0-9a-fA-F]{64}\b", "<redacted>", msg)`. Also redact `\b[0-9a-fA-F]{32}\b` (128-bit keys).
-- **Validation:** `stat -c %a ~/.config/ltesniffer-gui/keys.json` → 600. Echo a 64-hex string from a test script that pretends to be the sniffer → log entry shows `<redacted>`.
+  - After `path.write_text()` in `config.save`, `os.chmod(path, 0o600)`. `mkdir(mode=0o700)` for parents.
+- **Validation:** `stat -c %a ~/.config/ltesniffer-gui/config.json` → 600.
 - **Deps:** none.
 - **Effort:** Claude 15 min · your 5 min · hardware-time 0.
 
@@ -80,10 +78,8 @@ Detailed, executable breakdown of the improvement plan from the v2 inspection re
 - `curl http://127.0.0.1:8000/api/health` → `{"ok":true, ...}`  *(loopback still works)*
 - `curl http://192.168.x.x:8000/api/health` → **connection refused** *(LAN bind off by default)*
 - `LTESNIFFER_GUI_BIND=0.0.0.0 .venv/bin/uvicorn ...` then from LAN: `curl …/api/health` → **401** without token, **200** with `Authorization: Bearer $(cat ~/.config/ltesniffer-gui/token)`.
-- `stat -c %a ~/.config/ltesniffer-gui/keys.json` → **600**
 - `stat -c %a ~/.config/ltesniffer-gui/config.json` → **600**
 - `PUT /api/config '{"binary_path":"/usr/bin/id"}'` → **403** (allowlist)
-- Pipe `\b[0-9a-f]{64}\b` test string to stderr → log event shows `<redacted>`
 
 **Orphan / wedge regression**:
 - Start backend in real mode. Send `kill -9` to uvicorn. `pgrep -x LTESniffer` should return **nothing** within ~10 s (kill-script + lifespan shutdown).
@@ -92,7 +88,6 @@ Detailed, executable breakdown of the improvement plan from the v2 inspection re
 **Manual smoke**:
 - [ ] Dashboard loads, shows cell card with PCI (or "waiting for cell")
 - [ ] Start/Stop/Restart capture buttons all work
-- [ ] Keys page: add a test entry with kasme+nas_count, edit it, delete it
 - [ ] Captures tab lists pcaps, download link works
 - [ ] Spectrum button: opens popover (still disabled in mock — that's intended)
 - [ ] Config page: edit DL freq → Save → reload → value persists
@@ -304,7 +299,7 @@ Detailed, executable breakdown of the improvement plan from the v2 inspection re
 ### 4.4 — F11: UEStateTracker (RA → RRC → CRNTI → STMSI)
 - **Files:** `src/include/UeStateTracker.h` (new), `src/src/UeStateTracker.cc` (new), hooks in RRC + NAS decoders
 - **Approach:** state machine per C-RNTI: `IDLE → MSG3_SENT → RRC_SETUP → SECURITY_ACTIVE → DATA → IDLE`. On NAS S-TMSI / IMSI / GUTI seen, attach to the current state. Emits `ue_state` JSON events on transitions.
-- **Validation:** with a phone attaching, see clean transitions through all states. Eventual binding RNTI → S-TMSI → IMSI (when keys present).
+- **Validation:** with a phone attaching, see clean transitions through all states. Eventual binding RNTI → S-TMSI → IMSI.
 - **Deps:** 4.2.
 - **Effort:** Claude 3 hours · your 30 min · hardware-time 1-2 hours.
 

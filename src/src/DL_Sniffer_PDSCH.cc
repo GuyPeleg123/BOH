@@ -252,11 +252,6 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 				if (write_pcap_en)
 					write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
 
-				if (key_store)
-					key_store->process_dl_mac_pdu((uint16_t)cur_rnti,
-					                              pdsch_res[tb].payload,
-					                              (uint32_t)result_length, tti);
-
 				if (RNTI_name == "P_RNTI" && (api_mode == 2 || api_mode == 3))
 				{ // IMSI catching modes
 					int paging_ret = decode_imsi_tmsi_paging(pdsch_res[tb].payload, result_length);
@@ -297,11 +292,6 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 								}
 								mcs_tracking->update_ue_config_rnti(cur_rnti, ue_config);
 							}
-						} else if (lcid == 1 && key_store &&
-						           key_store->has_ue((uint16_t)cur_rnti) &&
-						           !key_store->is_security_active((uint16_t)cur_rnti)) {
-							// Try to detect SecurityModeCommand before ciphering activates
-							decode_security_mode_cmd(sdu_ptr, payload_length, (uint16_t)cur_rnti);
 						}
 					}
 					else
@@ -1382,63 +1372,3 @@ void PDSCH_Decoder::print_api_dl(uint32_t tti, uint16_t rnti, int id, std::strin
 	std::cout << std::endl;
 }
 
-/*
- * Decode an unencrypted SRB1 RLC AM SDU looking for SecurityModeCommand.
- * The SDU has a 2-byte RLC header + 1-byte PDCP header before the RRC payload.
- * Returns SRSRAN_SUCCESS if SecurityModeCommand was found and algo extracted.
- */
-int PDSCH_Decoder::decode_security_mode_cmd(const uint8_t* sdu_ptr, int length, uint16_t rnti)
-{
-	if (!key_store) return SRSRAN_ERROR;
-	if (length < 4) return SRSRAN_ERROR;
-
-	// RLC AM data PDU: D/C=1 (bit7), RF=0 (bit6)
-	if ((sdu_ptr[0] & 0xC0) != 0x80) return SRSRAN_ERROR;
-
-	// PDCP header: 1 byte, D/C=1 (bit7)
-	const uint8_t* pdcp_hdr = sdu_ptr + 2;
-	if ((pdcp_hdr[0] & 0x80) == 0) return SRSRAN_ERROR;
-
-	// RRC payload starts at offset 3 (2 RLC + 1 PDCP)
-	const uint8_t* rrc_ptr = sdu_ptr + 3;
-	int rrc_len = length - 3;
-	if (rrc_len <= 0) return SRSRAN_ERROR;
-
-	asn1::rrc::dl_dcch_msg_s msg;
-	asn1::cbit_ref bref(rrc_ptr, rrc_len);
-	if (msg.unpack(bref) != asn1::SRSASN_SUCCESS) return SRSRAN_ERROR;
-	if (msg.msg.type() != asn1::rrc::dl_dcch_msg_type_c::types::c1) return SRSRAN_ERROR;
-	if (msg.msg.c1().type() != asn1::rrc::dl_dcch_msg_type_c::c1_c_::types::security_mode_cmd)
-		return SRSRAN_ERROR;
-
-	const asn1::rrc::security_mode_cmd_r8_ies_s& smc =
-		msg.msg.c1().security_mode_cmd().crit_exts.c1().security_mode_cmd_r8();
-
-	const asn1::rrc::security_algorithm_cfg_s& algo_cfg =
-		smc.security_cfg_smc.security_algorithm_cfg;
-
-	CIPHERING_ALGORITHM_ID_ENUM cipher_algo = CIPHERING_ALGORITHM_ID_EEA0;
-	switch (algo_cfg.ciphering_algorithm.value) {
-		case asn1::rrc::ciphering_algorithm_r12_opts::eea0:       cipher_algo = CIPHERING_ALGORITHM_ID_EEA0;     break;
-		case asn1::rrc::ciphering_algorithm_r12_opts::eea1:       cipher_algo = CIPHERING_ALGORITHM_ID_128_EEA1; break;
-		case asn1::rrc::ciphering_algorithm_r12_opts::eea2:       cipher_algo = CIPHERING_ALGORITHM_ID_128_EEA2; break;
-		case asn1::rrc::ciphering_algorithm_r12_opts::eea3_v1130: cipher_algo = CIPHERING_ALGORITHM_ID_128_EEA3; break;
-		default: break;
-	}
-
-	INTEGRITY_ALGORITHM_ID_ENUM integ_algo = INTEGRITY_ALGORITHM_ID_EIA0;
-	switch (algo_cfg.integrity_prot_algorithm.value) {
-		case asn1::rrc::security_algorithm_cfg_s::integrity_prot_algorithm_opts::eia0_v920: integ_algo = INTEGRITY_ALGORITHM_ID_EIA0;     break;
-		case asn1::rrc::security_algorithm_cfg_s::integrity_prot_algorithm_opts::eia1:      integ_algo = INTEGRITY_ALGORITHM_ID_128_EIA1; break;
-		case asn1::rrc::security_algorithm_cfg_s::integrity_prot_algorithm_opts::eia2:      integ_algo = INTEGRITY_ALGORITHM_ID_128_EIA2; break;
-		case asn1::rrc::security_algorithm_cfg_s::integrity_prot_algorithm_opts::eia3_v1130:integ_algo = INTEGRITY_ALGORITHM_ID_128_EIA3; break;
-		default: break;
-	}
-
-	printf("[KeyAttach] RNTI 0x%04x: SecurityModeCommand detected (cipher=%d, integ=%d)\n",
-	       rnti, (int)cipher_algo, (int)integ_algo);
-
-	key_store->set_security_algo(rnti, cipher_algo, integ_algo);
-	key_store->activate_security(rnti);
-	return SRSRAN_SUCCESS;
-}

@@ -62,7 +62,6 @@ export function StatusBar() {
         {tab("/", "Dashboard")}
         {tab("/ues", "UEs")}
         {tab("/sessions", "Sessions")}
-        {tab("/keys", "Keys")}
         {tab("/config", "Config")}
         {tab("/captures", "Captures")}
         {tab("/log-history", "Log History")}

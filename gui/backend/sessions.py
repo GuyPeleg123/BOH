@@ -11,13 +11,10 @@ The chain (see CLAUDE.md):
   SIB1: PLMN → completes the (partial) GUTI
 
 Identity reality: over the air you reliably get M-TMSI; often MMEC; PLMN from
-SIB1. Full GUTI/IMSI from NAS only when traffic is decrypted (opt-in keys).
-Labels carry a `source`/`confidence` so nothing is overstated.
+SIB1. Full GUTI/IMSI is carried in encrypted NAS and is not available in this
+capture-only build. Labels carry a `source`/`confidence` so nothing is overstated.
 """
 from __future__ import annotations
-
-import tempfile
-from pathlib import Path
 
 from config import SnifferConfig
 import captures as C
@@ -67,10 +64,9 @@ def _latest_pcap(cfg: SnifferConfig) -> str | None:
     return None
 
 
-def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
-                     entries: list[dict] | None = None, decrypt: bool = False) -> dict:
+def analyze_sessions(cfg: SnifferConfig, input_path: str | None) -> dict:
     """Build per-UE sessions with correlated identity + TA range from a pcap.
-    Returns a manifest (never raises to the caller)."""
+    Cleartext only (no keys/decrypt). Returns a manifest (never raises to the caller)."""
     res: dict = {"ok": False, "error": None, "note": None, "source": None,
                  "sessions": [], "unmatched_rar": 0, "paging": []}
 
@@ -87,34 +83,11 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
         res["error"] = "tshark not found on PATH"; return res
     res["source"] = str(src)
 
-    keys: list[dict] = []
-    if decrypt:
-        for e in (entries or []):
-            try:
-                rrc, up = C._resolve_entry_keys(e)
-            except ValueError as ke:
-                res["error"] = str(ke); return res
-            rn = str(e.get("rnti", "")).strip()
-            keys.append({"rnti": int(rn) if rn not in ("", "None") else None,
-                         "rrc": rrc, "up": up,
-                         "cipher": str(e.get("cipher_algo", "EEA2")),
-                         "integ": str(e.get("integ_algo", "EIA2"))})
-    do_decrypt = decrypt and bool(keys)
-
-    tmp = None
     try:
-        # Decryption needs UEId:=RNTI so the Wireshark UAT applies; cleartext can
-        # read the source directly. SRB dissection is always on so RRC ConnReq
-        # (Msg3, sent in the clear) parses out M-TMSI/MMEC.
-        if do_decrypt:
-            with tempfile.NamedTemporaryFile(prefix="lte-sess-", suffix=".pcap", delete=False) as tf:
-                tmp = Path(tf.name)
-            C._rewrite_ueid_eq_rnti(src, tmp)
-            pcap = tmp
-            oargs = C._split_oargs(keys)         # decipher prefs + UAT rows + SRB dissect
-        else:
-            pcap = src
-            oargs = ["-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE"]
+        # Cleartext read: SRB dissection is on so RRC ConnReq (Msg3, sent in the
+        # clear) parses out M-TMSI/MMEC.
+        pcap = src
+        oargs = ["-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE"]
 
         # cell identity (ECI) + PLMN (MCC-MNC) from SIB1 — LTESniffer locks one cell
         # per capture, so every session's DL/UL belongs to this cell. Cell ID + PLMN
@@ -342,9 +315,8 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
             notes.append("No identity bound to a UL session in the clear (session-bound identity "
                          "needs an UL RRC Connection Request / Msg3, which is UL-reception-limited); "
                          "the DL paging pool above is the primary identity harvest.")
-        if not do_decrypt:
-            notes.append("Cleartext mode: GUTI/IMSI from encrypted NAS not included. "
-                         "Enable decrypt with keys to complete identities.")
+        notes.append("Cleartext mode: GUTI/IMSI carried in encrypted NAS is not available "
+                     "in this capture-only build.")
         notes.append(f"{len(out)} sessions, {named} identified, {with_ta} with TA. "
                      f"RAR↔C-RNTI is time-matched (no Temp-CRNTI field); {res['unmatched_rar']} RAR TAs unmatched.")
         res["note"] = " ".join(notes)
@@ -354,9 +326,3 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None,
         res["error"] = "tshark timed out"; return res
     except Exception as ex:  # noqa: BLE001
         res["error"] = f"{type(ex).__name__}: {ex}"; return res
-    finally:
-        if tmp and tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass

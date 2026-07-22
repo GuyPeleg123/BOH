@@ -23,7 +23,6 @@
 #include <map>
 
 #include "ArgManager.h"
-#include "KeyAttaching.h"
 #include "include/JSONEmitter.h"
 #include "falcon/common/SignalManager.h"
 #include "include/SubframeWorker.h"
@@ -182,6 +181,5 @@ private:
   HARQ                    harq; // test HARQ function
   int                     harq_mode;
   srsran_filesink_t       file_sink = {};
-  KeyStore                key_store_;       // PDCP decryption engine (empty unless -K flag given)
   JSONEmitter             json_emitter;     // newline-delimited JSON events for the gui/ backend (empty unless -J given)
 };

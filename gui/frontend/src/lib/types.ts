@@ -104,7 +104,6 @@ export interface SnifferConfig {
   pcap_file: string;
   dci_file_name: string;
   stats_file_name: string;
-  keys_file: string;
   pcap_stream_fifo: string;
   binary_path: string;
   captures_dir: string;
@@ -120,44 +119,6 @@ export interface CaptureFile {
   mtime: number;
   source: string;
   active: boolean;
-}
-
-export interface DecryptEntry {
-  rnti: number;
-  // Give the ciphering keys directly, OR a K_eNB, OR K_ASME + NAS uplink count
-  // (the backend derives K_RRCenc/K_UPenc per TS 33.401).
-  rrcenc_key?: string;  // 32 hex chars (K_RRCenc)
-  upenc_key?: string;   // 32 hex chars (K_UPenc)
-  kasme?: string | null;       // 64 hex chars (K_ASME)
-  nas_count?: number | null;   // NAS uplink COUNT
-  kenb?: string | null;        // 64 hex chars (K_eNB)
-  cipher_algo: string;  // EEA0|EEA1|EEA2|EEA3
-  integ_algo: string;   // EIA0|EIA1|EIA2|EIA3
-}
-
-export interface DeriveResponse {
-  ok: boolean;
-  error: string | null;
-  k_enb?: string;
-  cipher_algo?: string;
-  integ_algo?: string;
-  rrcenc_key?: string;
-  rrcint_key?: string;
-  upenc_key?: string;
-  upint_key?: string;
-}
-
-export interface SplitDim { id: string; label: string; }
-
-export interface SplitFile { path: string; frames: number; filter: string; }
-
-export interface SplitResponse {
-  ok: boolean;
-  error: string | null;
-  note: string | null;
-  folder: string | null;
-  leaves: number;
-  files: SplitFile[];
 }
 
 export interface SessionIdentity {
@@ -243,67 +204,6 @@ export interface PinCellResponse {
   plmn?: string | null;
 }
 
-export interface BruteforceResponse {
-  ok: boolean;
-  found: boolean;
-  error: string | null;
-  note: string | null;
-  nas_count: number | null;
-  rnti_used: number | null;
-  tested: number;
-  decode_count: number;
-  baseline: number;
-  k_enb?: string | null;
-  rrcenc_key?: string | null;
-  rrcint_key?: string | null;
-  upenc_key?: string | null;
-  upint_key?: string | null;
-}
-
-export interface DecryptResponse {
-  ok: boolean;
-  error: string | null;
-  stderr: string;
-  note: string | null;
-  keyed_pcap_path: string | null;
-  txt_path: string | null;
-  uat_path: string | null;
-  decoded_text: string;
-  uat_text: string;
-  frames_rewritten: number;
-  ndecoded: number;
-}
-
-export interface OrganizeEntry {
-  rnti?: number | null;   // optional in auto mode
-  rrcenc_key?: string;
-  upenc_key?: string;
-  kasme?: string | null;
-  nas_count?: number | null;
-  kenb?: string | null;
-  cipher_algo: string;
-  integ_algo: string;
-}
-
-export interface OrganizedUE {
-  rnti: number;
-  rnti_hex: string;
-  identity: string | null;     // "tmsi-..." / "imsi-..." or null
-  frames: number;
-  sub_pcap: string;
-  matched_key: string | null;  // truncated key preview, or null if no key matched
-  score: number;               // clean-decode delta the matched key achieved
-  decoded_txt: string | null;
-}
-
-export interface OrganizeResponse {
-  ok: boolean;
-  error: string | null;
-  folder: string | null;
-  ues: OrganizedUE[];
-  note: string | null;
-}
-
 export interface BrowseEntry {
   name: string;
   path: string;
@@ -324,26 +224,6 @@ export interface CapturesResponse {
   captures: CaptureFile[];
   roots: string[];
   captures_dir: string;
-}
-
-export type CipherAlgo = "EEA0" | "EEA1" | "EEA2" | "EEA3";
-export type IntegAlgo = "EIA0" | "EIA1" | "EIA2" | "EIA3";
-
-export interface KeyEntry {
-  rnti: number;                  // 0..0xFFFF, displayed in hex in UI
-  kenb?: string | null;          // 64 hex chars
-  kasme?: string | null;         // 64 hex chars
-  nas_count?: number | null;     // required iff kasme set, no kenb
-  cipher_algo?: CipherAlgo | null;
-  integ_algo?: IntegAlgo | null;
-  hfn_hint?: number;             // 0 default
-  label?: string | null;
-}
-
-export interface KeysResponse {
-  entries: KeyEntry[];
-  path: string;
-  exists: boolean;
 }
 
 export interface KnownCell {

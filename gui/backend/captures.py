@@ -5,9 +5,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import struct
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Iterable
@@ -131,7 +129,7 @@ _PCAP_SUFFIXES = {".pcap", ".pcapng", ".cap"}
 
 
 def resolve_input_pcap(cfg: SnifferConfig, path: str) -> Path:
-    """Resolve a pcap to DECRYPT/ORGANIZE. Unlike resolve_for_download this is
+    """Resolve a pcap to ORGANIZE/SPLIT. Unlike resolve_for_download this is
     not limited to the allowed roots — the operator can pick any capture file
     anywhere on the machine (this is an authenticated, local admin GUI). Still
     insists it's an existing pcap-type file, not a directory or arbitrary blob."""
@@ -191,222 +189,8 @@ def browse_dir(cfg: SnifferConfig, path: str | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Post-capture PDCP decryption
-#
-# Wireshark deciphers PDCP-LTE at dissection time using its `pdcp_lte_ue_keys`
-# UAT, keyed by UEId. LTESniffer pcaps tag every frame UEId=0 (only RNTI set),
-# so we first rewrite each frame's UEId tag to equal its RNTI, then feed tshark
-# one UAT row per RNTI. tshark can't bake decryption into a pcap (-w keeps the
-# ciphered bytes), so we emit (a) a readable verbose decode and (b) the
-# UEId-rewritten pcap + a .uat sidecar the operator can load in their Wireshark.
-# ---------------------------------------------------------------------------
-
-_HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
-_CIPHER_ALGOS = {"EEA0", "EEA1", "EEA2", "EEA3"}
-_INTEG_ALGOS = {"EIA0", "EIA1", "EIA2", "EIA3"}
-
-import keyderiv
-
-
-def _resolve_entry_keys(e: dict) -> tuple[str, str]:
-    """Return (rrcenc, upenc) 32-hex ciphering keys for a key entry, deriving
-    them from K_ASME+NAS_count (or K_eNB) when the raw keys aren't supplied.
-    Raises ValueError with a user-facing message on bad input."""
-    rrc = str(e.get("rrcenc_key", "") or "").strip().lower()
-    up = str(e.get("upenc_key", "") or "").strip().lower()
-    if _HEX32.match(rrc) and _HEX32.match(up):
-        return rrc, up
-    # not given directly — try to derive
-    kasme = str(e.get("kasme", "") or "").strip()
-    kenb = str(e.get("kenb", "") or "").strip()
-    nas = e.get("nas_count", None)
-    if kenb or (kasme and nas is not None):
-        d = keyderiv.derive_keys(
-            kasme=kasme or None, nas_count=nas, kenb=kenb or None,
-            cipher_algo=str(e.get("cipher_algo", "EEA2")),
-            integ_algo=str(e.get("integ_algo", "EIA2")),
-        )
-        return d["rrcenc_key"], d["upenc_key"]
-    raise ValueError("provide K_RRCenc+K_UPenc (32 hex each), or K_eNB, "
-                     "or K_ASME + NAS uplink count to derive them")
-
-# MAC-LTE pcap framing (DLT 147): record data = radioType, direction, rntiType,
-# then TLV tags until the 0x01 payload tag.
-_MAC_LTE_PAYLOAD_TAG = 0x01
-_MAC_LTE_RNTI_TAG = 0x02
-_MAC_LTE_UEID_TAG = 0x03
-_TAGS_2B = {0x02, 0x03, 0x04}              # RNTI, UEID, FRAME/SUBFRAME
-_TAGS_1B = {0x05, 0x06, 0x07, 0x0A, 0x0F}  # predef, retx, crc, carrier, nb-mode
-
-
-def _rewrite_ueid_eq_rnti(in_path: Path, out_path: Path) -> int:
-    """Copy a MAC-LTE pcap setting each frame's UEId tag = its RNTI (in place,
-    no length change) so the per-UEId pdcp_lte_ue_keys table keys per-RNTI.
-    Returns frames rewritten. Frames missing either tag pass through unchanged."""
-    with open(in_path, "rb") as f:
-        gh = f.read(24)
-        if len(gh) < 24:
-            raise ValueError("pcap too short")
-        magic = struct.unpack("<I", gh[:4])[0]
-        endi = "<" if magic in (0xA1B2C3D4, 0xA1B23C4D) else ">"
-        linktype = struct.unpack(endi + "I", gh[20:24])[0]
-        if linktype != 147:
-            raise ValueError(f"not a MAC-LTE pcap (linktype={linktype})")
-        rewritten = 0
-        with open(out_path, "wb") as o:
-            o.write(gh)
-            while True:
-                rh = f.read(16)
-                if len(rh) < 16:
-                    break
-                incl = struct.unpack(endi + "IIII", rh)[2]
-                data = bytearray(f.read(incl))
-                if len(data) < incl:
-                    break
-                i, n = 3, len(data)
-                rnti = None
-                ueid_pos = None
-                while i < n:
-                    tag = data[i]
-                    if tag == _MAC_LTE_PAYLOAD_TAG:
-                        break
-                    if tag == _MAC_LTE_RNTI_TAG and i + 3 <= n:
-                        rnti = (data[i + 1] << 8) | data[i + 2]
-                        i += 3
-                    elif tag == _MAC_LTE_UEID_TAG and i + 3 <= n:
-                        ueid_pos = i + 1
-                        i += 3
-                    elif tag in _TAGS_2B:
-                        i += 3
-                    elif tag in _TAGS_1B:
-                        i += 2
-                    else:
-                        break
-                if rnti is not None and ueid_pos is not None:
-                    data[ueid_pos] = (rnti >> 8) & 0xFF
-                    data[ueid_pos + 1] = rnti & 0xFF
-                    rewritten += 1
-                o.write(rh)
-                o.write(data)
-        return rewritten
-
-
-def decrypt_pcap(cfg: SnifferConfig, input_path: str, entries: list[dict]) -> dict:
-    """Decrypt a captured pcap with per-RNTI keys. Produces a readable decode
-    (.txt), a UEId-rewritten pcap, and a .uat keys sidecar. Returns a structured
-    result (never raises to the caller; tshark failures come back as ok=False)."""
-    res: dict = {
-        "ok": False, "error": None, "stderr": "", "note": None,
-        "keyed_pcap_path": None, "txt_path": None, "uat_path": None,
-        "decoded_text": "", "uat_text": "", "frames_rewritten": 0, "ndecoded": 0,
-    }
-    try:
-        src = resolve_input_pcap(cfg, input_path)
-    except FileNotFoundError:
-        res["error"] = "input pcap not found"; return res
-    except PermissionError as e:
-        res["error"] = str(e); return res
-
-    if not entries:
-        res["error"] = "no key entries provided"; return res
-    norm = []
-    for e in entries:
-        try:
-            rnti = int(e["rnti"])
-        except (KeyError, ValueError, TypeError):
-            res["error"] = "invalid rnti"; return res
-        if not 0 <= rnti <= 0xFFFF:
-            res["error"] = f"rnti {rnti} out of range (0..65535)"; return res
-        try:
-            rrc, up = _resolve_entry_keys(e)
-        except ValueError as ke:
-            res["error"] = f"RNTI {rnti}: {ke}"; return res
-        cipher = str(e.get("cipher_algo", "EEA2"))
-        integ = str(e.get("integ_algo", "EIA2"))
-        if cipher not in _CIPHER_ALGOS:
-            res["error"] = f"RNTI {rnti}: bad cipher_algo {cipher}"; return res
-        if integ not in _INTEG_ALGOS:
-            res["error"] = f"RNTI {rnti}: bad integ_algo {integ}"; return res
-        norm.append({"rnti": rnti, "rrc": rrc.lower(), "up": up.lower(),
-                     "cipher": cipher, "integ": integ})
-
-    if len({e["cipher"] for e in norm}) > 1:
-        res["note"] = ("Multiple cipher algorithms given; tshark applies one global "
-                       "default, so mixed-algo UEs decrypt only if the capture also "
-                       "contains their RRC SecurityModeCommand.")
-
-    stem, d = src.stem, src.parent
-    keyed = d / f"{stem}_keyed.pcap"
-    txt = d / f"{stem}_decrypted.txt"
-    uat = d / f"{stem}.pdcp_lte_ue_keys.uat"
-
-    if not shutil.which("tshark"):
-        res["error"] = "tshark not found on PATH"; return res
-
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="lte-keyed-", suffix=".pcap", delete=False) as tf:
-            tmp = Path(tf.name)
-        res["frames_rewritten"] = _rewrite_ueid_eq_rnti(src, tmp)
-
-        oargs = [
-            "-o", "pdcp-lte.decipher_signalling:TRUE",
-            "-o", "pdcp-lte.decipher_userplane:TRUE",
-            "-o", f"pdcp-lte.default_ciphering_algorithm:{norm[0]['cipher']}",
-            "-o", f"pdcp-lte.default_integrity_algorithm:{norm[0]['integ']}",
-            "-o", "pdcp-lte.show_user_plane_as_ip:TRUE",
-            "-o", "pdcp-lte.show_signalling_plane_as_rrc:TRUE",
-            "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
-        ]
-        uat_rows = []
-        for e in norm:
-            row = f'"{e["rnti"]}","{e["rrc"]}","{e["up"]}",""'  # rrcIntegrity left blank
-            uat_rows.append(row)
-            oargs += ["-o", f"uat:pdcp_lte_ue_keys:{row}"]
-        uat_text = (
-            "# Wireshark PDCP-LTE keys (pdcp_lte_ue_keys.uat)\n"
-            "# Load: copy into ~/.config/wireshark/  then open the *_keyed.pcap\n"
-            "# Columns: ueid(=RNTI), RRC cipher key, UP cipher key, RRC integrity key\n"
-            + "\n".join(uat_rows) + "\n"
-        )
-
-        shutil.move(str(tmp), str(keyed)); tmp = None
-        uat.write_text(uat_text)
-
-        cmd = ["tshark", "-r", str(keyed), *oargs, "-Y", "pdcp-lte", "-V"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        res["stderr"] = (proc.stderr or "").strip()
-        decoded = proc.stdout or ""
-        max_bytes = 4 * 1024 * 1024
-        if len(decoded) > max_bytes:
-            decoded = decoded[:max_bytes] + "\n...[truncated]...\n"
-        txt.write_text(decoded)
-
-        res["ndecoded"] = decoded.count("PDCP-LTE")
-        res["keyed_pcap_path"] = str(keyed)
-        res["txt_path"] = str(txt)
-        res["uat_path"] = str(uat)
-        res["decoded_text"] = decoded
-        res["uat_text"] = uat_text
-        res["ok"] = proc.returncode == 0
-        if proc.returncode != 0 and not res["error"]:
-            res["error"] = "tshark exited non-zero — see stderr"
-        return res
-    except subprocess.TimeoutExpired:
-        res["error"] = "tshark timed out (>300s)"; return res
-    except Exception as ex:  # noqa: BLE001 - report any failure structurally
-        res["error"] = f"{type(ex).__name__}: {ex}"; return res
-    finally:
-        if tmp is not None:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-
-
-# ---------------------------------------------------------------------------
 # Session organizer: split a whole sniff into a folder of per-UE sub-pcaps
-# named by TMSI/IMSI (falling back to RNTI), optionally decrypting each UE.
+# named by TMSI/IMSI (falling back to RNTI).
 # ---------------------------------------------------------------------------
 
 _MIN_FRAMES_PER_UE = 3   # ignore one-hit C-RNTI ghosts from blind search
@@ -525,33 +309,10 @@ def _safe_label(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", s)[:48]
 
 
-def _decode_count(pcap: Path, rnti: int, key: dict | None) -> int:
-    """Count frames of this RNTI that dissect cleanly to lte-rrc or ip. With the
-    right key, ciphered SRB/DRB decode to RRC/IP; with a wrong key they're garbage."""
-    oargs = [
-        "-o", "pdcp-lte.decipher_signalling:TRUE",
-        "-o", "pdcp-lte.decipher_userplane:TRUE",
-        "-o", "pdcp-lte.show_user_plane_as_ip:TRUE",
-        "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
-    ]
-    if key:
-        oargs += [
-            "-o", f"pdcp-lte.default_ciphering_algorithm:{key['cipher']}",
-            "-o", f"pdcp-lte.default_integrity_algorithm:{key['integ']}",
-            "-o", f'uat:pdcp_lte_ue_keys:"{rnti}","{key["rrc"]}","{key["up"]}",""',
-        ]
-    cmd = ["tshark", "-r", str(pcap), "-Y", f"mac-lte.rnti=={rnti} and (lte_rrc or ip)", *oargs, "-T", "fields", "-e", "frame.number"]
-    out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    return len([x for x in out.stdout.splitlines() if x.strip()])
-
-
-def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | None,
-                     mode: str = "auto") -> dict:
+def organize_session(cfg: SnifferConfig, input_path: str) -> dict:
     """Build a session folder: the full pcap + one sub-pcap per UE (recurring
-    C-RNTI), named by TMSI/IMSI when known else by RNTI. If keys are given,
-    decrypt each UE — `mode='auto'` heuristically matches keys to UEs by which
-    one yields the most clean RRC/IP decodes; `mode='per-rnti'` uses the RNTI on
-    each key entry. Returns a structured manifest (never raises to the caller)."""
+    C-RNTI), named by TMSI/IMSI when known else by RNTI. Cleartext only — no
+    key/decrypt step. Returns a structured manifest (never raises to the caller)."""
     res: dict = {"ok": False, "error": None, "folder": None, "ues": [], "note": None}
     try:
         src = resolve_input_pcap(cfg, input_path)
@@ -562,26 +323,14 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
     if not shutil.which("tshark"):
         res["error"] = "tshark not found on PATH"; return res
 
-    entries = entries or []
-    keys = []
-    for e in entries:
-        try:
-            rrc, up = _resolve_entry_keys(e)
-        except ValueError as ke:
-            res["error"] = str(ke); return res
-        keys.append({
-            "rnti": int(e["rnti"]) if str(e.get("rnti", "")).strip() not in ("", "None") else None,
-            "rrc": rrc, "up": up,
-            "cipher": str(e.get("cipher_algo", "EEA2")), "integ": str(e.get("integ_algo", "EIA2")),
-        })
-
     stem, d = src.stem, src.parent
     folder = d / f"{stem}_session"
     try:
         folder.mkdir(exist_ok=True)
-        # ueid:=rnti rewrite -> keyed full pcap (the one we split + decrypt)
+        # Full pcap copy: byte-identical to the source, so its frame numbers are
+        # the same indices as the original dual-sniff capture.
         full = folder / f"{stem}_full.pcap"
-        _rewrite_ueid_eq_rnti(src, full)
+        shutil.copy(src, full)
 
         idmap = _rnti_identity_map(full)
 
@@ -607,37 +356,7 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
             subprocess.run(["tshark", "-r", str(full), "-Y", f"mac-lte.rnti=={rnti}", "-w", str(sub)],
                            capture_output=True, text=True, timeout=180)
             ue = {"rnti": rnti, "rnti_hex": f"0x{rnti:04X}", "identity": ident,
-                  "frames": counts[rnti], "sub_pcap": str(sub),
-                  "matched_key": None, "score": 0, "decoded_txt": None}
-
-            # choose a key
-            key = None
-            if mode == "per-rnti":
-                key = next((k for k in keys if k["rnti"] == rnti), None)
-            elif keys:  # auto-match: best clean-decode delta over the no-key baseline
-                base = _decode_count(sub, rnti, None)
-                best, best_delta = None, 0
-                for k in keys:
-                    delta = _decode_count(sub, rnti, k) - base
-                    if delta > best_delta:
-                        best, best_delta = k, delta
-                if best and best_delta >= 2:
-                    key = best; ue["score"] = best_delta
-
-            if key:
-                ue["matched_key"] = f"{key['rrc'][:8]}…/{key['up'][:8]}…"
-                txt = folder / f"ue_{label}_decrypted.txt"
-                oargs = [
-                    "-o", "pdcp-lte.decipher_signalling:TRUE", "-o", "pdcp-lte.decipher_userplane:TRUE",
-                    "-o", f"pdcp-lte.default_ciphering_algorithm:{key['cipher']}",
-                    "-o", f"pdcp-lte.default_integrity_algorithm:{key['integ']}",
-                    "-o", "pdcp-lte.show_user_plane_as_ip:TRUE", "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
-                    "-o", f'uat:pdcp_lte_ue_keys:"{rnti}","{key["rrc"]}","{key["up"]}",""',
-                ]
-                dec = subprocess.run(["tshark", "-r", str(sub), *oargs, "-Y", "pdcp-lte", "-V"],
-                                     capture_output=True, text=True, timeout=180).stdout
-                txt.write_text(dec[:4 * 1024 * 1024])
-                ue["decoded_txt"] = str(txt)
+                  "frames": counts[rnti], "sub_pcap": str(sub)}
             res["ues"].append(ue)
 
         named = sum(1 for u in res["ues"] if u["identity"])
@@ -658,120 +377,12 @@ def organize_session(cfg: SnifferConfig, input_path: str, entries: list[dict] | 
 
 
 # ---------------------------------------------------------------------------
-# NAS-count brute force
-#
-# When you hold K_ASME for a UE but not the exact NAS uplink COUNT (it gates
-# K_eNB → all AS keys), sweep a candidate range: derive keys for each count and
-# keep the one that actually decrypts the UE's PDCP — measured by the same
-# clean lte-rrc/ip decode heuristic the auto-match uses. The capture is
-# pre-filtered to the target RNTI once so each candidate test is cheap.
-# ---------------------------------------------------------------------------
-_BF_MAX_CANDIDATES = 2048   # keep a full sweep under a few minutes
-_BF_MIN_DELTA = 2           # clean-decode jump over baseline that counts as "works"
-
-
-def bruteforce_nas(cfg: SnifferConfig, input_path: str, kasme: str,
-                   nas_lo, nas_hi, rnti=None,
-                   cipher_algo: str = "EEA2", integ_algo: str = "EIA2") -> dict:
-    """Find the NAS uplink COUNT in [nas_lo, nas_hi] that decrypts the target
-    UE, deriving keys from K_ASME per candidate (TS 33.401). Returns the winning
-    count + the full derived key set, or found=False. Never raises to caller."""
-    res: dict = {"ok": False, "found": False, "error": None, "note": None,
-                 "nas_count": None, "rnti_used": None, "tested": 0,
-                 "decode_count": 0, "baseline": 0,
-                 "k_enb": None, "rrcenc_key": None, "rrcint_key": None,
-                 "upenc_key": None, "upint_key": None}
-    try:
-        src = resolve_input_pcap(cfg, input_path)
-    except FileNotFoundError:
-        res["error"] = "input pcap not found"; return res
-    except PermissionError as e:
-        res["error"] = str(e); return res
-    if not shutil.which("tshark"):
-        res["error"] = "tshark not found on PATH"; return res
-    try:
-        nas_lo, nas_hi = int(nas_lo), int(nas_hi)
-    except (TypeError, ValueError):
-        res["error"] = "NAS range must be integers"; return res
-    if nas_lo > nas_hi:
-        nas_lo, nas_hi = nas_hi, nas_lo
-    if nas_lo < 0 or nas_hi > 0xFFFFFFFF:
-        res["error"] = "NAS count out of range (0..2^32-1)"; return res
-    n = nas_hi - nas_lo + 1
-    if n > _BF_MAX_CANDIDATES:
-        res["error"] = f"range too large ({n} counts); cap is {_BF_MAX_CANDIDATES} — narrow it"; return res
-    # validate K_ASME / algos up front by deriving the first candidate
-    try:
-        keyderiv.derive_keys(kasme=kasme, nas_count=nas_lo, cipher_algo=cipher_algo, integ_algo=integ_algo)
-    except ValueError as e:
-        res["error"] = str(e); return res
-
-    tmp_full = tmp_small = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="lte-bf-full-", suffix=".pcap", delete=False) as tf:
-            tmp_full = Path(tf.name)
-        _rewrite_ueid_eq_rnti(src, tmp_full)  # UEId:=RNTI so the Wireshark UAT applies
-        if rnti is None:
-            counts: dict = {}
-            for r in _tshark_fields(tmp_full, "mac-lte", ["mac-lte.rnti", "mac-lte.rnti-type"]):
-                if len(r) >= 2 and r[0] and r[1] == "3":
-                    rr = int(r[0]); counts[rr] = counts.get(rr, 0) + 1
-            if not counts:
-                res["error"] = "no C-RNTI traffic to test against in this capture"; return res
-            rnti = max(counts, key=counts.get)
-        rnti = int(rnti)
-        res["rnti_used"] = rnti
-        # pre-filter to the target RNTI so each candidate test runs on a tiny pcap
-        with tempfile.NamedTemporaryFile(prefix="lte-bf-small-", suffix=".pcap", delete=False) as tf:
-            tmp_small = Path(tf.name)
-        subprocess.run(["tshark", "-r", str(tmp_full), "-Y", f"mac-lte.rnti=={rnti}", "-w", str(tmp_small)],
-                       capture_output=True, text=True, timeout=180)
-        baseline = _decode_count(tmp_small, rnti, None)
-        res["baseline"] = baseline
-        strong = baseline + 5  # a clear win → stop early
-        best_nas = None; best_d = None; best_cnt = baseline
-        for nas in range(nas_lo, nas_hi + 1):
-            d = keyderiv.derive_keys(kasme=kasme, nas_count=nas, cipher_algo=cipher_algo, integ_algo=integ_algo)
-            key = {"rrc": d["rrcenc_key"], "up": d["upenc_key"], "cipher": cipher_algo, "integ": integ_algo}
-            cnt = _decode_count(tmp_small, rnti, key)
-            res["tested"] += 1
-            if cnt > best_cnt:
-                best_cnt, best_nas, best_d = cnt, nas, d
-            if cnt >= strong:
-                best_cnt, best_nas, best_d = cnt, nas, d
-                break
-        if best_d is not None and (best_cnt - baseline) >= _BF_MIN_DELTA:
-            res.update({"ok": True, "found": True, "nas_count": best_nas, "decode_count": best_cnt,
-                        "k_enb": best_d["k_enb"], "rrcenc_key": best_d["rrcenc_key"],
-                        "rrcint_key": best_d["rrcint_key"], "upenc_key": best_d["upenc_key"],
-                        "upint_key": best_d["upint_key"]})
-        else:
-            res["ok"] = True
-            res["note"] = (f"No NAS count in {nas_lo}–{nas_hi} decrypted RNTI 0x{rnti:04x} "
-                           f"(baseline {baseline}, best {best_cnt} over {res['tested']} tried). "
-                           f"Check K_ASME / cipher / RNTI, or widen the range.")
-        return res
-    except subprocess.TimeoutExpired:
-        res["error"] = "tshark timed out"; return res
-    except Exception as ex:  # noqa: BLE001
-        res["error"] = f"{type(ex).__name__}: {ex}"; return res
-    finally:
-        for t in (tmp_full, tmp_small):
-            try:
-                if t and t.exists():
-                    t.unlink()
-            except OSError:
-                pass
-
-
-# ---------------------------------------------------------------------------
 # Modular capture splitting
 #
 # Partition a capture into sub-pcaps along one or more ordered "dimensions".
 # Each dimension yields a list of (bucket_label, tshark_filter); nesting ANDs
 # the filters down a folder tree. Adding a new way to split = one entry in
-# _SPLIT_DIMS. Decryption is orthogonal: when keys are supplied the filters run
-# against the deciphered view and a .uat sidecar is written alongside.
+# _SPLIT_DIMS.
 # ---------------------------------------------------------------------------
 _SPLIT_MAX_LEAVES = 300          # hard cap on output pcaps to avoid blow-ups
 _SPLIT_RNTI_CAP = 64             # most-active C-RNTIs to keep for rnti/identity
@@ -845,16 +456,12 @@ def _build_split_ctx(full: Path) -> dict:
     return {"rnti_counts": {rn: counts[rn] for rn in keep}, "idmap": idmap}
 
 
-def _split_oargs(keys: list[dict]) -> list[str]:
-    o = ["-o", "pdcp-lte.decipher_signalling:TRUE", "-o", "pdcp-lte.decipher_userplane:TRUE",
-         "-o", "pdcp-lte.show_user_plane_as_ip:TRUE", "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE"]
-    if keys:
-        o += ["-o", f"pdcp-lte.default_ciphering_algorithm:{keys[0]['cipher']}",
-              "-o", f"pdcp-lte.default_integrity_algorithm:{keys[0]['integ']}"]
-        for k in keys:
-            if k["rnti"] is not None:
-                o += ["-o", f'uat:pdcp_lte_ue_keys:"{k["rnti"]}","{k["rrc"]}","{k["up"]}",""']
-    return o
+# MAC→PDCP dissection prefs so the packet_type / security dimensions can classify
+# frames (cleartext SRB SDUs → RRC, user-plane → IP). No keys / no deciphering:
+# ciphered frames stay ciphered and fall into the "ciphered" bucket.
+_DISSECT_OARGS = [
+    "-o", "pdcp-lte.show_user_plane_as_ip:TRUE", "-o", "mac-lte.attempt_to_dissect_srb_sdus:TRUE",
+]
 
 
 def _count_pcap(p: Path) -> int:
@@ -907,8 +514,7 @@ def _split_partition(full: Path, parent: Path, dims: list[str], depth: int, acc:
                 except OSError: pass
 
 
-def split_capture(cfg: SnifferConfig, input_path: str, dims: list[str],
-                  entries: list[dict] | None = None, decrypt: bool = False) -> dict:
+def split_capture(cfg: SnifferConfig, input_path: str, dims: list[str]) -> dict:
     """Partition a capture into nested sub-pcaps along the ordered `dims`.
     Returns a manifest (never raises to the caller)."""
     res: dict = {"ok": False, "error": None, "folder": None, "note": None, "files": [], "leaves": 0}
@@ -927,32 +533,18 @@ def split_capture(cfg: SnifferConfig, input_path: str, dims: list[str],
     if not shutil.which("tshark"):
         res["error"] = "tshark not found on PATH"; return res
 
-    keys: list[dict] = []
-    for e in (entries or []):
-        try:
-            rrc, up = _resolve_entry_keys(e)
-        except ValueError as ke:
-            res["error"] = str(ke); return res
-        rn = str(e.get("rnti", "")).strip()
-        keys.append({"rnti": int(rn) if rn not in ("", "None") else None,
-                     "rrc": rrc, "up": up,
-                     "cipher": str(e.get("cipher_algo", "EEA2")), "integ": str(e.get("integ_algo", "EIA2"))})
-    do_decrypt = decrypt and bool(keys)
-
     stem, d = src.stem, src.parent
     folder = d / f"{stem}_split"
     try:
         folder.mkdir(exist_ok=True)
+        # Full pcap copy: byte-identical to the source, so its frame numbers are
+        # the same indices as the original dual-sniff capture.
         full = folder / f"{stem}_full.pcap"
-        _rewrite_ueid_eq_rnti(src, full)
+        shutil.copy(src, full)
         ctx = _build_split_ctx(full)
-        # Always enable MAC→PDCP dissection so packet_type/security classify even
-        # without keys (ciphered frames stay ciphered → "ciphered" bucket). Key
-        # UAT rows are only added when decrypting.
-        oargs = _split_oargs(keys)
-        if do_decrypt:
-            rows = [f'"{k["rnti"]}","{k["rrc"]}","{k["up"]}",""' for k in keys if k["rnti"] is not None]
-            (folder / f"{stem}.pdcp_lte_ue_keys.uat").write_text("\n".join(rows) + "\n")
+        # Always enable MAC→PDCP dissection so packet_type/security classify
+        # (ciphered frames stay ciphered → "ciphered" bucket).
+        oargs = _DISSECT_OARGS
         budget = [_SPLIT_MAX_LEAVES]
         _split_partition(full, folder, dims, 0, "", ctx, oargs, res, budget)
         if budget[0] <= 0:
@@ -962,7 +554,7 @@ def split_capture(cfg: SnifferConfig, input_path: str, dims: list[str],
             res["note"] = (res["note"] or "") + " No non-empty buckets produced for these dimensions."
         import json as _json
         (folder / "split.json").write_text(_json.dumps(
-            {"source": str(src), "dims": dims, "decrypt": do_decrypt, "files": res["files"]}, indent=2))
+            {"source": str(src), "dims": dims, "files": res["files"]}, indent=2))
         res["folder"] = str(folder); res["leaves"] = len(res["files"]); res["ok"] = True
         return res
     except subprocess.TimeoutExpired:

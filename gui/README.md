@@ -2,12 +2,16 @@
 
 An operator-facing web GUI for the [LTESniffer](../README.md) C++ tool. Adds
 a live JSON event stream from the sniffer, a configuration page covering every
-CLI flag, a key management page for PDCP decryption, a built-in spectrum
-analyzer launcher, and a captures browser.
+CLI flag, a built-in spectrum analyzer launcher, and a captures browser.
+
+> **Capture-only build** (branch `sniffer-nodecrypt`): all PDCP decryption /
+> key-management features have been removed. Everything else — capturing
+> pcaps, config, sessions, dashboard, spectrum, Wireshark, and logs — is
+> unchanged.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ LTESniffer  Dashboard  Keys  Config         ● connected  ● running       │
+│ LTESniffer  Dashboard  Config               ● connected  ● running       │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ [▶ Start] [■ Stop] [⟳ Restart] [📡 Spectrum]   ● Cell PCI 271  50 PRB    │
 ├──────────────────────────────────────────────────────────────────────────┤
@@ -29,7 +33,7 @@ analyzer launcher, and a captures browser.
 └───────────┘                   └────────────┘               └────────────┘
       │                               │
       ▼                               ▼
-   pcap files          ~/.config/ltesniffer-gui/{config,keys}.json
+   pcap files          ~/.config/ltesniffer-gui/config.json
    (in captures_dir)
 ```
 
@@ -37,10 +41,10 @@ analyzer launcher, and a captures browser.
   decoded subframe + cell / MIB / stats / lifecycle events. See
   [PROTOCOL.md](./PROTOCOL.md) for the schema.
 - Backend (Python / FastAPI) manages the sniffer subprocess, reads its FIFO,
-  broadcasts events over a WebSocket, persists config + keys, and exposes a
+  broadcasts events over a WebSocket, persists config, and exposes a
   small REST control plane.
 - Frontend (React + Vite + Tailwind) consumes the WebSocket, renders the live
-  dashboard, and POSTs config / keys / capture-control changes.
+  dashboard, and POSTs config / capture-control changes.
 
 ## Dependencies
 
@@ -230,26 +234,6 @@ the top of the page (clicking copies a sample rfargs string into the field).
 "Save" persists to `~/.config/ltesniffer-gui/config.json`; "Save & Restart"
 also restarts the capture with the new args.
 
-### Decryption keys
-
-A dedicated **Keys** page lets the operator add per-RNTI key material that
-LTESniffer uses to decrypt PDCP DRBs in real time (via the existing `-K
-<file>` flag). Two input modes per RNTI:
-
-- **Path A — K_eNB direct** — paste the 64-hex-char K_eNB (e.g. extracted
-  from an MME debug log or test UE).
-- **Path B — KASME + NAS uplink count** — the sniffer derives K_eNB
-  internally via 3GPP TS 33.401 §A.2.
-
-Optional **cipher / integrity algorithms** (EEA0–EEA3 / EIA0–EIA3) and an
-**HFN hint** for mid-session join. Validates 64-char hex / non-negative
-counts client-side, posts to `/api/keys`, writes a C++-compatible JSON file
-at `~/.config/ltesniffer-gui/keys.json`, and auto-wires that path into
-SnifferConfig so the next "Save & restart capture" picks it up.
-
-Decrypted IP packets land in `<captures_dir>/ltesniffer_<mode>_decrypted_ip.pcap`,
-listed in the Captures tab with download buttons.
-
 ### Captures
 
 `/api/captures` enumerates `.pcap` files in the captures directory plus
@@ -271,7 +255,6 @@ are rejected with 403.
 | GET    | `/api/usrps`                    | Result of `uhd_find_devices`             |
 | GET    | `/api/captures`                 | List pcaps in allowed roots              |
 | GET    | `/api/captures/download?path=…` | Stream a pcap (allowlist-checked)        |
-| GET / PUT | `/api/keys`                  | Per-RNTI decryption keys                 |
 | GET    | `/api/spectrum`                 | Status + pre-flight checks               |
 | POST   | `/api/spectrum/launch`          | Spawn uhd_fft / gqrx (body: freq, sr, tool, device_args) |
 | POST   | `/api/spectrum/stop`            | Terminate the spectrum process           |
@@ -309,7 +292,6 @@ gui/
 │   ├── sniffer.py              # Subprocess + FIFO reader (real mode)
 │   ├── mock.py                 # Synthetic events (no SDR needed)
 │   ├── config.py               # SnifferConfig + argv builder + persistence
-│   ├── keys.py                 # KeyEntry persistence + C++ format conversion
 │   ├── captures.py             # Pcap discovery + safe download
 │   ├── spectrum.py             # uhd_fft / gqrx launcher + preflight
 │   └── usrp.py                 # uhd_find_devices wrapper
@@ -320,7 +302,6 @@ gui/
         ├── App.tsx, main.tsx, index.css
         ├── pages/
         │   ├── Dashboard.tsx
-        │   ├── Keys.tsx
         │   └── Config.tsx
         ├── components/
         │   ├── StatusBar.tsx
@@ -337,7 +318,7 @@ gui/
         └── lib/
             ├── store.ts        # context + reducer + WS connection
             ├── api.ts          # REST client
-            ├── types.ts        # Event / Config / Keys types
+            ├── types.ts        # Event / Config types
             ├── color.ts        # Deterministic RNTI / power color maps
             └── useStableTick.ts# Slow-render hook for calmer numeric tiles
 ```
@@ -362,5 +343,4 @@ src/include/LTESniffer_Core.h src/src/LTESniffer_Core.cc ← register emitter,
 | `No devices found for ----->Empty Device Address` | Pick a specific USRP in the spectrum popover; the picker passes `-a serial=…`.            |
 | `Could not find path for image: usrp_b200_fw.hex` | `sudo /lib/x86_64-linux-gnu/uhd/utils/uhd_images_downloader.py`                          |
 | Captures tab is empty                          | The sniffer runs with cwd=`captures_dir` (Config page). Pcaps from previous runs in other dirs only appear if those dirs are under one of the allowed roots in `captures.py`. |
-| Keys page saves but decryption doesn't happen  | Click **Save & restart capture** so the new `-K` is on the argv. Check the Logs tab for `[KeyAttach]` messages. |
 | `sudo: a password is required`                 | Either run uvicorn under `sudo`, or set up a passwordless sudoers entry as documented above. |

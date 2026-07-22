@@ -4,7 +4,6 @@ import { StoreProvider } from "./lib/store";
 import { StatusBar } from "./components/StatusBar";
 import { Dashboard } from "./pages/Dashboard";
 import { ConfigPage } from "./pages/Config";
-import { KeysPage } from "./pages/Keys";
 import { HelpPage } from "./pages/Help";
 import { LoginPage } from "./pages/Login";
 import { CapturesPage } from "./pages/CapturesPage";
@@ -68,7 +67,6 @@ export default function App() {
             <Route path="/ues"         element={<UEsPage />} />
             <Route path="/sessions"    element={<SessionsPage />} />
             <Route path="/config"      element={<ConfigPage />} />
-            <Route path="/keys"        element={<KeysPage />} />
             <Route path="/captures"    element={<CapturesPage />} />
             <Route path="/log-history" element={<LogHistoryPage />} />
             <Route path="/help"        element={<HelpPage />} />

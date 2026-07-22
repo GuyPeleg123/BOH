@@ -682,9 +682,9 @@ class SnifferRunner:
     def _prune_empty_outputs(self) -> None:
         """Delete output files LTESniffer always opens but only fills in specific
         modes: api_collector.pcap (-z API/IMSI mode), iq_sample_dl.bin /
-        ul_sample.raw (IQ-dump mode), *_decrypted_ip.pcap (-K decrypt with a DRB
-        hit). When a run doesn't use that mode they stay empty (0 bytes, or a
-        24-byte pcap header), so the run folder keeps only real output. Strictly
+        ul_sample.raw (IQ-dump mode). When a run doesn't use that mode they stay
+        empty (0 bytes, or a 24-byte pcap header), so the run folder keeps only
+        real output. Strictly
         conditional on emptiness — anything with real content is left untouched.
         The main *_dual_mode.pcap is never touched (it's the run record)."""
         run_dir = self._run_dir
@@ -696,7 +696,7 @@ class SnifferRunner:
                 if f.is_file() and f.stat().st_size == 0:
                     f.unlink()
             for f in run_dir.glob("*.pcap"):
-                if (f.name == "api_collector.pcap" or f.name.endswith("_decrypted_ip.pcap")) \
+                if f.name == "api_collector.pcap" \
                         and f.is_file() and f.stat().st_size <= self._EMPTY_PCAP_HDR:
                     f.unlink()
         except OSError:

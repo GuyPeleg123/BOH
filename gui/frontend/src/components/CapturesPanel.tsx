@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { CapturesResponse, CaptureFile } from "../lib/types";
 import { useStore } from "../lib/store";
-import { DecryptModal } from "./DecryptModal";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -67,8 +66,6 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
   const state = { lifecycle };
   const [resp, setResp] = useState<CapturesResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [decryptTarget, setDecryptTarget] = useState<CaptureFile | null>(null);
-  const [decryptOpen, setDecryptOpen] = useState(false);
   const [view, setView] = useState<"tree" | "flat">("tree");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [seeded, setSeeded] = useState(false);
@@ -130,21 +127,14 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
           {empty ? "—" : fmtBytes(c.size)}
         </span>
         <span className="shrink-0 w-24 text-right text-sm text-muted tabular-nums">{fmtAge(c.mtime)}</span>
-        <div className="shrink-0 flex items-center justify-end gap-2 w-[210px]">
+        <div className="shrink-0 flex items-center justify-end gap-2 w-[140px]">
           {empty ? (
             <span className="text-muted text-xs italic pr-2">writing…</span>
           ) : (
-            <>
-              <a className="btn btn-secondary !px-3 !py-1.5 !text-xs !gap-1.5"
-                 href={api.downloadCaptureUrl(c.path)} download={c.name} title="Download this pcap">
-                <span aria-hidden>↓</span><span className="hidden lg:inline">Download</span>
-              </a>
-              <button className="btn btn-primary !px-3 !py-1.5 !text-xs !gap-1.5"
-                      title="Decrypt with PDCP keys"
-                      onClick={() => { setDecryptTarget(c); setDecryptOpen(true); }}>
-                <span aria-hidden>🔓</span><span className="hidden lg:inline">Decrypt</span>
-              </button>
-            </>
+            <a className="btn btn-secondary !px-3 !py-1.5 !text-xs !gap-1.5"
+               href={api.downloadCaptureUrl(c.path)} download={c.name} title="Download this pcap">
+              <span aria-hidden>↓</span><span className="hidden lg:inline">Download</span>
+            </a>
           )}
         </div>
       </div>
@@ -224,8 +214,6 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
             </div>
           )}
 
-          <button className="btn btn-secondary" title="Pick any pcap on the machine to decrypt (opens in the captures folder)"
-                  onClick={() => { setDecryptTarget(null); setDecryptOpen(true); }}>🔓 Decrypt a file…</button>
           <button className="btn btn-secondary" title="Reload the capture list now" onClick={refresh}>↻ Refresh</button>
         </div>
       </div>
@@ -237,7 +225,7 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
           <span className="pl-8">Name</span>
           <span className="ml-auto w-28 text-right">Size</span>
           <span className="w-24 text-right">Modified</span>
-          <span className="w-[210px] text-right pr-2">Actions</span>
+          <span className="w-[140px] text-right pr-2">Actions</span>
         </div>
 
         {view === "tree"
@@ -255,10 +243,6 @@ export function CapturesPanel({ embedded = false }: { embedded?: boolean }) {
         )}
         {err && <div className="text-center text-bad py-4 font-mono text-sm">{err}</div>}
       </div>
-
-      {decryptOpen && (
-        <DecryptModal file={decryptTarget} onClose={() => setDecryptOpen(false)} onDone={refresh} />
-      )}
     </div>
   );
 
