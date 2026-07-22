@@ -110,6 +110,24 @@ export interface SnifferConfig {
   sudo: boolean;
   auto_split_enabled?: boolean;
   auto_split_dims?: string[];
+  pcap_forward_enabled?: boolean;
+  pcap_forward_host?: string;
+  pcap_forward_port?: number;
+  pcap_forward_compress?: boolean;
+}
+
+export interface ForwardStatus {
+  enabled: boolean;
+  state: "idle" | "starting" | "connected" | "retrying" | "error";
+  host: string;
+  port: number;
+  compress: boolean;
+  bytes_in: number;
+  records: number;
+  bytes_out: number;
+  connected_since: number | null;
+  connects: number;
+  last_error: string | null;
 }
 
 export interface CaptureFile {

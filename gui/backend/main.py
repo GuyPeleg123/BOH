@@ -23,6 +23,7 @@ import config as config_mod
 from config import SnifferConfig
 from sniffer import SnifferRunner
 import sniffer as sniffer_mod
+import pcap_forward
 from mock import MockRunner
 from usrp import find_devices, auto_config_patch, probe_all_gpsdo
 from spectrum import SpectrumLauncher
@@ -336,6 +337,12 @@ async def metrics_endpoint():
 @app.get("/api/config", response_model=SnifferConfig)
 async def get_config() -> SnifferConfig:
     return config_mod.load()
+
+
+@app.get("/api/forward/status")
+async def get_forward_status() -> dict:
+    """Live pcap-forwarding status (state / bytes / reconnects) for the GUI."""
+    return pcap_forward.forwarder.status()
 
 
 @app.put("/api/config", response_model=SnifferConfig)

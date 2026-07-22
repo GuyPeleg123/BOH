@@ -21,6 +21,7 @@ from typing import Any, AsyncIterator, Optional
 
 import re
 
+import pcap_forward
 from config import SnifferConfig
 
 
@@ -372,12 +373,28 @@ class SnifferRunner:
         # as an actual FIFO. The C++ side opens it O_WRONLY|O_NONBLOCK, which
         # fails with ENXIO if no reader is connected — log a hint so the user
         # knows to open Wireshark *before* hitting Start.
-        if cfg.pcap_stream_fifo:
+        # The live-stream FIFO feeds both the Wireshark button and live pcap
+        # forwarding. Forwarding needs it, so auto-provision a default path when
+        # the user enabled forwarding but left the FIFO unset.
+        stream_fifo = cfg.pcap_stream_fifo
+        if cfg.pcap_forward_enabled and not stream_fifo:
+            stream_fifo = "/tmp/lte_forward.pcap"
+        if stream_fifo:
             try:
-                _ensure_stream_fifo(cfg.pcap_stream_fifo)
+                _ensure_stream_fifo(stream_fifo)
             except (PermissionError, OSError) as e:
                 self._cleanup_fifo()
                 raise PermissionError(f"pcap_stream_fifo rejected: {e}")
+
+        # Start the live-pcap forwarder BEFORE the child opens the FIFO for write
+        # (its O_WRONLY|O_NONBLOCK open ENXIOs without a reader). The forwarder
+        # opens the read-end synchronously, so a reader is guaranteed present.
+        if cfg.pcap_forward_enabled and stream_fifo:
+            pcap_forward.forwarder.start(
+                stream_fifo, cfg.pcap_forward_host, cfg.pcap_forward_port,
+                cfg.pcap_forward_compress)
+        else:
+            pcap_forward.forwarder.stop()
 
         self._state.update(
             running=True,
@@ -396,8 +413,8 @@ class SnifferRunner:
         # Pass the live-stream FIFO path via the environment (preserved across
         # sudo by a scoped `env_keep` rule) instead of a `sudo env …` prefix.
         child_env = dict(os.environ)
-        if cfg.pcap_stream_fifo:
-            child_env["LTESNIFFER_PCAP_STREAM"] = cfg.pcap_stream_fifo
+        if stream_fifo:
+            child_env["LTESNIFFER_PCAP_STREAM"] = stream_fifo
 
         # Per-UE wide UL timing search: for grants clearing UL_TIMING_ACQ_MINDB of
         # allocated-RB energy, scan a wide FFT-window range and centre on that UE's
@@ -521,6 +538,9 @@ class SnifferRunner:
           3. Reap the sudo wrapper if it's somehow still around (rare — sudo
              usually exits when its child does).
         """
+        # Tear down the live-pcap forwarder first (safe/no-op if it wasn't running).
+        pcap_forward.forwarder.stop()
+
         if not self.running or self._proc is None:
             return
 

@@ -1,4 +1,4 @@
-import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KnownCellsResponse, BrowseResponse, SessionsResponse, CellIdResponse, PinCellResponse } from "./types";
+import type { SnifferConfig, USRPDevice, RuntimeState, CapturesResponse, KnownCellsResponse, BrowseResponse, SessionsResponse, CellIdResponse, PinCellResponse, ForwardStatus } from "./types";
 
 // ---- Session-cookie auth ---------------------------------------------------
 //
@@ -62,6 +62,7 @@ export const api = {
       body: JSON.stringify(cfg),
     }),
   status: () => req<{ state: RuntimeState; mock: boolean }>("/api/status"),
+  forwardStatus: () => req<ForwardStatus>("/api/forward/status"),
   cellId: () => req<CellIdResponse>("/api/cell-id"),
   pinCell: () => req<PinCellResponse>("/api/pin-cell", { method: "POST" }),
   pinCellStop: () => req<{ ok: boolean }>("/api/pin-cell/stop", { method: "POST" }),

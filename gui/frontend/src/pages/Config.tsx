@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { SnifferConfig, USRPDevice } from "../lib/types";
+import type { SnifferConfig, USRPDevice, ForwardStatus } from "../lib/types";
 
 // Fields that auto-detect is allowed to overwrite
 const HARDWARE_KEYS = new Set(["sniffer_mode", "rf_args", "usrp_a_args", "usrp_b_args"]);
@@ -132,6 +132,18 @@ const SECTIONS: Section[] = [
     ],
   },
   {
+    title: "Live pcap forwarding",
+    fields: [
+      { key: "pcap_forward_enabled", label: "Forward live pcap to a remote IP", flag: "",
+        hint: "During a capture, push the live MAC-LTE pcap to a collector over TCP (PCAP-over-IP). The on-disk pcap is still written in full. Uses the live-stream FIFO above (auto-created if unset). Note: this and the local Wireshark button both read that FIFO, so use one at a time." },
+      { key: "pcap_forward_host", label: "Destination IP / host", flag: "", widget: "text",
+        hint: "The appliance connects OUT to this address and pushes the stream. On the receiver: `nc -l -p PORT | wireshark -k -i -` (live) or `… > live.pcap` (record). For compressed, insert `| zstd -d` before wireshark." },
+      { key: "pcap_forward_port", label: "Destination port", flag: "" },
+      { key: "pcap_forward_compress", label: "Compress the stream (zstd, binary)", flag: "",
+        hint: "On (default): zstd-compressed binary stream (~2.5× smaller on the wire); receiver pipes through `zstd -d`. Off: raw libpcap — open directly in Wireshark with no extra step." },
+    ],
+  },
+  {
     title: "GUI",
     fields: [
       { key: "binary_path",  label: "LTESniffer binary path", flag: "", widget: "text" },
@@ -141,6 +153,47 @@ const SECTIONS: Section[] = [
     ],
   },
 ];
+
+function fmtKB(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1048576).toFixed(2)} MB`;
+}
+
+// Live status for the pcap forwarder — polls /api/forward/status while the page
+// is open. Only shown when forwarding is enabled (in config) or currently active.
+function ForwardStatusStrip({ enabled }: { enabled: boolean }) {
+  const [st, setSt] = useState<ForwardStatus | null>(null);
+  useEffect(() => {
+    let live = true;
+    const tick = () => api.forwardStatus().then((s) => { if (live) setSt(s); }).catch(() => {});
+    tick();
+    const iv = setInterval(tick, 2000);
+    return () => { live = false; clearInterval(iv); };
+  }, []);
+  if (!enabled && !(st && st.enabled)) return null;
+  const s = st;
+  const color =
+    !s ? "text-muted border-border" :
+    s.state === "connected" ? "text-ok border-ok/40 bg-ok/5" :
+    s.state === "retrying" ? "text-warn border-warn/40 bg-warn/5" :
+    s.state === "error" ? "text-bad border-bad/40 bg-bad/5" :
+    "text-muted border-border";
+  return (
+    <div className={`panel p-3 mb-4 flex items-center gap-4 flex-wrap border ${color}`}>
+      <span className="font-semibold text-sm">Live forward: {s ? s.state : "…"}</span>
+      {s && s.enabled && (
+        <>
+          <span className="text-sm text-slate-200">→ {s.host}:{s.port} <span className="text-muted">{s.compress ? "(zstd)" : "(raw)"}</span></span>
+          <span className="text-sm tabular-nums text-slate-300">
+            sent {fmtKB(s.bytes_out)} · {s.records.toLocaleString()} rec · {s.connects} conn
+          </span>
+          {s.last_error && <span className="text-bad text-xs font-mono truncate max-w-[46ch]" title={s.last_error}>{s.last_error}</span>}
+        </>
+      )}
+    </div>
+  );
+}
 
 export function ConfigPage() {
   const lifecycle = useStore((s) => s.lifecycle);
@@ -608,6 +661,8 @@ export function ConfigPage() {
           </div>
         </div>
       )}
+
+      <ForwardStatusStrip enabled={!!cfg.pcap_forward_enabled} />
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {SECTIONS.map((s) => (

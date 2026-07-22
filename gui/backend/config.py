@@ -133,6 +133,16 @@ class SnifferConfig(BaseModel):
     auto_split_enabled: bool = Field(False, description="Split each finished capture automatically.")
     auto_split_dims: list[str] = Field(default_factory=list, description="Ordered split dimensions, e.g. ['identity','packet_type'].")
 
+    # --- Live pcap forwarding (backend-side; push the live pcap to a remote
+    # collector DURING the run). The backend forwarder reads the live-stream FIFO
+    # and connects OUT to host:port ("PCAP-over-IP", optionally zstd-compressed).
+    # NONE of these reach the C++ argv — they only drive the backend forwarder.
+    # Enabling it auto-provisions pcap_stream_fifo at capture start if unset. ---
+    pcap_forward_enabled: bool = Field(False, description="Push the live pcap to a remote collector during capture.")
+    pcap_forward_host: str = Field("", description="Destination IP/host to connect out to and push the live pcap.")
+    pcap_forward_port: int = Field(0, ge=0, le=65535, description="Destination TCP port for live pcap forwarding.")
+    pcap_forward_compress: bool = Field(True, description="zstd-compress the forwarded stream (binary/compact). Off = raw libpcap for live Wireshark.")
+
     def to_argv(self, json_output_path: str) -> list[str]:
         """Render to argv for subprocess.Popen.
 
