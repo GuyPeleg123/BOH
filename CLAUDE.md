@@ -5,7 +5,7 @@ short and factual; role-specific behavior lives in `.claude/agents/*.md`.
 
 ## What this is
 A FALCON/srsRAN-based dual-mode LTE sniffer (this fork = `GuyPeleg123/BOH`,
-branch `multi-usrp`; local clone at `~/work/LTESniffer`). Captures DL+UL with two
+main trunk `develop`; local clone at `~/work/LTESniffer`). Captures DL+UL with two
 USRP B210s and writes MAC-LTE pcaps.
 
 ## Stack & layout
@@ -46,6 +46,6 @@ C++ changes require rebuilding + re-shipping the full ~600 MB appliance, so
 - **Verify everything against real artifacts** — run it, test on real captures /
   known vectors, show the output. No "looks correct" without evidence.
 - Match surrounding code style; no unrequested scope or dependencies.
-- **Commit/push only when the user asks.** Branch is `multi-usrp` on origin
+- **Commit/push only when the user asks.** The main trunk is `develop` on origin
   `GuyPeleg123/BOH`. End commit messages with the Co-Authored-By trailer.
 - Keep `dist/` rebuilt when frontend changes; restart the backend to serve it.
