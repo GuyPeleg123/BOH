@@ -343,6 +343,19 @@ class SnifferRunner:
         if diag and argv[:2] == ["sudo", "-n"]:
             argv = argv[2:]
 
+        # Real-time scheduling for the capture. The host's rtprio limit is 0, so
+        # the USRP RX threads can't self-elevate to SCHED_FIFO ("Failed to set
+        # thread priority") — the OS preempts them and the B210 buffer overflows,
+        # dropping ~2% of samples per radio (measured with benchmark_rate: 184
+        # overruns/10.5M dropped at 23.04 Msps → 0/0 under `chrt -f 50`). Dropped
+        # samples corrupt the RX stream and disproportionately kill the marginal
+        # UL. Wrap the launch in `chrt -f` to force SCHED_FIFO. Only on the sudo
+        # path — chrt needs privilege to set RT; diag mode runs unprivileged.
+        # `chrt` execs into LTESniffer (no extra process), so the kill-wrapper
+        # still finds the binary by name on stop.
+        if argv[:2] == ["sudo", "-n"]:
+            argv = argv[:2] + ["chrt", "-f", "50"] + argv[2:]
+
         # NOTE on -H (FALCON RNTI-histogram threshold, default 5): a single back-to-back
         # test once suggested -H 2 gave ~3x UL frames, but a rigorous ABBA-balanced
         # interleaved A/B (12x120s, 2026-07-19) found NO statistically significant
