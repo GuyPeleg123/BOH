@@ -2,6 +2,50 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { useStore, shallow } from "../lib/store";
 import { api } from "../lib/api";
+import type { ForwardStatus, ReceiveStatus } from "../lib/types";
+
+// Cross-machine link status — is THIS instance actually talking to the
+// other one, not just "is my own browser tab's websocket alive" (that's
+// the separate connected/disconnected dot below). Polls the matching
+// status endpoint for whichever role this build is; caller passes which.
+function LinkStatus({ kind }: { kind: "forward" | "receive" }) {
+  const [st, setSt] = useState<ForwardStatus | ReceiveStatus | null>(null);
+  useEffect(() => {
+    let live = true;
+    const tick = () => {
+      const p = kind === "forward" ? api.forwardStatus() : api.receiveStatus();
+      p.then((s) => { if (live) setSt(s); }).catch(() => {});
+    };
+    tick();
+    const iv = setInterval(tick, 2000);
+    return () => { live = false; clearInterval(iv); };
+  }, [kind]);
+
+  const linked = st?.state === "connected";
+  const label =
+    !st || !st.enabled ? "not configured"
+    : st.state === "connected" ? "linked"
+    : st.state === "listening" ? "waiting"
+    : st.state;
+  const target =
+    kind === "forward" && st && "host" in st && st.host ? `→ ${st.host}:${st.port}`
+    : kind === "receive" && st && "peer" in st && st.peer ? `← ${st.peer}`
+    : null;
+
+  return (
+    <span
+      className={`flex items-center gap-1.5 ${linked ? "text-ok" : "text-muted"}`}
+      title={
+        kind === "forward"
+          ? "Live pcap forwarding — is this capture instance actually connected to a decrypt instance right now"
+          : "Pcap receiving — is a capture instance actually connected and pushing data right now"
+      }
+    >
+      <span className={`inline-block w-2 h-2 rounded-full ${linked ? "bg-ok animate-pulse" : "bg-muted"}`} />
+      link: {label}{target && <span className="text-muted">&nbsp;{target}</span>}
+    </span>
+  );
+}
 
 async function handleLogout() {
   // Drop server session + cookie, then force a hard reload to nuke any
@@ -11,7 +55,13 @@ async function handleLogout() {
   if (typeof window !== "undefined") window.location.reload();
 }
 
-export function StatusBar() {
+export type NavTab = { path: string; label: string };
+
+export function StatusBar({ tabs, showCaptureStatus = true, linkKind }: {
+  tabs: NavTab[];
+  showCaptureStatus?: boolean;
+  linkKind?: "forward" | "receive";
+}) {
   // Only re-render when the connection / lifecycle status or cell identity changes.
   const state = useStore((s) => ({
     connected: s.connected,
@@ -59,17 +109,12 @@ export function StatusBar() {
       </div>
 
       <nav className="flex gap-1.5 shrink-0">
-        {tab("/", "Dashboard")}
-        {tab("/ues", "UEs")}
-        {tab("/sessions", "Sessions")}
-        {tab("/config", "Config")}
-        {tab("/captures", "Captures")}
-        {tab("/log-history", "Log History")}
-        {tab("/help", "Help")}
+        {tabs.map((t) => <span key={t.path}>{tab(t.path, t.label)}</span>)}
       </nav>
 
       <div className="ml-auto flex items-center gap-3.5 text-sm">
-        {/* Connection state */}
+        {/* Connection state — this backend's own websocket, not the cross-
+            machine link (that's the separate "link:" indicator below). */}
         <span
           className={`flex items-center gap-1.5 ${state.connected ? "text-ok" : "text-bad"}`}
           title={state.connected ? "WebSocket connected" : "WebSocket disconnected — backend may be down"}
@@ -78,22 +123,30 @@ export function StatusBar() {
           {state.connected ? "connected" : "disconnected"}
         </span>
 
-        {/* Capture lifecycle */}
-        <span
-          className={`flex items-center gap-1.5 ${running ? "text-ok" : "text-muted"}`}
-          title={running ? `Sniffer running (pid ${state.pid})` : "Sniffer stopped"}
-        >
-          <span className={`inline-block w-2 h-2 rounded-full ${running ? "bg-ok animate-pulse" : "bg-muted"}`} />
-          {running ? <span>running <span className="text-muted">· pid {state.pid}</span></span> : "stopped"}
-        </span>
+        {/* Cross-machine link — is this instance actually connected to the
+            other one (forwarding out, or receiving in) right now. */}
+        {linkKind && <LinkStatus kind={linkKind} />}
 
-        {/* Cell identity */}
-        {state.cell && (
-          <span className="text-muted hidden md:inline whitespace-nowrap">
-            PCI <span className="text-slate-100 font-mono">{state.cell.pci}</span> ·{" "}
-            <span className="font-mono">{state.cell.nof_prb}</span>&nbsp;PRB ·{" "}
-            <span className="font-mono">{(state.cell.dl_freq / 1e6).toFixed(1)}</span>&nbsp;MHz
-          </span>
+        {/* Capture lifecycle + cell identity — only meaningful on an instance
+            that actually runs a capture. */}
+        {showCaptureStatus && (
+          <>
+            <span
+              className={`flex items-center gap-1.5 ${running ? "text-ok" : "text-muted"}`}
+              title={running ? `Sniffer running (pid ${state.pid})` : "Sniffer stopped"}
+            >
+              <span className={`inline-block w-2 h-2 rounded-full ${running ? "bg-ok animate-pulse" : "bg-muted"}`} />
+              {running ? <span>running <span className="text-muted">· pid {state.pid}</span></span> : "stopped"}
+            </span>
+
+            {state.cell && (
+              <span className="text-muted hidden md:inline whitespace-nowrap">
+                PCI <span className="text-slate-100 font-mono">{state.cell.pci}</span> ·{" "}
+                <span className="font-mono">{state.cell.nof_prb}</span>&nbsp;PRB ·{" "}
+                <span className="font-mono">{(state.cell.dl_freq / 1e6).toFixed(1)}</span>&nbsp;MHz
+              </span>
+            )}
+          </>
         )}
 
         {/* User + logout */}

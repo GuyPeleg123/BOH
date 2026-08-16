@@ -19,7 +19,12 @@ import io
 import json
 from pathlib import Path
 from statistics import median, mean
-from typing import Iterable
+from typing import Any, Iterable
+
+from fastapi import APIRouter, HTTPException
+
+import config as config_mod
+import captures as captures_mod
 
 
 def _iter_session(path: Path) -> Iterable[dict]:
@@ -124,3 +129,29 @@ def analyze_rnti_churn(path: Path) -> dict:
         "lifetime_seconds":   _stats(lifetimes),
         "reuse_delay_seconds":_stats(reuse_delays),
     }
+
+
+# Route lives HERE, not in main.py — main.py only app.include_router()s this
+# module when GUI_ROLE=="decrypt". A capture-role deployment that omits this
+# file has no /api/analytics/rnti-churn route at all.
+router = APIRouter()
+
+
+@router.get("/api/analytics/rnti-churn")
+async def analytics_rnti_churn_route(path: str) -> dict[str, Any]:
+    """Run the RNTI churn analyzer against a recorded session.
+
+    `path` must point to a .jsonl.zst file under the session dir or the
+    pcap-allowed roots — same allowlist used by /api/captures/download.
+    """
+    p = Path(path).expanduser().resolve()
+    sessions_dir = (Path.home() / ".local" / "share" / "ltesniffer-gui" / "sessions").resolve()
+    cfg = config_mod.load()
+    allowed_roots = captures_mod.allowed_roots(cfg) + [sessions_dir]
+    if not any(str(p).startswith(str(r)) for r in allowed_roots):
+        raise HTTPException(403, f"path '{p}' outside allowed roots")
+    if not p.exists():
+        raise HTTPException(404, str(p))
+    if not str(p).endswith(".jsonl.zst"):
+        raise HTTPException(415, "expected .jsonl.zst session file")
+    return analyze_rnti_churn(p)

@@ -114,6 +114,8 @@ export interface SnifferConfig {
   pcap_forward_host?: string;
   pcap_forward_port?: number;
   pcap_forward_compress?: boolean;
+  pcap_receive_bind?: string;
+  pcap_receive_port?: number;
 }
 
 export interface ForwardStatus {
@@ -128,6 +130,21 @@ export interface ForwardStatus {
   connected_since: number | null;
   connects: number;
   last_error: string | null;
+}
+
+export interface ReceiveStatus {
+  enabled: boolean;
+  state: "idle" | "listening" | "connected" | "error";
+  bind: string;
+  port: number;
+  bytes_in: number;
+  records: number;
+  connections: number;
+  peer: string | null;
+  connected_since: number | null;
+  last_file: string | null;
+  last_error: string | null;
+  host_ip: string;
 }
 
 export interface CaptureFile {

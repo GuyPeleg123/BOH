@@ -53,7 +53,12 @@ AUTH_PATH = _CONFIG_DIR / "auth.json"
 # Cookie name + sliding-window TTL. In-memory store — server restart kicks
 # everyone out, which is fine for self-hosted gear (and removes any need
 # for a session-revocation mechanism: a restart IS the revocation).
-COOKIE_NAME    = "ltesniffer_session"
+#
+# Name is role-scoped (not just "ltesniffer_session"): browser cookies for
+# 127.0.0.1 are NOT port-scoped, so a capture instance on :8443 and a decrypt
+# instance on :8444 would otherwise silently share one cookie slot — signing
+# into one logs the other out. Distinct names let both sessions coexist.
+COOKIE_NAME    = "ltesniffer_session_" + os.environ.get("LTESNIFFER_GUI_ROLE", "capture").strip().lower()
 SESSION_TTL_S  = 8 * 60 * 60   # 8 hours of inactivity → expire
 SESSION_RENEW_THRESHOLD_S = 60  # only update last_seen if >60s since last update (avoid mutex thrash)
 

@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && npm run build:capture && npm run build:decrypt",
+    "build:capture": "vite build --mode capture",
+    "build:decrypt": "vite build --mode decrypt && mv dist-decrypt/decrypt.html dist-decrypt/index.html",
     "preview": "vite preview"
   },
   "dependencies": {

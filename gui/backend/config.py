@@ -143,6 +143,14 @@ class SnifferConfig(BaseModel):
     pcap_forward_port: int = Field(0, ge=0, le=65535, description="Destination TCP port for live pcap forwarding.")
     pcap_forward_compress: bool = Field(True, description="zstd-compress the forwarded stream (binary/compact). Off = raw libpcap for live Wireshark.")
 
+    # --- pcap-over-IP receiving (decrypt-role instance only; see
+    # pcap_receive.py). The counterpart to forwarding above: this instance
+    # listens for a capture instance's forwarder to connect in and push its
+    # live pcap. Applied live — changing bind/port here restarts the
+    # listener immediately, no capture-start step to hook into on this side. ---
+    pcap_receive_bind: str = Field("0.0.0.0", description="Bind address for the incoming pcap-over-IP listener. 0.0.0.0 = reachable from other hosts on the LAN.")
+    pcap_receive_port: int = Field(9000, ge=1, le=65535, description="Port this instance listens on for an incoming pcap-over-IP push.")
+
     def to_argv(self, json_output_path: str) -> list[str]:
         """Render to argv for subprocess.Popen.
 

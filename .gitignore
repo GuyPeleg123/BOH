@@ -8,6 +8,8 @@ gui/backend/.venv/
 # Frontend build output / deps
 gui/frontend/node_modules/
 gui/frontend/dist/
+gui/frontend/dist-capture/
+gui/frontend/dist-decrypt/
 
 # Runtime capture artifacts (never commit; can contain sensitive RF/IP data)
 *.pcap

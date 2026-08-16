@@ -21,12 +21,8 @@ from fastapi.responses import FileResponse, PlainTextResponse
 
 import config as config_mod
 from config import SnifferConfig
-from sniffer import SnifferRunner
-import sniffer as sniffer_mod
 import pcap_forward
 from mock import MockRunner
-from usrp import find_devices, auto_config_patch, probe_all_gpsdo
-from spectrum import SpectrumLauncher
 import captures as captures_mod
 import runlogs
 from auth import (
@@ -34,20 +30,51 @@ from auth import (
     require_session, require_session_ws,
     verify_credentials, create_session, drop_session, session_user,
 )
+import auth as auth_mod
 import https as https_mod
 import zmq_pub
 from metrics import MetricsBus
 from recorder import SessionRecorder, ReplayRunner
 from state_tracker import StateTracker
-import analytics
-import known_cells as known_cells_mod
-from known_cells import KnownCellsFile, KnownCell, KNOWN_CELLS_PATH
 
 log = logging.getLogger(__name__)
 
 MOCK = os.environ.get("LTESNIFFER_GUI_MOCK", "").lower() in {"1", "true", "yes"}
 REPLAY = os.environ.get("LTESNIFFER_GUI_REPLAY", "").strip()
-FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+# Two-tool split: this same GUI backend can run as either role. "capture"
+# (default) sniffs LTE and forwards the live pcap out; ships only the
+# Dashboard/Config frontend pages. "decrypt" additionally opens a
+# pcap-over-IP listener that a remote (or, for now, local) capture
+# instance's live forwarder connects out to — see pcap_receive.py /
+# pcap_forward.py — and ships the UEs/Sessions/Captures/Log History/Help
+# pages instead. The two frontend bundles are separate Vite builds with
+# disjoint module graphs (see frontend/vite.config.ts) — not a hidden nav.
+#
+# The backend mirrors that split at the import/route level, not just the
+# frontend: a capture-role deployment must have ZERO trace of session/UE
+# analysis (sessions.py, analytics.py's RNTI-churn, pcap_receive.py) — if
+# that device is lost, its disk should show nothing beyond "captures LTE
+# and forwards it somewhere". Symmetrically, a decrypt-role deployment
+# never touches USRPs/RF, so it doesn't need sniffer.py/usrp.py/spectrum.py/
+# known_cells.py at all. Each such module is imported ONLY on the role that
+# needs it, and its routes are registered ONLY on that role — so the other
+# role's deploy can physically omit the file and main.py still boots clean.
+GUI_ROLE = os.environ.get("LTESNIFFER_GUI_ROLE", "capture").strip().lower()
+FRONTEND_DIST = (Path(__file__).resolve().parent.parent / "frontend"
+                  / ("dist-decrypt" if GUI_ROLE == "decrypt" else "dist-capture"))
+
+if GUI_ROLE == "decrypt":
+    import pcap_receive
+    import analytics
+    import sessions
+else:
+    from sniffer import SnifferRunner
+    import sniffer as sniffer_mod
+    from usrp import find_devices, auto_config_patch, probe_all_gpsdo
+    from spectrum import SpectrumLauncher
+    import known_cells as known_cells_mod
+    from known_cells import KnownCellsFile, KnownCell, KNOWN_CELLS_PATH
 
 
 _KILL_SCRIPT = (
@@ -145,19 +172,36 @@ async def lifespan(app: FastAPI):
         "==================================================================",
         BIND, AUTH_PATH, AUTH_PATH,
     )
+    if GUI_ROLE == "decrypt":
+        cfg = config_mod.load()
+        pcap_receive.receiver.start(cfg.pcap_receive_bind, cfg.pcap_receive_port, cfg.captures_dir)
+        st = pcap_receive.receiver.status()
+        log.warning(
+            "==================================================================\n"
+            "  role=%s — pcap receive %s on %s:%s (state=%s)\n"
+            "  Point a capture instance's Live pcap forwarding at: %s:%s\n"
+            "  Incoming pcaps land in: %s\n"
+            "==================================================================",
+            GUI_ROLE, "READY" if st["state"] == "listening" else "FAILED",
+            cfg.pcap_receive_bind, cfg.pcap_receive_port, st["state"],
+            auth_mod._autodetect_lan_ip(), cfg.pcap_receive_port, cfg.captures_dir,
+        )
     yield
     # ---- shutdown ----
     # Stop all subprocesses so nothing is orphaned when the server exits.
     # This runs when uvicorn receives SIGINT / SIGTERM or is programmatically stopped.
     log.info("Shutdown: stopping sniffer and spectrum processes…")
+    if GUI_ROLE == "decrypt":
+        pcap_receive.receiver.stop()
     try:
         await runner.stop()
     except Exception as exc:
         log.warning("Error stopping runner on shutdown: %s", exc)
-    try:
-        await spectrum.stop()
-    except Exception as exc:
-        log.warning("Error stopping spectrum on shutdown: %s", exc)
+    if spectrum is not None:
+        try:
+            await spectrum.stop()
+        except Exception as exc:
+            log.warning("Error stopping spectrum on shutdown: %s", exc)
     if _zmq is not None:
         try:
             await _zmq.stop()
@@ -178,13 +222,23 @@ async def lifespan(app: FastAPI):
     log.info("Shutdown: all subprocesses stopped.")
 
 
-if REPLAY:
+# A decrypt-role instance never captures (no /api/capture/* routes exist on
+# it — see below), so it uses MockRunner purely as an inert stand-in that
+# satisfies _metrics/_state_tracker/_recorder/_zmq's shared "runner" interface
+# without needing sniffer.py/usrp.py present. It's never .start()ed, so it
+# never emits its synthetic events either — it just sits idle, same as a
+# real SnifferRunner would before a capture starts.
+if GUI_ROLE == "decrypt":
+    runner = MockRunner()
+    spectrum = None
+elif REPLAY:
     runner = ReplayRunner(Path(REPLAY).expanduser())
 elif MOCK:
     runner = MockRunner()
 else:
     runner = SnifferRunner()
-spectrum = SpectrumLauncher()
+if GUI_ROLE != "decrypt":
+    spectrum = SpectrumLauncher()
 _recorder = SessionRecorder()
 
 app = FastAPI(title="LTESniffer GUI Backend", lifespan=lifespan)
@@ -208,6 +262,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Session-analysis routes live entirely in their own modules (sessions.py /
+# pcap_receive.py / analytics.py) — see the top-of-file comment. A
+# capture-role deployment that omits those files simply never gets these
+# routes registered at all; they're not disabled, they don't exist.
+if GUI_ROLE == "decrypt":
+    app.include_router(pcap_receive.router)
+    app.include_router(analytics.router)
+    app.include_router(sessions.router)
 
 
 # Auth-free routes. /api/login is obviously needed (you can't auth in if
@@ -324,7 +387,10 @@ async def whoami(request: Request) -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     # auth_required is always True with the new HTTP Basic Auth model — no
     # loopback bypass. Field kept for client-side compatibility.
-    return {"ok": True, "mock": MOCK, "auth_required": True}
+    out: dict[str, Any] = {"ok": True, "mock": MOCK, "auth_required": True, "role": GUI_ROLE}
+    if GUI_ROLE == "decrypt":
+        out["receiving"] = pcap_receive.receiver.status()["state"] in ("listening", "connected")
+    return out
 
 
 @app.get("/metrics")
@@ -348,33 +414,47 @@ async def get_forward_status() -> dict:
 @app.put("/api/config", response_model=SnifferConfig)
 async def put_config(cfg: SnifferConfig) -> SnifferConfig:
     # Security gate: anything that becomes argv to a root-owned process must
-    # be validated server-side, not just sanitized client-side.
-    if cfg.binary_path:
-        try:
-            from sniffer import _resolve_and_validate_binary
-            _resolve_and_validate_binary(cfg.binary_path)
-        except PermissionError as e:
-            raise HTTPException(403, f"binary_path rejected: {e}")
-        except FileNotFoundError:
-            # Tolerate not-yet-built binary at save time; start will reject later.
-            pass
-    if cfg.pcap_stream_fifo:
-        # Fail fast on out-of-allowlist paths so the user gets a useful error
-        # at Save time, not 30s later when they hit ▶ Start. We don't actually
-        # mkfifo here (that happens at capture/start); just validate the path
-        # shape via the same helper. tolerates the path not existing yet.
-        try:
-            from sniffer import _STREAM_FIFO_ALLOWED_ROOTS
-            p = Path(cfg.pcap_stream_fifo).expanduser()
-            if not p.is_absolute() or p.is_symlink() or \
-               not any(str(p).startswith(str(r) + os.sep) for r in _STREAM_FIFO_ALLOWED_ROOTS):
-                raise PermissionError(
-                    f"must be an absolute non-symlink path under one of: "
-                    f"{', '.join(str(r) for r in _STREAM_FIFO_ALLOWED_ROOTS)}"
-                )
-        except PermissionError as e:
-            raise HTTPException(403, f"pcap_stream_fifo rejected: {e}")
+    # be validated server-side, not just sanitized client-side. Capture-only:
+    # binary_path/pcap_stream_fifo are LTESniffer-binary/local-Wireshark
+    # concerns that don't apply to a decrypt instance — which also doesn't
+    # have sniffer.py on disk to import (binary_path's field default is a
+    # non-empty string, so this ran on EVERY save, every role, until this
+    # guard — ModuleNotFoundError wasn't caught by `except PermissionError`,
+    # so it 500'd instead of being skipped).
+    if GUI_ROLE != "decrypt":
+        if cfg.binary_path:
+            try:
+                from sniffer import _resolve_and_validate_binary
+                _resolve_and_validate_binary(cfg.binary_path)
+            except PermissionError as e:
+                raise HTTPException(403, f"binary_path rejected: {e}")
+            except FileNotFoundError:
+                # Tolerate not-yet-built binary at save time; start will reject later.
+                pass
+        if cfg.pcap_stream_fifo:
+            # Fail fast on out-of-allowlist paths so the user gets a useful error
+            # at Save time, not 30s later when they hit ▶ Start. We don't actually
+            # mkfifo here (that happens at capture/start); just validate the path
+            # shape via the same helper. tolerates the path not existing yet.
+            try:
+                from sniffer import _STREAM_FIFO_ALLOWED_ROOTS
+                p = Path(cfg.pcap_stream_fifo).expanduser()
+                if not p.is_absolute() or p.is_symlink() or \
+                   not any(str(p).startswith(str(r) + os.sep) for r in _STREAM_FIFO_ALLOWED_ROOTS):
+                    raise PermissionError(
+                        f"must be an absolute non-symlink path under one of: "
+                        f"{', '.join(str(r) for r in _STREAM_FIFO_ALLOWED_ROOTS)}"
+                    )
+            except PermissionError as e:
+                raise HTTPException(403, f"pcap_stream_fifo rejected: {e}")
     config_mod.save(cfg)
+    # Receive settings apply immediately — this instance never "starts a
+    # capture" to hook a restart into, so PUT /api/config is the only place
+    # a bind/port change can take effect.
+    if GUI_ROLE == "decrypt":
+        st = pcap_receive.receiver.status()
+        if st.get("bind") != cfg.pcap_receive_bind or st.get("port") != cfg.pcap_receive_port:
+            pcap_receive.receiver.start(cfg.pcap_receive_bind, cfg.pcap_receive_port, cfg.captures_dir)
     return cfg
 
 
@@ -417,6 +497,8 @@ async def pin_cell() -> dict[str, Any]:
     """Pin the configured PCI (+PRB), decode SIB1 until we read the MCC/MNC of the
     cell transmitting there, then set the config to pinned mode (cell-search off)
     with that PLMN. Needs the radios free (stop any capture first)."""
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     cfg = config_mod.load()
     if bool(runner.state().get("running")):
         return {"ok": False, "error": "Stop the current capture first — pinning needs the radios."}
@@ -438,12 +520,16 @@ async def pin_cell() -> dict[str, Any]:
 @app.post("/api/pin-cell/stop")
 async def pin_cell_stop() -> dict[str, Any]:
     """Abort an in-flight Pin cell (user changed their mind mid-run)."""
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     import scanner
     return scanner.cancel_pin()
 
 
 @app.post("/api/capture/start")
 async def capture_start(cfg: SnifferConfig | None = None) -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     if cfg is None:
         cfg = config_mod.load()
     else:
@@ -469,6 +555,8 @@ async def capture_dense_test() -> dict[str, Any]:
     Captures/Sessions), but the run also enables the env-gated UL diagnostics and
     saves their output to <run_dir>/ul_diag.log for offline analysis. Meant for a
     dense-area test where the extra UL instrumentation is wanted."""
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     cfg = config_mod.load()
     if runner.running:
         raise HTTPException(409, "sniffer already running")
@@ -485,12 +573,16 @@ async def capture_dense_test() -> dict[str, Any]:
 
 @app.post("/api/capture/stop")
 async def capture_stop() -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     await runner.stop()
     return {"ok": True, "state": runner.state()}
 
 
 @app.post("/api/capture/restart")
 async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     if cfg is None:
         cfg = config_mod.load()
     else:
@@ -508,6 +600,8 @@ async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
 
 @app.get("/api/usrps")
 async def list_usrps() -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     # NEVER enumerate USB (uhd_find_devices) while a capture holds the USRPs —
     # the scan resets the bus and disconnects the running radios.
     if runner.running:
@@ -523,6 +617,8 @@ async def usrps_autoconfig() -> dict[str, Any]:
     user having to type them manually.  Keys starting with '_' are metadata
     (not SnifferConfig fields) and should not be written to the config.
     """
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     # Auto-detect runs uhd_find_devices — skip entirely while capturing so it
     # can't reset the bus out from under the live radios.
     if runner.running:
@@ -539,6 +635,8 @@ async def probe_usrps_gpsdo() -> dict[str, Any]:
     this in the background after auto-config and uses the result to
     conditionally add clock=gpsdo to usrp_a_args / usrp_b_args.
     """
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     # uhd_usrp_probe OPENS each device — absolutely must not run during a
     # capture or it yanks the USRP away from the running sniffer.
     if runner.running:
@@ -567,11 +665,15 @@ async def probe_usrps_gpsdo() -> dict[str, Any]:
 
 @app.get("/api/spectrum")
 async def spectrum_status() -> dict[str, Any]:
+    if spectrum is None:
+        raise HTTPException(404)
     return spectrum.status()
 
 
 @app.post("/api/spectrum/launch")
 async def spectrum_launch(body: dict[str, Any]) -> dict[str, Any]:
+    if spectrum is None:
+        raise HTTPException(404)
     freq = float(body.get("freq_hz") or 0)
     sr = float(body.get("sample_rate_hz") or 0)
     tool = body.get("tool")
@@ -596,114 +698,98 @@ async def spectrum_launch(body: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/spectrum/stop")
 async def spectrum_stop() -> dict[str, Any]:
+    if spectrum is None:
+        raise HTTPException(404)
     return await spectrum.stop()
 
 
-@app.get("/api/known-cells")
-async def get_known_cells() -> dict[str, Any]:
-    kcf = known_cells_mod.load()
-    return {"cells": [c.model_dump() for c in kcf.cells], "path": str(KNOWN_CELLS_PATH)}
+# Whole block conditional, not just body guards: the request/response models
+# below (KnownCellsFile, KnownCell) are only imported on the capture role, and
+# FastAPI resolves parameter annotations at route-registration time (even
+# with `from __future__ import annotations`) — a body-only guard would still
+# NameError at import time on a decrypt-role process. This whole feature is
+# capture-side RF tuning aid anyway; doesn't apply to a decrypt instance.
+if GUI_ROLE != "decrypt":
+    @app.get("/api/known-cells")
+    async def get_known_cells() -> dict[str, Any]:
+        kcf = known_cells_mod.load()
+        return {"cells": [c.model_dump() for c in kcf.cells], "path": str(KNOWN_CELLS_PATH)}
 
+    @app.put("/api/known-cells")
+    async def put_known_cells(body: KnownCellsFile) -> dict[str, Any]:
+        try:
+            path = known_cells_mod.save(body)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        return {"ok": True, "path": str(path), "n_cells": len(body.cells)}
 
-@app.put("/api/known-cells")
-async def put_known_cells(body: KnownCellsFile) -> dict[str, Any]:
-    try:
-        path = known_cells_mod.save(body)
-    except PermissionError as e:
-        raise HTTPException(403, str(e))
-    return {"ok": True, "path": str(path), "n_cells": len(body.cells)}
+    @app.post("/api/known-cells/{idx}/load")
+    async def load_known_cell_into_config(idx: int) -> dict[str, Any]:
+        """Copy a known cell's freq/USRP/mode settings into the active SnifferConfig.
+        Returns the updated config so the GUI can refresh the form."""
+        kcf = known_cells_mod.load()
+        if idx < 0 or idx >= len(kcf.cells):
+            raise HTTPException(404, f"known cell index {idx} out of range (have {len(kcf.cells)})")
+        cell = kcf.cells[idx]
+        cfg = config_mod.load()
+        cfg.rf_freq = cell.dl_freq_mhz * 1e6
+        cfg.ul_freq = cell.ul_freq_mhz * 1e6
+        cfg.nof_prb = cell.nof_prb
+        cfg.sniffer_mode = cell.sniffer_mode
+        cfg.usrp_a_args = cell.usrp_a_args
+        cfg.usrp_b_args = cell.usrp_b_args
+        cfg.rf_gain = cell.rf_gain
+        config_mod.save(cfg)
+        return {"ok": True, "loaded": cell.label, "config": cfg.model_dump()}
 
+    @app.post("/api/known-cells/save-current")
+    async def save_current_as_known_cell(body: dict[str, Any]) -> dict[str, Any]:
+        """Snapshot the active SnifferConfig + a label/notes into a new KnownCell.
 
-@app.post("/api/known-cells/{idx}/load")
-async def load_known_cell_into_config(idx: int) -> dict[str, Any]:
-    """Copy a known cell's freq/USRP/mode settings into the active SnifferConfig.
-    Returns the updated config so the GUI can refresh the form."""
-    kcf = known_cells_mod.load()
-    if idx < 0 or idx >= len(kcf.cells):
-        raise HTTPException(404, f"known cell index {idx} out of range (have {len(kcf.cells)})")
-    cell = kcf.cells[idx]
-    cfg = config_mod.load()
-    cfg.rf_freq = cell.dl_freq_mhz * 1e6
-    cfg.ul_freq = cell.ul_freq_mhz * 1e6
-    cfg.nof_prb = cell.nof_prb
-    cfg.sniffer_mode = cell.sniffer_mode
-    cfg.usrp_a_args = cell.usrp_a_args
-    cfg.usrp_b_args = cell.usrp_b_args
-    cfg.rf_gain = cell.rf_gain
-    config_mod.save(cfg)
-    return {"ok": True, "loaded": cell.label, "config": cfg.model_dump()}
+        The label is required; notes/PCI are optional. Other fields are copied from
+        the live SnifferConfig (freq, mode, USRP rfargs, gain, PRB).
+        """
+        import time as _t
+        label = (body.get("label") or "").strip()
+        if not label:
+            raise HTTPException(400, "label is required")
+        cfg = config_mod.load()
+        kcf = known_cells_mod.load()
+        cell = KnownCell(
+            label=label,
+            dl_freq_mhz=cfg.rf_freq / 1e6,
+            ul_freq_mhz=cfg.ul_freq / 1e6,
+            bandwidth_mhz=body.get("bandwidth_mhz"),
+            nof_prb=cfg.nof_prb,
+            pci=body.get("pci"),
+            sniffer_mode=cfg.sniffer_mode,
+            usrp_a_args=cfg.usrp_a_args,
+            usrp_b_args=cfg.usrp_b_args,
+            rf_gain=cfg.rf_gain,
+            last_success_iso=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+            notes=(body.get("notes") or "").strip(),
+        )
+        kcf.cells.append(cell)
+        path = known_cells_mod.save(kcf)
+        return {"ok": True, "path": str(path), "idx": len(kcf.cells) - 1, "cell": cell.model_dump()}
 
+    @app.put("/api/known-cells/{idx}")
+    async def update_known_cell(idx: int, cell: KnownCell) -> dict[str, Any]:
+        kcf = known_cells_mod.load()
+        if idx < 0 or idx >= len(kcf.cells):
+            raise HTTPException(404, f"known cell idx {idx} out of range")
+        kcf.cells[idx] = cell
+        known_cells_mod.save(kcf)
+        return {"ok": True, "cell": cell.model_dump()}
 
-@app.post("/api/known-cells/save-current")
-async def save_current_as_known_cell(body: dict[str, Any]) -> dict[str, Any]:
-    """Snapshot the active SnifferConfig + a label/notes into a new KnownCell.
-
-    The label is required; notes/PCI are optional. Other fields are copied from
-    the live SnifferConfig (freq, mode, USRP rfargs, gain, PRB).
-    """
-    import time as _t
-    label = (body.get("label") or "").strip()
-    if not label:
-        raise HTTPException(400, "label is required")
-    cfg = config_mod.load()
-    kcf = known_cells_mod.load()
-    cell = KnownCell(
-        label=label,
-        dl_freq_mhz=cfg.rf_freq / 1e6,
-        ul_freq_mhz=cfg.ul_freq / 1e6,
-        bandwidth_mhz=body.get("bandwidth_mhz"),
-        nof_prb=cfg.nof_prb,
-        pci=body.get("pci"),
-        sniffer_mode=cfg.sniffer_mode,
-        usrp_a_args=cfg.usrp_a_args,
-        usrp_b_args=cfg.usrp_b_args,
-        rf_gain=cfg.rf_gain,
-        last_success_iso=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
-        notes=(body.get("notes") or "").strip(),
-    )
-    kcf.cells.append(cell)
-    path = known_cells_mod.save(kcf)
-    return {"ok": True, "path": str(path), "idx": len(kcf.cells) - 1, "cell": cell.model_dump()}
-
-
-@app.put("/api/known-cells/{idx}")
-async def update_known_cell(idx: int, cell: KnownCell) -> dict[str, Any]:
-    kcf = known_cells_mod.load()
-    if idx < 0 or idx >= len(kcf.cells):
-        raise HTTPException(404, f"known cell idx {idx} out of range")
-    kcf.cells[idx] = cell
-    known_cells_mod.save(kcf)
-    return {"ok": True, "cell": cell.model_dump()}
-
-
-@app.delete("/api/known-cells/{idx}")
-async def delete_known_cell(idx: int) -> dict[str, Any]:
-    kcf = known_cells_mod.load()
-    if idx < 0 or idx >= len(kcf.cells):
-        raise HTTPException(404, f"known cell idx {idx} out of range")
-    removed = kcf.cells.pop(idx)
-    known_cells_mod.save(kcf)
-    return {"ok": True, "removed_label": removed.label, "n_remaining": len(kcf.cells)}
-
-
-@app.get("/api/analytics/rnti-churn")
-async def analytics_rnti_churn(path: str) -> dict[str, Any]:
-    """Run the RNTI churn analyzer against a recorded session.
-
-    `path` must point to a .jsonl.zst file under the session dir or the
-    pcap-allowed roots — same allowlist used by /api/captures/download.
-    """
-    p = Path(path).expanduser().resolve()
-    sessions_dir = (Path.home() / ".local" / "share" / "ltesniffer-gui" / "sessions").resolve()
-    cfg = config_mod.load()
-    allowed_roots = captures_mod.allowed_roots(cfg) + [sessions_dir]
-    if not any(str(p).startswith(str(r)) for r in allowed_roots):
-        raise HTTPException(403, f"path '{p}' outside allowed roots")
-    if not p.exists():
-        raise HTTPException(404, str(p))
-    if not str(p).endswith(".jsonl.zst"):
-        raise HTTPException(415, "expected .jsonl.zst session file")
-    return analytics.analyze_rnti_churn(p)
+    @app.delete("/api/known-cells/{idx}")
+    async def delete_known_cell(idx: int) -> dict[str, Any]:
+        kcf = known_cells_mod.load()
+        if idx < 0 or idx >= len(kcf.cells):
+            raise HTTPException(404, f"known cell idx {idx} out of range")
+        removed = kcf.cells.pop(idx)
+        known_cells_mod.save(kcf)
+        return {"ok": True, "removed_label": removed.label, "n_remaining": len(kcf.cells)}
 
 
 @app.get("/api/logs/history")
@@ -746,22 +832,6 @@ async def download_capture(path: str) -> FileResponse:
     except PermissionError as e:
         raise HTTPException(403, str(e))
     return FileResponse(p, media_type="application/vnd.tcpdump.pcap", filename=p.name)
-
-
-class _SessionsBody(BaseModel):
-    path: str | None = None                  # None → latest/active capture
-
-
-@app.post("/api/sessions")
-async def analyze_sessions(body: _SessionsBody) -> dict[str, Any]:
-    """Correlate UE sessions: RNTI ↔ identity (M-TMSI/S-TMSI/GUTI/IMSI) ↔ TA
-    range, so a TA distance can be attributed to a specific UE. Post-capture
-    (tshark); off the event loop; failures return ok=False."""
-    import sessions as sessions_mod
-    cfg = config_mod.load()
-    return await asyncio.to_thread(
-        sessions_mod.analyze_sessions, cfg, body.path
-    )
 
 
 @app.get("/api/captures/split-dims")
@@ -847,6 +917,8 @@ async def events_ws(ws: WebSocket) -> None:
 
 @app.post("/api/wireshark/open")
 async def open_wireshark() -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
     cfg = config_mod.load()
     if not cfg.pcap_stream_fifo:
         raise HTTPException(
@@ -912,6 +984,12 @@ if FRONTEND_DIST.exists():
 
     @app.get("/{full_path:path}")
     async def spa(full_path: str) -> FileResponse:
+        # A role-gated /api/* route that isn't registered on this instance
+        # (e.g. /api/known-cells on a decrypt-role process) must 404 cleanly,
+        # not silently fall through to the SPA shell — that would look like
+        # the route "worked" (200 + HTML) instead of correctly not existing.
+        if full_path.startswith("api/"):
+            raise HTTPException(404)
         # no-store on the HTML so a fresh tab always picks up new hashed JS;
         # the /assets/* files are content-hashed and safe to cache normally.
         index = FRONTEND_DIST / "index.html"

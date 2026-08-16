@@ -16,6 +16,13 @@ capture-only build. Labels carry a `source`/`confidence` so nothing is overstate
 """
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+import config as config_mod
 from config import SnifferConfig
 import captures as C
 
@@ -326,3 +333,24 @@ def analyze_sessions(cfg: SnifferConfig, input_path: str | None) -> dict:
         res["error"] = "tshark timed out"; return res
     except Exception as ex:  # noqa: BLE001
         res["error"] = f"{type(ex).__name__}: {ex}"; return res
+
+
+# The route lives HERE, not in main.py, on purpose: main.py only
+# app.include_router()s this module when GUI_ROLE=="decrypt" (see main.py).
+# A capture-role deployment that omits this file from disk has main.py boot
+# clean with no /api/sessions route at all — not hidden, not disabled, just
+# never defined anywhere on that machine.
+router = APIRouter()
+
+
+class _SessionsBody(BaseModel):
+    path: str | None = None                  # None → latest/active capture
+
+
+@router.post("/api/sessions")
+async def analyze_sessions_route(body: _SessionsBody) -> dict[str, Any]:
+    """Correlate UE sessions: RNTI ↔ identity (M-TMSI/S-TMSI/GUTI/IMSI) ↔ TA
+    range, so a TA distance can be attributed to a specific UE. Post-capture
+    (tshark); off the event loop; failures return ok=False."""
+    cfg = config_mod.load()
+    return await asyncio.to_thread(analyze_sessions, cfg, body.path)

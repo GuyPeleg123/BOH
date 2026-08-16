@@ -1,40 +1,13 @@
-import { useMemo } from "react";
-import { useFullState } from "../lib/store";
-import { useStableTick } from "../lib/useStableTick";
+import { useEffect, useMemo, useState } from "react";
+import { api } from "../lib/api";
+import type { SessionsResponse, UeSession } from "../lib/types";
+import { FileBrowser } from "../components/FileBrowser";
 
-// A UE/RNTI is "active" if seen within this many seconds of the latest event.
-const ACTIVE_WINDOW_S = 5;
-
-type RntiClass = "C-RNTI" | "SI-RNTI" | "P-RNTI" | "RA-RNTI" | "other";
-
-// LTE RNTI value ranges (36.321 Table 7.1-1):
-//   0x0001-0x003C RA-RNTI · 0x003D-0xFFF3 C-RNTI · 0xFFFE P-RNTI · 0xFFFF SI-RNTI
-function rntiClass(r: number): RntiClass {
-  if (r === 0xffff) return "SI-RNTI";
-  if (r === 0xfffe) return "P-RNTI";
-  if (r >= 0x0001 && r <= 0x003c) return "RA-RNTI";
-  if (r >= 0x003d && r <= 0xfff3) return "C-RNTI";
-  return "other";
-}
-const hex = (r: number) => "0x" + r.toString(16).toUpperCase().padStart(4, "0");
-
-const kindBadge: Record<string, string> = {
-  imsi: "bg-bad/20 text-bad border-bad/40",
-  tmsi: "bg-warn/20 text-warn border-warn/40",
-  guti: "bg-warn/20 text-warn border-warn/40",
-  ue_capa: "bg-accent/20 text-accent border-accent/40",
-  identity_map: "bg-ok/20 text-ok border-ok/40",
-};
-// Friendlier display names.
-const kindLabel: Record<string, string> = { tmsi: "M-TMSI", imsi: "IMSI", guti: "GUTI", ue_capa: "UE-Capa", identity_map: "ID-map" };
-
-const classBadge: Record<RntiClass, string> = {
-  "C-RNTI": "bg-ok/20 text-ok border-ok/40",
-  "SI-RNTI": "bg-muted/20 text-muted border-border",
-  "P-RNTI": "bg-muted/20 text-muted border-border",
-  "RA-RNTI": "bg-accent/20 text-accent border-accent/40",
-  "other": "bg-muted/20 text-muted border-border",
-};
+// UE roster for a received/analyzed capture. Sourced from the same post-hoc
+// tshark analysis as the Sessions page (/api/sessions) — NOT from the live
+// /api/events WebSocket stream, which only exists during an active capture
+// and would be permanently empty on a decrypt-role instance (this instance
+// never captures; it only receives pcaps pushed over the network).
 
 function Stat({ label, value, sub, accent }: { label: string; value: string | number; sub?: string; accent?: "ok" | "warn" | "bad" }) {
   const c = accent === "ok" ? "text-ok" : accent === "warn" ? "text-warn" : accent === "bad" ? "text-bad" : "text-slate-100";
@@ -47,101 +20,125 @@ function Stat({ label, value, sub, accent }: { label: string; value: string | nu
   );
 }
 
+const confColor: Record<string, string> = {
+  imsi: "bg-bad/20 text-bad border-bad/40",
+  guti: "bg-ok/20 text-ok border-ok/40",
+  tmsi: "bg-ok/20 text-ok border-ok/40",
+  "rnti-only": "bg-muted/15 text-muted border-border",
+};
+
+function idLabel(s: UeSession): string {
+  const i = s.identity;
+  return i.guti ? `guti ${i.guti}` : i.s_tmsi ? `s-tmsi ${i.s_tmsi}` : i.imsi ? `imsi ${i.imsi}` : i.m_tmsi ? `m-tmsi ${i.m_tmsi}` : "";
+}
+
 export function UEsPage() {
-  const state = useFullState();
-  const tick = useStableTick(1000);
+  const [path, setPath] = useState<string | null>(null);   // null = latest capture
+  const [name, setName] = useState<string>("(latest capture)");
+  const [browsing, setBrowsing] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [resp, setResp] = useState<SessionsResponse | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [q, setQ] = useState("");
 
-  const v = useMemo(() => {
-    const now = state.monotonic;
-    const rntis = Array.from(state.rntis.values());
+  async function run(p: string | null = path) {
+    setErr(null); setRunning(true);
+    try {
+      const r = await api.analyzeSessions(p);
+      setResp(r);
+      if (!r.ok) setErr(r.error);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally { setRunning(false); }
+  }
 
-    const byClass: Record<RntiClass, number> = { "C-RNTI": 0, "SI-RNTI": 0, "P-RNTI": 0, "RA-RNTI": 0, "other": 0 };
-    let cActive = 0, cGhost = 0, cRecur = 0;
-    for (const r of rntis) {
-      const cls = rntiClass(r.rnti);
-      byClass[cls]++;
-      if (cls === "C-RNTI") {
-        const seen = r.dl_count + r.ul_count;
-        if (now - r.last_seen <= ACTIVE_WINDOW_S) cActive++;
-        if (seen <= 1) cGhost++; else if (seen >= 3) cRecur++;
-      }
-    }
+  // UEs is the landing page — load the latest capture automatically so
+  // there's something on screen without an extra click.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { run(null); }, []);
 
-    // De-duplicate identities (the store keeps one record per sighting).
-    const idMap = new Map<string, { kind: string; value: string; rntis: Set<number>; count: number; last: number; from: string }>();
-    for (const id of state.identities) {
-      const key = id.kind + "|" + id.value;
-      let e = idMap.get(key);
-      if (!e) { e = { kind: id.kind, value: id.value, rntis: new Set(), count: 0, last: id.ts, from: id.from }; idMap.set(key, e); }
-      e.count++; e.rntis.add(id.rnti); e.last = Math.max(e.last, id.ts);
-    }
-    const ids = Array.from(idMap.values()).sort((a, b) => b.last - a.last);
-    const nImsi = ids.filter((i) => i.kind === "imsi").length;
-    const nTmsi = ids.filter((i) => i.kind === "tmsi").length;
+  const sessions = resp?.sessions ?? [];
+  const nImsi = new Set(sessions.map((s) => s.identity.imsi).filter(Boolean)).size;
+  const nTmsi = new Set(sessions.map((s) => s.identity.m_tmsi).filter(Boolean)).size;
+  const nIdentified = sessions.filter((s) => s.identity.confidence !== "rnti-only").length;
 
-    const rows = rntis.slice().sort((a, b) => b.last_seen - a.last_seen).slice(0, 500);
-    return { now, byClass, cActive, cGhost, cRecur, cTotal: byClass["C-RNTI"], ids, nImsi, nTmsi, rows };
-    // gate recompute on the 1 s tick so the page doesn't thrash at event rate
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick]);
+  const filtered = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return sessions;
+    return sessions.filter((s) => {
+      const hay = [s.c_rnti_hex, s.identity.m_tmsi, s.identity.imsi, s.identity.s_tmsi,
+                   s.identity.guti, s.plmn, idLabel(s)].filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(needle);
+    });
+  }, [sessions, q]);
 
-  const ago = (t: number) => Math.max(0, v.now - t);
+  const ago = (t: number) => (resp ? Math.max(0, (sessions[0]?.end ?? t) - t) : 0);
 
   return (
     <div className="p-3 h-full flex flex-col min-h-0 gap-3 overflow-auto">
-      {/* Honest summary — identities are the real UE count; RNTIs are sessions/signals. */}
+      <div className="flex items-center gap-2 text-xs bg-bg border border-border rounded px-2 py-1.5 flex-wrap">
+        <span className="text-muted uppercase text-[10px] shrink-0">Capture</span>
+        <span className="font-mono text-slate-100 truncate" title={path ?? ""}>{name}</span>
+        <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => setBrowsing(true)}>📁 Browse…</button>
+        <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => { setPath(null); setName("(latest capture)"); run(null); }}>↺ latest</button>
+        <button className="btn btn-primary !px-3.5 !py-1.5 !text-sm ml-auto" disabled={running} onClick={() => run()}>
+          {running ? "Analyzing…" : "Refresh"}
+        </button>
+      </div>
+
+      {err && <div className="text-bad text-xs font-mono border border-bad/40 rounded p-2">{err}</div>}
+
       <div>
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted mb-2">Identified UEs</h2>
         <div className="flex flex-wrap gap-2">
-          <Stat label="UEs identified" value={v.nImsi + v.nTmsi} sub="distinct IMSI + M-TMSI" accent={v.nImsi + v.nTmsi > 0 ? "ok" : undefined} />
-          <Stat label="IMSI" value={v.nImsi} sub="distinct" accent={v.nImsi > 0 ? "bad" : undefined} />
-          <Stat label="M-TMSI" value={v.nTmsi} sub="distinct" accent={v.nTmsi > 0 ? "warn" : undefined} />
+          <Stat label="UE sessions" value={sessions.length} sub="distinct C-RNTI sessions" />
+          <Stat label="Identified" value={nIdentified} sub="have a TMSI/IMSI/GUTI" accent={nIdentified > 0 ? "ok" : undefined} />
+          <Stat label="IMSI" value={nImsi} sub="distinct" accent={nImsi > 0 ? "bad" : undefined} />
+          <Stat label="M-TMSI" value={nTmsi} sub="distinct" accent={nTmsi > 0 ? "warn" : undefined} />
         </div>
         <p className="text-[11px] text-muted mt-1">
-          Lower bound — only UEs that exposed an identity in the clear (paging, RRC request, attach) with API mode (-z) on.
+          One row per UE session (a C-RNTI lifetime), from the same post-capture analysis as the Sessions page. Identities are read in the clear (paging, RRC request, attach).
         </p>
       </div>
 
-      {/* RNTIs — sessions/signals, not UEs. Broken down so it's honest. */}
-      <div>
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted mb-2">Radio sessions (RNTIs)</h2>
-        <div className="flex flex-wrap gap-2">
-          <Stat label="Active C-RNTIs" value={v.cActive} sub={`seen in last ${ACTIVE_WINDOW_S}s`} accent={v.cActive > 0 ? "ok" : undefined} />
-          <Stat label="Distinct C-RNTIs" value={v.cTotal} sub={`${v.cRecur} recurring · ${v.cGhost} one-hit`} />
-          <Stat label="One-hit C-RNTIs" value={v.cGhost} sub="likely false positives" accent={v.cGhost > 0 ? "warn" : undefined} />
-          <Stat label="Broadcast RNTIs" value={v.byClass["SI-RNTI"] + v.byClass["P-RNTI"] + v.byClass["RA-RNTI"]} sub={`SI ${v.byClass["SI-RNTI"]} · P ${v.byClass["P-RNTI"]} · RA ${v.byClass["RA-RNTI"]} (not UEs)`} />
-        </div>
-        <p className="text-[11px] text-muted mt-1">
-          A UE gets a new C-RNTI per connection and blind search produces one-hit ghosts — so distinct-RNTI count is NOT a UE count.
-        </p>
-      </div>
-
-      {/* Identity detail */}
       <div className="panel p-3 flex flex-col min-h-0">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted mb-2">Identities ({v.ids.length})</h3>
-        {v.ids.length === 0 ? (
-          <div className="text-sm text-muted text-center py-4">None yet. Enable API mode (-z) — IMSI/M-TMSI appear from paging / RRC requests.</div>
+        <div className="flex items-center gap-2 mb-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">UEs ({filtered.length}{filtered.length !== sessions.length ? ` / ${sessions.length}` : ""})</h3>
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="search RNTI / TMSI / IMSI / GUTI…"
+            className="ml-auto w-64 max-w-[50vw] bg-bg border border-border rounded px-2 py-1 text-xs font-mono text-slate-100"
+          />
+        </div>
+        {sessions.length === 0 ? (
+          <div className="text-sm text-muted text-center py-4">
+            {resp?.ok === false ? "No capture available to analyze." : "No UE sessions found in this capture."}
+          </div>
         ) : (
           <table className="w-full text-xs font-mono">
             <thead className="text-[10px] uppercase tracking-wide text-muted">
               <tr className="border-b border-border">
-                <th className="px-2 py-1.5 text-left">Type</th>
-                <th className="px-2 py-1.5 text-left">Value</th>
-                <th className="px-2 py-1.5 text-right">RNTIs</th>
-                <th className="px-2 py-1.5 text-right">Seen</th>
-                <th className="px-2 py-1.5 text-left">From</th>
-                <th className="px-2 py-1.5 text-right">Last (s)</th>
+                <th className="px-2 py-1.5 text-left">C-RNTI</th>
+                <th className="px-2 py-1.5 text-left">Identity</th>
+                <th className="px-2 py-1.5 text-left">Via</th>
+                <th className="px-2 py-1.5 text-right">DL/UL</th>
+                <th className="px-2 py-1.5 text-right">Dur</th>
+                <th className="px-2 py-1.5 text-right">Ago (s)</th>
               </tr>
             </thead>
             <tbody>
-              {v.ids.map((id, i) => (
-                <tr key={i} className="border-b border-border/40">
-                  <td className="px-2 py-1"><span className={`px-1.5 py-0.5 rounded border text-[10px] uppercase ${kindBadge[id.kind] ?? "border-border text-muted"}`}>{kindLabel[id.kind] ?? id.kind}</span></td>
-                  <td className="px-2 py-1 text-slate-100">{id.value}</td>
-                  <td className="px-2 py-1 text-right text-muted">{Array.from(id.rntis).map(hex).join(", ")}</td>
-                  <td className="px-2 py-1 text-right">{id.count}</td>
-                  <td className="px-2 py-1 text-muted">{id.from}</td>
-                  <td className="px-2 py-1 text-right text-muted">{ago(id.last).toFixed(1)}</td>
+              {filtered.map((s) => (
+                <tr key={s.session_id} className="border-b border-border/40">
+                  <td className="px-2 py-1 text-slate-100">{s.c_rnti_hex}</td>
+                  <td className="px-2 py-1">
+                    <span className="text-slate-100">{idLabel(s) || "—"}</span>
+                    <span className={`ml-2 px-1 rounded border text-[9px] ${confColor[s.identity.confidence] ?? confColor["rnti-only"]}`}>{s.identity.confidence}</span>
+                  </td>
+                  <td className="px-2 py-1 text-muted">{s.identity.id_via ?? "—"}</td>
+                  <td className="px-2 py-1 text-right text-muted">{s.dl_frames}/{s.ul_frames}</td>
+                  <td className="px-2 py-1 text-right text-muted">{s.duration_s}s</td>
+                  <td className="px-2 py-1 text-right text-muted">{ago(s.end).toFixed(1)}</td>
                 </tr>
               ))}
             </tbody>
@@ -149,46 +146,11 @@ export function UEsPage() {
         )}
       </div>
 
-      {/* RNTI detail */}
-      <div className="panel p-3 flex flex-col min-h-0">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted mb-2">RNTIs seen ({state.rntis.size}{state.rntis.size >= 500 ? ", showing 500" : ""})</h3>
-        {v.rows.length === 0 ? (
-          <div className="text-sm text-muted text-center py-4">No RNTIs decoded yet.</div>
-        ) : (
-          <table className="w-full text-xs font-mono">
-            <thead className="text-[10px] uppercase tracking-wide text-muted">
-              <tr className="border-b border-border">
-                <th className="px-2 py-1.5 text-left">RNTI</th>
-                <th className="px-2 py-1.5 text-left">Class</th>
-                <th className="px-2 py-1.5 text-right">DL</th>
-                <th className="px-2 py-1.5 text-right">UL</th>
-                <th className="px-2 py-1.5 text-right">Last (s)</th>
-                <th className="px-2 py-1.5 text-left">State</th>
-              </tr>
-            </thead>
-            <tbody>
-              {v.rows.map((r) => {
-                const cls = rntiClass(r.rnti);
-                const active = v.now - r.last_seen <= ACTIVE_WINDOW_S;
-                const seen = r.dl_count + r.ul_count;
-                return (
-                  <tr key={r.rnti} className="border-b border-border/40">
-                    <td className="px-2 py-1 text-slate-100">{hex(r.rnti)}</td>
-                    <td className="px-2 py-1"><span className={`px-1.5 py-0.5 rounded border text-[10px] ${classBadge[cls]}`}>{cls}</span></td>
-                    <td className="px-2 py-1 text-right">{r.dl_count}</td>
-                    <td className="px-2 py-1 text-right">{r.ul_count}</td>
-                    <td className="px-2 py-1 text-right text-muted">{ago(r.last_seen).toFixed(1)}</td>
-                    <td className="px-2 py-1 text-[10px]">
-                      {active ? <span className="text-ok">active</span> : <span className="text-muted">idle</span>}
-                      {cls === "C-RNTI" && seen <= 1 && <span className="text-warn"> · ghost?</span>}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+      {browsing && (
+        <FileBrowser startPath={path}
+          onClose={() => setBrowsing(false)}
+          onPick={(p, n) => { setPath(p); setName(n); setBrowsing(false); run(p); }} />
+      )}
     </div>
   );
 }
