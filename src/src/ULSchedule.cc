@@ -34,38 +34,28 @@ void ULSchedule::push_rar_ULSche(uint32_t tti, const std::vector<DCI_UL> &rar_dc
 	lock.unlock();
 }
 
-std::vector<DCI_UL> *ULSchedule::getULSche(uint32_t tti)
+std::vector<DCI_UL> ULSchedule::getULSche(uint32_t tti)
 {
-	std::unique_lock<std::mutex> lock(ulsche_mutex);
+	std::lock_guard<std::mutex> lock(ulsche_mutex);
 	uint32_t ul_tti = get_ul_tti(tti);
-	std::map<uint32_t, std::vector<DCI_UL>>::iterator iter;
-	iter = ulsche_database.find(ul_tti);
+	auto iter = ulsche_database.find(ul_tti);
 	if (iter != ulsche_database.end())
 	{
-		return &iter->second;
+		return iter->second;   // copy under lock — safe even if another worker erases the key
 	}
-	else
-	{
-		return nullptr;
-	}
-	lock.unlock();
+	return {};
 }
 
-std::vector<DCI_UL> *ULSchedule::get_rar_ULSche(uint32_t tti)
+std::vector<DCI_UL> ULSchedule::get_rar_ULSche(uint32_t tti)
 {
-	std::unique_lock<std::mutex> lock(ulsche_mutex);
+	std::lock_guard<std::mutex> lock(ulsche_mutex);
 	uint32_t ul_tti = get_rar_ul_tti(tti);
-	std::map<uint32_t, std::vector<DCI_UL>>::iterator iter;
-	iter = ulsche_rar_database.find(ul_tti);
+	auto iter = ulsche_rar_database.find(ul_tti);
 	if (iter != ulsche_rar_database.end())
 	{
-		return &iter->second;
+		return iter->second;
 	}
-	else
-	{
-		return nullptr;
-	}
-	lock.unlock();
+	return {};
 }
 
 void ULSchedule::deleteULSche(uint32_t tti)
@@ -109,32 +99,16 @@ void ULSchedule::set_SIB2(asn1::rrc::sib_type2_s *sib2_)
 	lock.unlock();
 }
 
-int ULSchedule::get_ul_tti(uint32_t cur_tti)
+uint32_t ULSchedule::get_ul_tti(uint32_t cur_tti)
 {
-	int temp_tti = (int)cur_tti - 4;
-	if (temp_tti >= 0)
-	{
-		return temp_tti;
-	}
-	else
-	{
-		temp_tti = temp_tti + 10240;
-		return temp_tti;
-	}
+	// modulo-10240 wrap; old unsigned `if(cur_tti-4 >= 0)` never took the wrap
+	// branch, underflowing for cur_tti<4 (SFN rollover) -> wrong key.
+	return (cur_tti + 10240u - 4u) % 10240u;
 }
 
-int ULSchedule::get_rar_ul_tti(uint32_t cur_tti)
+uint32_t ULSchedule::get_rar_ul_tti(uint32_t cur_tti)
 {
-	int temp_tti = (int)cur_tti - 6;
-	if (temp_tti >= 0)
-	{
-		return temp_tti;
-	}
-	else
-	{
-		temp_tti = temp_tti + 10240;
-		return temp_tti;
-	}
+	return (cur_tti + 10240u - 6u) % 10240u;
 }
 
 void ULSchedule::set_config()

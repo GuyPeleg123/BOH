@@ -5,9 +5,9 @@ project(cmnalib-download NONE)
 
 include(ExternalProject)
 ExternalProject_Add(cmnalib
-    GIT_REPOSITORY https://github.com/falkenber9/c-mnalib.git
-    GIT_TAG v1.0.0
-#    GIT_TAG develop
+    GIT_REPOSITORY @CMNALIB_REPO@
+    GIT_TAG 417fbc108367a1936eb090d8915fc3301156d822
+#    (pinned to v1.0.0's exact commit; was floating tag "v1.0.0")
     SOURCE_DIR "${CMAKE_BINARY_DIR}/cmnalib-src"
     BINARY_DIR "${CMAKE_BINARY_DIR}/cmnalib-build"
     CONFIGURE_COMMAND ""

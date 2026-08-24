@@ -1,0 +1,16 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/*.egg-info/
+backend/.pytest_cache/
+**/__pycache__/
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+frontend/.vite/
+
+# Editor / OS
+.DS_Store
+*.swp

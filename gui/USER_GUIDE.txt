@@ -1,0 +1,887 @@
+==============================================================================
+              L T E S N I F F E R   G U I   —   U S E R   G U I D E
+                    Project44 lab build, generated 2026-05-26
+==============================================================================
+
+Everything the system can do, end-to-end. Reads top-to-bottom as a tour;
+also indexable by section header. Every feature here is in the multi-usrp
+branch at commit b468c97 or later.
+
+NOTE: this is the CAPTURE-ONLY build (branch sniffer-nodecrypt). All PDCP
+decryption / key-management features have been removed. Everything else —
+capturing pcaps, config, sessions, dashboard, spectrum, Wireshark, logs,
+and metrics — is unchanged.
+
+------------------------------------------------------------------------------
+0. AT A GLANCE
+------------------------------------------------------------------------------
+
+LTESniffer is a passive LTE PDCCH / PDSCH / PUSCH decoder built on srsRAN +
+FALCON. This GUI wraps it with a web frontend, a Python FastAPI backend, and
+a structured JSON event stream emitted by the C++ side.
+
+      ┌───────────┐  JSON-lines over FIFO   ┌──────────┐    WebSocket    ┌──────────┐
+      │ LTESniffer│ ──────────────────────▶ │ FastAPI  │ ◀──────────────▶│  React   │
+      │  (C++)    │                         │ backend  │   REST + WS     │ frontend │
+      └───────────┘                         └──────────┘                 └──────────┘
+            │                                     │
+            ▼                                     ▼
+        MAC pcaps                       ~/.config/ltesniffer-gui/
+        (in cwd =                          ├── config.json (active SnifferConfig)
+        captures_dir)                       ├── known_cells.json (registry)
+                                            └── token (bearer auth)
+
+What you get out:
+  - Live dashboard: cell info, packet feed, RB waterfall, RNTI table.
+  - One or more pcap files of decoded MAC PDUs (openable in Wireshark).
+  - Optional live PCAP-over-FIFO so Wireshark sees frames in real time.
+  - Prometheus /metrics endpoint, ZMQ publisher, session recorder.
+  - Per-UE state machine (Phase 4) + RNTI churn analyzer.
+
+------------------------------------------------------------------------------
+1. INSTALLATION & DEPENDENCIES
+------------------------------------------------------------------------------
+
+1.1 System packages
+    sudo apt install build-essential cmake libuhd-dev libboost-all-dev \
+                     libfftw3-dev python3-pip python3-venv \
+                     gnuradio-uhd uhd-host
+
+1.2 UHD firmware images (one-time)
+    sudo /usr/lib/uhd/utils/uhd_images_downloader.py
+
+1.3 Build LTESniffer
+    cd LTESniffer
+    cmake -S . -B build
+    cmake --build build -j$(nproc)
+    # binary: build/src/LTESniffer
+
+1.4 Backend (Python)
+    cd gui/backend
+    python3 -m venv .venv
+    .venv/bin/pip install -e .
+    # also recommended (Phase 3 features):
+    .venv/bin/pip install pyzmq prometheus_client zstandard playwright
+
+1.5 Frontend (Node 18+)
+    cd gui/frontend
+    npm install
+    npm run build      # produces dist/, served by the backend at /
+
+1.6 Optional: chrony with GPSDO refclock (Phase 3.2)
+    sudo bash scripts/setup-chrony-gpsdo.sh
+
+1.7 Sudoers entry for safe LTESniffer kill (Phase 3 stability)
+    # Add a line for the kill-wrapper so the non-root backend can SIGKILL
+    # root-owned LTESniffer subprocesses on shutdown.
+    echo 'your_user ALL=(root) NOPASSWD: /path/to/LTESniffer/scripts/kill-ltesniffer.sh' \
+        | sudo tee -a /etc/sudoers.d/ltesniffer
+
+------------------------------------------------------------------------------
+2. QUICK START
+------------------------------------------------------------------------------
+
+2.1 First-time launch in MOCK mode (no USRP needed)
+    cd gui/backend
+    LTESNIFFER_GUI_MOCK=1 .venv/bin/uvicorn main:app --port 8000
+
+    Browse to http://127.0.0.1:8000/
+    Click "▶ Start" — the dashboard populates with synthetic events at ~50/s.
+
+2.2 Real mode (USRP plugged in)
+    cd gui/backend
+    .venv/bin/uvicorn main:app --port 8000
+
+    Hit /config in the browser; load a known cell or set rf_freq/ul_freq
+    manually; Save & Restart.
+
+2.3 Expose to LAN (token-required by default)
+    LTESNIFFER_GUI_BIND=0.0.0.0 .venv/bin/uvicorn main:app --port 8000
+    # token is in ~/.config/ltesniffer-gui/token (mode 0600); pass it via
+    # `?token=<hex>` URL param the first time you open the dashboard from
+    # a non-loopback host. Frontend will persist it to localStorage.
+
+------------------------------------------------------------------------------
+3. LTESniffer CLI FLAGS (C++ binary)
+------------------------------------------------------------------------------
+
+The GUI builds the argv from SnifferConfig, but you can also run the
+binary directly. Flags are short options only (getopt).
+
+  -f <Hz>          Downlink centre frequency (required for cell search).
+  -u <Hz>          Uplink centre frequency (required for UL/Dual mode).
+  -g <dB>          RX gain; default = AGC. Try 50-70 for weak signals.
+  -A <n>           Number of RX antennas (default 1).
+  -m <0|1|2>       Sniffer mode: 0 = DL only, 1 = UL only, 2 = Dual.
+                   This fork is hard-wired for UL/Dual; mode 0 errors out.
+  -W <n>           Worker threads (>= 2; default 4).
+  -C               Enable cell search (PSS/SSS scan).
+  -I <pci>         Force fixed cell ID (skip cell search; needs -p).
+  -p <prb>         PRBs of fixed cell (6/15/25/50/75/100).
+  -r <rnti>        Target a single RNTI (decode only its traffic).
+  -y <mask>        CPU affinity bitmask (-1 disables; default -1).
+  -Y <n>           Decimate factor (0 = none).
+  -t <samples>     Time offset.
+  -s               Skip secondary (less frequent) DCI formats.
+  -S <ratio>       DCI primary/secondary split ratio (0.0-1.0; default 0.5).
+  -T <ms>          DCI split update interval (default 100 ms).
+  -L               Disable shortcut discovery.
+  -H <n>           RNTI histogram activation threshold.
+  -q <mode>        MCS table tracking algorithm mode (default 1 = best).
+  -z <mode>        API mode (3GPP-app):
+                     -1 = off
+                      0 = identity mapping
+                      1 = IMSI collecting
+                      2 = UE capability profiling
+                      3 = all
+  -d               Verbose debug log.
+  -F <file>        Pcap base filename (default ul_sniffer.pcap;
+                                       overridden per-mode by the writer).
+  -D <file>        DCI text file output (default stdout).
+  -E <file>        Stats CSV output.
+  -J <path>        JSON event output path (typically a FIFO; the GUI
+                   creates it). This is the channel the dashboard reads.
+  -X <args>        USRP A rfargs override (e.g. "clock=gpsdo,serial=XXX").
+  -Z <args>        USRP B rfargs override (UL USRP in Dual mode).
+  -a <args>        Single-USRP rfargs (used when -X/-Z not set).
+
+------------------------------------------------------------------------------
+4. ENVIRONMENT VARIABLES
+------------------------------------------------------------------------------
+
+Read by gui/backend/main.py + sub-modules:
+
+  LTESNIFFER_GUI_MOCK=1                 Replace SnifferRunner with MockRunner
+                                        (synthetic events at ~50/s, no SDR).
+  LTESNIFFER_GUI_REPLAY=<file.jsonl.zst>
+                                        Replace SnifferRunner with a
+                                        ReplayRunner that plays the recorded
+                                        session back. Pairs with:
+  LTESNIFFER_GUI_REPLAY_FF=1            Fast-forward mode (no real-time pacing).
+  LTESNIFFER_GUI_BIND=<addr>            Backend bind address. Default
+                                        127.0.0.1; set 0.0.0.0 to expose on LAN.
+  LTESNIFFER_GUI_REQUIRE_TOKEN_LOCAL=1  Force bearer-token auth even on
+                                        loopback (paranoia mode).
+  LTESNIFFER_GUI_RECORD=0               Disable the session recorder
+                                        (default ON; writes .jsonl.zst to
+                                        ~/.local/share/ltesniffer-gui/sessions).
+  LTESNIFFER_GUI_ZMQ_BIND=tcp://127.0.0.1:5555
+                                        Opt-in ZeroMQ PUB publisher.
+                                        Topic = event.t; payload = JSON bytes.
+
+Read by the C++ binary:
+
+  LTESNIFFER_PCAP_ROTATE_MB=<N>         Rotate the on-disk pcap every N MB.
+  LTESNIFFER_PCAP_ROTATE_MIN=<N>        Rotate every N minutes.
+                                        New files named <base>_<iso8601>_<seq>.pcap.
+  LTESNIFFER_PCAP_STREAM=<fifo path>    Mirror every MAC PDU to a named pipe
+                                        for live Wireshark dissection. The
+                                        GUI now exposes this as
+                                        `pcap_stream_fifo` in SnifferConfig
+                                        plus the 🦈 Wireshark button on the
+                                        Dashboard — see §10.2 for the full
+                                        flow. Direct CLI use still works:
+                                          mkfifo /tmp/lte.pcap
+                                          wireshark -k -i /tmp/lte.pcap
+
+------------------------------------------------------------------------------
+5. REST API REFERENCE
+------------------------------------------------------------------------------
+
+All endpoints under /api/* require a bearer token unless the request is on
+loopback (default). /api/health and /metrics are always open. /assets/* and
+/index.html are static.
+
+  GET    /api/health
+         { ok, mock, auth_required }
+  GET    /api/status
+         { state:{running,pid,started_at,exit_code,argv,replay?,mock?}, mock }
+
+  -- Config --
+  GET    /api/config                    → SnifferConfig
+  PUT    /api/config (SnifferConfig)    persist (with server-side validation
+                                        of the binary_path).
+
+  -- Capture lifecycle --
+  POST   /api/capture/start             body: SnifferConfig | null
+  POST   /api/capture/stop
+  POST   /api/capture/restart           body: SnifferConfig | null
+
+  -- USRPs --
+  GET    /api/usrps                     uhd_find_devices result.
+  GET    /api/usrps/autoconfig          suggested rfargs based on detected USRPs.
+
+  -- Known cells (registry of working freqs) --
+  GET    /api/known-cells               list cells
+  PUT    /api/known-cells (KnownCellsFile)
+                                        replace
+  POST   /api/known-cells/save-current  body: { label, notes?, pci?, bandwidth_mhz? }
+                                        snapshot active SnifferConfig as a new cell
+  POST   /api/known-cells/{idx}/load    copy cell into active SnifferConfig
+  PUT    /api/known-cells/{idx} (KnownCell)   edit
+  DELETE /api/known-cells/{idx}         remove
+
+  -- Spectrum analyzer launcher --
+  GET    /api/spectrum                  status + preflight (display, uhd_images, tools)
+  POST   /api/spectrum/launch           body: { freq_hz, sample_rate_hz?, tool?, device_args? }
+  POST   /api/spectrum/stop
+
+  -- Wireshark live-stream launcher --
+  POST   /api/wireshark/open            spawns `wireshark -k -i <pcap_stream_fifo>`.
+                                        Requires cfg.pcap_stream_fifo to be set
+                                        and a $DISPLAY on the backend host.
+
+  -- Captures (pcap files) --
+  GET    /api/captures                  list pcaps from allowed roots
+  GET    /api/captures/download?path=…  serve a pcap (allowlist-checked)
+
+  -- Analytics --
+  GET    /api/analytics/rnti-churn?path=<sessions/*.jsonl.zst>
+                                        offline RNTI lifetime / reuse analysis
+
+  -- Live event stream --
+  WS     /api/events                    JSON event stream, token via ?token=
+                                        First frame on connect: {"t":"replay",
+                                        "events":[...]} envelope with sticky
+                                        state (lifecycle, hello, cell, mib, stats).
+                                        Then live events one per WS frame.
+
+  -- Observability --
+  GET    /metrics                       Prometheus exposition format.
+
+------------------------------------------------------------------------------
+6. WEBSOCKET EVENT PROTOCOL
+------------------------------------------------------------------------------
+
+Every event has at minimum {"t":<type>}. Most include a monotonic "ts"
+(seconds since C++ process start) and the type-specific fields below.
+
+  hello       Once at sniffer startup; carries Args dump.
+                {t:"hello", ts, version:1, args:{rf_freq,ul_freq,...}}
+
+  cell        Cell sync acquired.
+                {t:"cell", ts, pci, nof_prb, nof_ports, cp, mode,
+                  dl_freq, ul_freq, sample_rate}
+
+  mib         MIB decoded.
+                {t:"mib", ts, sfn, sfn_offset}
+
+  sf_tick     Lightweight per-subframe heartbeat (Phase 2.4). ~80 bytes.
+                {t:"sf_tick", ts, sfn, sf, cfi, dl_n, ul_n}
+
+  sf          Rich per-subframe event (capped at 50 Hz by the C++ throttle).
+                {t:"sf", ts, sfn, sf, cfi,
+                  dl:[{rnti,fmt,mcs,nprb,tbs,ndi,harq,ncce,L,hist,hex},...],
+                  ul:[{rnti,fmt,mcs,nprb,tbs,ndi,ncce,L,hist,hex},...],
+                  rb_dl:[uint16,...],
+                  rb_ul:[uint16,...],
+                  pwr_dl:[float,...],
+                  pwr_min, pwr_max}
+
+  stats       Periodic decoder stats (~1 Hz).
+                {t:"stats", ts, sfn, sf_processed, sf_skipped,
+                  nof_rnti, rb_dl_total, rb_ul_total, cfo_hz, dropped_events}
+
+  identity    API mode (-z) collected an identity.
+                {t:"identity", ts, sfn, kind, rnti, value, from}
+
+  log         Free-form log line.
+                {t:"log", ts, level, source?, msg}
+
+  bye         Clean shutdown.
+                {t:"bye", ts, reason}
+
+  -- Backend-injected --
+
+  lifecycle   {t:"lifecycle", event:"started"|"exited", pid?, argv?, exit_code?}
+
+  replay      Connect-time envelope wrapping the sticky+buffered events.
+                {t:"replay", events:[...]}
+
+  -- Phase 4 state tracker injects --
+
+  ra_event    Best-effort RA detection (first-seen-C-RNTI heuristic).
+                {t:"ra_event", ts, cell_id, sfn, sf, rnti, source}
+
+  ue_state    Per-RNTI state machine transitions.
+                {t:"ue_state", ts, cell_id, rnti, from, to}
+              (states: IDLE, DATA, FORGOTTEN)
+
+------------------------------------------------------------------------------
+7. GUI PANELS & FEATURES
+------------------------------------------------------------------------------
+
+7.1 Status bar (top)
+    - Logo + nav: Dashboard / Config (+ Help, when present)
+    - Connection indicator (● connected / ○ disconnected)
+    - Capture indicator (● running pid N / ○ stopped)
+    - Sticky cell summary: PCI · PRB · DL freq
+
+7.2 Dashboard
+    Layout: capture controls + spectrum button | cell card (top row),
+    metrics tiles (second row), main grid (packet feed / waterfall /
+    RNTI table), tabbed footer (logs / captures / identities).
+
+    a) Capture controls   ▶ Start  ■ Stop  ⟳ Restart
+       All POST to /api/capture/*. Restart = stop + start with current cfg.
+
+    b) Spectrum launcher (📡 Spectrum)
+       Opens uhd_fft / gqrx on the backend's $DISPLAY with current DL freq
+       + sample rate prefilled. USRP picker shows detected boards; marks
+       any held by the running sniffer ("HELD BY SNIFFER"). Pre-flight panel
+       inside the popover surfaces: $DISPLAY ok, UHD images installed,
+       tool on PATH — with the exact fix command for each red item.
+       Disabled in mock mode (real RF samples required). DL freq comes
+       from (in order): live cell sync → last sniffer launch args → saved
+       Config — so you can launch the spectrum before any capture has run.
+
+    c) Wireshark launcher (🦈 Wireshark)
+       Opens Wireshark on cfg.pcap_stream_fifo so MAC PDUs are dissected
+       live. Disabled when no FIFO is set (tooltip points you at Config).
+       Open this BEFORE starting capture — see §10.2 for the ordering
+       caveat and the full flow.
+
+    d) Cell card
+       Headline of what's locked: PCI, PRB count, CP type, FDD/TDD,
+       DL+UL freq, sample rate, bandwidth, MIB SFN, CFO, % skipped SF.
+
+    e) Metrics tiles (6, refreshed at 1 Hz)
+       UEs seen · DCIs decoded · DL/UL split · Throughput · RBs/s ·
+       Decoding health %. Values are quantized so digits don't jitter.
+
+    f) Packets · live DCI feed
+       Per-DCI table: Dir / SFN.sf / Time / RNTI / Format / MCS / PRB /
+       TBS / NDI / HARQ / hex. Filter buttons ALL / DL / UL; RNTI input
+       filter; ❚❚ pause button. Hover over the table to auto-pause for
+       reading (badge: "+N while paused").
+
+    g) RB waterfall (canvas)
+       Time × frequency heat map. Toggle Alloc (per-RNTI colours) vs
+       Power (RSRP gradient). Toggle DL vs UL. Newest at bottom.
+       Throttled to 5 Hz repaint.
+
+    h) RNTI table (sortable)
+       RNTI · last-seen · DL count · DL RB · DL bytes · UL count · UL RB.
+       Default sort: RNTI ascending (stable). Toggle "show only active
+       (last 5 s)". Rows fade as they age out.
+
+    i) Tabbed footer
+       Logs       — every backend / stderr / state-tracker log event.
+                    Auto-scrolls to bottom; pauses on hover.
+       Captures   — pcap files in captures_dir + ~/work/captures +
+                    ~/work/LTESniffer/pcap_file_example. Download link
+                    per file; size + age. The green "live capture"
+                    badge requires the sniffer to be running AND the
+                    file modified in the last 20 s — see §10.4.
+       Identities — IMSI/TMSI/GUTI/UECapa collected by API mode (-z).
+
+7.3 Config page
+    Form covering every SnifferConfig field, grouped:
+      RF / hardware   — freqs, gain, antennas, USRP rfargs, decimate, CPU mask
+      Cell & mode     — sniffer mode, API mode, cell search, fixed cell ID, PRB, target RNTI
+      Decoder         — workers, DCI split, shortcut, MCS tracking, debug
+      Output files    — pcap, DCI text, stats CSV,
+                        pcap_stream_fifo (live Wireshark FIFO — see §10.2)
+      GUI             — binary_path, captures_dir, sudo toggle
+
+    Above the form:
+      Known cells — one-click load
+        Lists each saved cell; ↓ Load copies into the form; ✕ deletes.
+        "+ Save current as known cell" snapshots active config with a
+        label + notes.
+
+      🔍 Auto-detect USRPs button
+        Calls /api/usrps/autoconfig; populates rf_args / usrp_a_args /
+        usrp_b_args from uhd_find_devices output.
+
+      Detected USRPs chips
+        Click any to copy its `clock=gpsdo,serial=XXX,type=…` into rf_args.
+
+    Save / Save & Restart buttons at the top right.
+
+------------------------------------------------------------------------------
+8. KNOWN CELLS REGISTRY
+------------------------------------------------------------------------------
+
+Stored at ~/.config/ltesniffer-gui/known_cells.json (mode 0600).
+Each entry: label, dl_freq_mhz, ul_freq_mhz, bandwidth_mhz, nof_prb,
+pci, sniffer_mode, usrp_a_args, usrp_b_args, rf_gain, last_success_iso,
+notes.
+
+Three ways to interact:
+  Config page  — visible at top; load/edit/delete buttons.
+  REST API     — see §5.
+  Hand-edit    — the JSON is small and self-explanatory.
+
+Adding a working cell from the form:
+  1. Tune to the cell (Load a known one, then Save & Restart).
+  2. If it locks + decodes DCIs, click "+ Save current as known cell".
+  3. Type a label and optional notes (operator name, PCI seen, etc.).
+  Now it's in the registry for future sessions.
+
+Seeded example: Pelephone B3 at DL 1845 / UL 1750 MHz (the first
+successful real-RF capture on this rig — 256 DL RNTIs, 85 UL RNTIs,
+10 153 UL DCIs in 120 s).
+
+------------------------------------------------------------------------------
+9. SPECTRUM ANALYZER LAUNCHER
+------------------------------------------------------------------------------
+
+The "📡 Spectrum" button on the dashboard opens a native UHD GUI on the
+backend's $DISPLAY tuned to the active DL freq. Useful for:
+  - Confirming a cell actually exists at the freq you want to sniff.
+  - Scanning a band to find LTE plateaus (wide ~5-20 MHz flat shapes).
+  - Diagnosing weak / blocked / interfered cells.
+
+Supported tools (auto-detected on PATH):
+  uhd_fft         primary recommendation (FFT + waterfall)
+  usrp_fft        legacy alias
+  gqrx            popular SDR receiver
+
+Pre-flight checks the popover shows:
+  ✓/✗ display       $DISPLAY or $WAYLAND_DISPLAY available?
+  ✓/✗ uhd_images    USRP firmware/FPGA images downloaded?
+  ✓/✗ tool          uhd_fft / gqrx on PATH?
+  → fix command provided inline for each red item.
+
+USRP picker:
+  Radio buttons for every USRP from uhd_find_devices.
+  USRPs currently held by the running sniffer are marked
+  "HELD BY SNIFFER" and the per-tool launch button is disabled.
+
+Stderr surfacing:
+  If the launched tool dies within 2.5 s, its stderr tail is captured
+  and shown in a red box inside the popover (e.g. "No devices found"
+  or "Could not find path for image"). The button turns red
+  ("⚠ Spectrum failed") and the next click re-opens with the last
+  error pinned.
+
+CLI direct equivalent:
+  DISPLAY=:0 uhd_fft -a "serial=XXX" -f 1845000000 -s 40000000
+
+------------------------------------------------------------------------------
+10. PCAP OUTPUT
+------------------------------------------------------------------------------
+
+The C++ side writes MAC PDUs (DL link type 147 — MAC-LTE, Wireshark
+native) into one file per sniffer mode. Files land in captures_dir
+(cfg field; default ~/ltesniffer-captures/). Owner is root (LTESniffer
+runs under sudo).
+
+  Mode 0 (DL)     ltesniffer_dl_mode.pcap
+  Mode 1 (UL)     ltesniffer_ul_mode.pcap
+  Mode 2 (Dual)   ltesniffer_dual_mode.pcap
+
+API-mode (IMSI/UECapa) PDUs go separately into api_collector.pcap.
+
+10.1 Rotation (Phase 3.3)
+  Opt-in via env vars (no restart needed for the GUI to pick up):
+    LTESNIFFER_PCAP_ROTATE_MB=200       # rotate every 200 MB
+    LTESNIFFER_PCAP_ROTATE_MIN=30       # rotate every 30 minutes
+  New names: ltesniffer_dual_mode_20260526T193924_001.pcap
+  A log line "[PcapWriter] rotated -> path (reason=size|time)" appears
+  in the Logs panel each time.
+
+10.2 Live-stream via FIFO  (the easy way — wired through the GUI)
+  Same DLT=147 stream as the on-disk pcap, mirrored to a named pipe so
+  Wireshark dissects MAC PDUs as they're decoded.
+
+  GUI flow (recommended):
+    1. Config page → "Live-stream FIFO (Wireshark)" → set e.g.
+       /tmp/lte.pcap → Save.
+    2. Dashboard → 🦈 Wireshark button → opens Wireshark on the FIFO
+       (Wireshark blocks on the reader side until a writer connects).
+    3. Dashboard → ▶ Start capture. The C++ child opens the FIFO for
+       write, both ends connect, packets flow.
+
+  Critical ordering: open Wireshark BEFORE starting capture. The C++
+  PcapWriter opens the FIFO O_WRONLY|O_NONBLOCK and silently skips
+  streaming if no reader is attached (ENXIO). The button warns you
+  in its tooltip if the order is wrong.
+
+  Under the hood:
+    - SnifferConfig.pcap_stream_fifo holds the path.
+    - argv builder prepends  `env LTESNIFFER_PCAP_STREAM=<path>` after
+      sudo -n so the env var survives sudo's `env_reset`.
+    - backend mkfifos the path on capture start with mode 0660.
+    - Path is validated to live under /tmp/ or ~/ltesniffer-captures/
+      (no symlinks, refuses to overwrite an existing non-FIFO file).
+
+  Pure CLI alternative (no GUI):
+    mkfifo /tmp/lte.pcap
+    wireshark -k -i /tmp/lte.pcap &            # terminal A
+    sudo -n env LTESNIFFER_PCAP_STREAM=/tmp/lte.pcap \
+         /path/to/LTESniffer -f … -u … -m 2 -A 2 -C \
+         -X "clock=gpsdo,serial=…" -Z "clock=gpsdo,serial=…"
+
+  If the reader dies mid-capture, the writer ignores SIGPIPE so the
+  sniffer keeps going. Click 🦈 Wireshark again to reopen — you'll
+  need to restart capture so the C++ writer re-attaches.
+
+10.3 Filter UL vs DL in Wireshark
+  Display filter:    mac-lte.direction == 0      # UL
+                     mac-lte.direction == 1      # DL
+
+10.4 Captures tab
+  /api/captures lists pcaps under captures_dir + a couple of common
+  spots. Each row shows size + age and offers a download link. The
+  download endpoint allowlist-checks paths so you can't ../ escape
+  through it.
+
+  The green "live capture" badge requires ALL of:
+    (1) the sniffer subprocess is currently running, AND
+    (2) the pcap lives in captures_dir, AND
+    (3) the file was modified within the last 20 s.
+  Without (3), a stale pcap left over from a previous session that
+  happens to live in captures_dir would forever claim to be live.
+
+------------------------------------------------------------------------------
+11. SESSION RECORDER & REPLAY
+------------------------------------------------------------------------------
+
+11.1 Recorder (default ON — disable with LTESNIFFER_GUI_RECORD=0)
+  Every event from the broadcast bus is tee'd to:
+    ~/.local/share/ltesniffer-gui/sessions/session_<iso8601>_<seq>.jsonl.zst
+  Files rotate every 50 MB. Mode 0600 (may contain RNTIs / DCI hex).
+
+11.2 ReplayRunner
+  Set LTESNIFFER_GUI_REPLAY=<file.jsonl.zst> on startup and the backend
+  swaps in a ReplayRunner that reads the file with real-time pacing
+  (or as fast as possible with LTESNIFFER_GUI_REPLAY_FF=1). The dashboard
+  sees the recorded events identically to a live capture.
+
+  Use cases:
+    - Bug reports with full reproducible stimulus.
+    - Demoing the dashboard without hardware.
+    - Regression-testing the frontend against a frozen event stream.
+
+------------------------------------------------------------------------------
+12. PROMETHEUS METRICS (/metrics)
+------------------------------------------------------------------------------
+
+Auth-free endpoint at GET /metrics, Prometheus exposition format.
+Bind 127.0.0.1 if you don't want it readable from the LAN.
+
+Counters:
+  ltesniffer_dci_decoded_total{direction="dl"|"ul"}
+  ltesniffer_tbs_bits_total{direction}
+  ltesniffer_rb_total{direction}
+  ltesniffer_sf_processed_total
+  ltesniffer_sf_skipped_total
+  ltesniffer_overflow_total
+  ltesniffer_lifecycle_total{event="started"|"exited"}
+  ltesniffer_dropped_events_total
+
+Gauges:
+  ltesniffer_rnti_active
+  ltesniffer_cfo_hz
+  ltesniffer_cell_pci          (-1 = no cell)
+  ltesniffer_dl_freq_hz
+  ltesniffer_capture_running   (0|1)
+
+Histogram:
+  ltesniffer_dci_mcs{direction}   buckets 0,2,4,…,32
+
+A minimal Prometheus scrape:
+  - job_name: ltesniffer
+    scrape_interval: 1s
+    static_configs:
+      - targets: ['127.0.0.1:8000']
+
+Then any Grafana dashboard built on Prometheus can chart per-cell
+throughput, RNTI counts, decoding health, etc.
+
+------------------------------------------------------------------------------
+13. ZEROMQ PUBLISHER (Phase 3.8)
+------------------------------------------------------------------------------
+
+Opt-in via env:
+  LTESNIFFER_GUI_ZMQ_BIND=tcp://127.0.0.1:5555
+
+PUB socket. Each event is sent as a two-frame multipart:
+  [ topic_bytes, payload_bytes ]
+where topic = event.t and payload = canonical JSON (same bytes the
+WebSocket sends, no re-encoding).
+
+Topics: hello cell mib sf sf_tick stats log identity lifecycle bye
+        replay (envelope), ra_event ue_state.
+
+SUB example:
+  import zmq, json
+  s = zmq.Context().socket(zmq.SUB)
+  s.connect("tcp://127.0.0.1:5555")
+  s.subscribe(b"sf")                 # or b"" for everything
+  while True:
+      topic, payload = s.recv_multipart()
+      print(topic, json.loads(payload)["sfn"])
+
+Publisher uses NOBLOCK send + SNDHWM=5000 — slow subscribers get
+drops, never back-pressure the producer.
+
+------------------------------------------------------------------------------
+14. PHASE-4 STATEFULNESS
+------------------------------------------------------------------------------
+
+Live per-RNTI state machine. Consumes the broadcast event stream
+(no extra protocol) and emits:
+
+  ra_event    First-seen C-RNTI heuristic ≈ MAC Msg4 contention resolution.
+              Includes sfn/sf at the sighting. (Note: this is a heuristic
+              because true PRACH/RAR parsing would need C++ MAC-PDU plumbing.)
+
+  ue_state    Per-RNTI transitions IDLE → DATA → IDLE → FORGOTTEN.
+              Tunables in state_tracker.py:
+                UE_IDLE_AFTER_S    = 8
+                UE_FORGET_AFTER_S  = 60
+
+Each transition also generates a human-readable log line visible in
+the Logs panel:
+  "[cell 0] new UE rnti=0x49a9 first seen, sfn=872.3"
+  "[cell 0] UE rnti=0x49a9 → IDLE (no DCI for 9s, last had 4/0 DL/UL DCIs)"
+
+C-RNTI filter: 0x003D..0xFFF3 per 3GPP TS 36.321 §7.1. Non-C-RNTIs
+(SI, P, RA) are skipped.
+
+------------------------------------------------------------------------------
+15. RNTI CHURN ANALYZER (offline)
+------------------------------------------------------------------------------
+
+GET /api/analytics/rnti-churn?path=<sessions/*.jsonl.zst>
+
+Walks a recorded session, tracks per-RNTI activity windows (gap > 5 s
+= new window), and reports lifetime + reuse-delay distributions
+(min / p25 / median / p75 / p95 / max). Useful for sizing the
+UE_FORGET_AFTER_S knob in state_tracker for your specific network.
+
+Returns JSON:
+  {
+    path, events_total, sf_events, unique_rntis, total_windows,
+    lifetime_seconds:   {n, min, p25, median, mean, p75, p95, max},
+    reuse_delay_seconds:{n, ...}
+  }
+
+------------------------------------------------------------------------------
+16. SECURITY & PERMISSIONS
+------------------------------------------------------------------------------
+
+16.1 Bind + auth
+  Default bind: 127.0.0.1 (loopback only).
+  LAN: set LTESNIFFER_GUI_BIND=0.0.0.0; a 256-bit token is auto-created
+  at ~/.config/ltesniffer-gui/token (mode 0600). Pass via Authorization:
+  Bearer <hex> on REST or ?token=<hex> on the WS upgrade.
+
+  Set LTESNIFFER_GUI_REQUIRE_TOKEN_LOCAL=1 to require the token even on
+  loopback.
+
+  /api/health and /metrics stay open (so monitoring works without
+  exposing the token).
+
+16.2 File permissions
+  All config / token / known_cells / session files written 0600
+  with O_NOFOLLOW + parent mkdir 0700. Mode is enforced explicitly
+  (chmod after write) so an unlucky umask can't widen them.
+
+16.3 Path allowlists
+  binary_path  — must resolve to one of:
+                   <repo>/build/src/LTESniffer
+                   /usr/local/bin/LTESniffer
+                   /usr/bin/LTESniffer
+                 (otherwise 403 from PUT /api/config or capture/start).
+  pcap download — only files under captures_dir, ~/work/captures, or
+                  ~/work/LTESniffer/pcap_file_example/ can be served.
+                  Path-traversal blocked via .resolve() + relative_to().
+
+16.4 Sudo / orphan handling
+  LTESniffer runs as root under sudo NOPASSWD (cfg.sudo). On backend
+  shutdown the FastAPI lifespan calls runner.stop() which SIGINTs the
+  child; if it doesn't exit within 5 s, the sudoers-whitelisted
+  scripts/kill-ltesniffer.sh is invoked to SIGKILL the root-owned
+  process before the sudo wrapper is itself killed — without this,
+  killing sudo alone re-parents LTESniffer to init and creates an OOM
+  orphan.
+
+  On startup the backend also sweeps any stale LTESniffer processes
+  via pgrep + the kill-wrapper.
+
+------------------------------------------------------------------------------
+17. OPERATIONAL TIPS & TROUBLESHOOTING
+------------------------------------------------------------------------------
+
+Dashboard says "stopped" but events are clearly flowing
+  → Stale browser tab. Hard-refresh (Ctrl+Shift+R). The SPA is served
+    with Cache-Control: no-store specifically to fix this for future
+    refreshes.
+
+"Waiting for cell discovery…" forever
+  → LTESniffer can't lock at the configured freq. Check Logs tab for
+    PSS / cell-not-found messages. Use the Spectrum button to confirm
+    activity at that freq. Try a known-good cell from the registry.
+
+Spectrum button red ("⚠ Spectrum failed")
+  → Hover the button for the last error in the tooltip. Click to re-open
+    the popover for the full stderr. Common: "No devices found" =
+    USRP held by the running sniffer (stop capture first) or wrong serial;
+    "Could not find path for image" = run uhd_images_downloader.py once.
+
+Pcap files are 0 bytes
+  → The C++ pipeline locks the cell + decodes MIB but no PDCCH content
+    is being decoded. Use the Spectrum button to confirm a real LTE-shaped
+    plateau exists at your DL freq. Try lower gain (clipping?), longer
+    dwell (>60 s), or a known-good freq from the registry. Note:
+    `mac_pcap` only writes once at least one DCI's MAC PDU has been
+    successfully demodulated.
+
+No `sf` events (only sf_tick)
+  → If you see sf_tick at ~1000/s but no rich sf, you're on a stale
+    build of LTESniffer that has the JSONEmitter rich-event init bug
+    (last_rich_sf = time_point::min()). Rebuild from commit faa080f
+    or later — `cmake --build build -j$(nproc)` from the repo root.
+
+No sf events at all (sf_tick=0 too)
+  → consumeDCICollection was commented out at SubframeWorker.cc:273.
+    Fixed in commit faa080f. Rebuild.
+
+Multi-cell ambitions on the user's rig
+  → Both B210s currently share one USB-3 controller (Bus 02). For
+    actual multi-cell capture (Phase 4.7) you'd want each B210 on a
+    separate USB-3 root controller, or move to PCIe/10GbE SDRs (X310/N310).
+
+GPSDO troubles
+  → `gps_locked: True` + `ref_locked: False` is bad — the GPSDO sees
+    satellites but its 10 MHz output isn't disciplining the FPGA's
+    reference clock. Sample timing drifts. Usually means a poor GPSDO
+    model (LC_XO is barely a GPSDO) or insufficient GPS signal. The
+    LTESniffer fork is hard-wired to require `clock=gpsdo` for dual
+    mode, so ref_locked needs to succeed for the multi-USRP sync to
+    work.
+
+Wireshark says "Capture file appears truncated"
+  → Expected for live FIFO streams or rotating pcaps in mid-write.
+    The zstd-compressed session recordings need streaming decompress
+    (zstandard.ZstdDecompressor().stream_reader(f), not .decompress(bytes)).
+
+Wireshark opens, then dies with "Couldn't run /usr/bin/dumpcap in child
+process: Permission denied"
+  → On Debian/Ubuntu, /usr/bin/dumpcap is mode 0754 owner root group
+    `wireshark`. Non-wireshark-group users can't exec it. Fix:
+        sudo usermod -aG wireshark $USER
+        # log out + back in (groups only update on a fresh login)
+        # restart the GUI backend so it inherits the new group
+    or equivalently:
+        sudo dpkg-reconfigure wireshark-common
+        # answer YES to "Should non-superusers be able to capture packets?"
+    The /api/wireshark/open endpoint now pre-checks `os.access(dumpcap,
+    X_OK)` and 403s with this exact message before spawning Wireshark,
+    so the GUI surfaces the fix instead of failing silently in a dialog.
+
+------------------------------------------------------------------------------
+18. CODE-ONLY FEATURES (LTESniffer C++ side, not surfaced in GUI)
+------------------------------------------------------------------------------
+
+These exist in the binary but the GUI doesn't expose them as form
+fields. Pass via raw flag if you really need them.
+
+  -d (en_debug)             SnifferConfig has en_debug but the Config form
+                            doesn't show it explicitly as a debug toggle.
+                            Edit ~/.config/ltesniffer-gui/config.json
+                            directly to set "en_debug": true.
+
+  -i <input_file>           File-mode replay of an IQ recording. The C++
+                            supports it; the GUI assumes RF only.
+                            Workaround: run the binary directly with -i.
+
+  -w (file_wrap)            Loop the file-mode input. Same as above.
+
+  -o (file_offset_freq)     Frequency offset correction for file input.
+  -O (file_offset_time)     Sample offset for file input.
+  -P (file_nof_ports)       Override port count for file input.
+  -c (file_cell_id)         Override cell ID for file input.
+
+  -l (force_N_id_2)         Force the N_id_2 PSS selection during cell
+                            search. Useful when there are multiple cells
+                            with overlapping PSS.
+
+  -n (nof_subframes)        Limit the capture to N subframes (0 = forever).
+                            GUI assumes infinite; pass directly if needed.
+
+  -v (verbose)              srsRAN debug verbosity. The cfg.en_debug is
+                            similar; -v is more granular (-vv, -vvv).
+
+Things in the inspection report that exist in the codebase but aren't
+implemented yet (full descriptions in TIER 5 of the v2 inspection report):
+
+  - PHICH ACK/NACK decoding (F21, deferred 4.1) — srsran_phich_decode
+    integration. Backend ready; C++ side untouched.
+  - SCell inventory from RRC reconfig (F33, deferred 4.5) — needs ASN.1
+    decode beyond what the C++ side does today.
+  - CIF cross-carrier decoding (F3, deferred 4.6) — DCI bit-field parser
+    addition.
+  - Multi-cell aggregator (F2, deferred 4.7) — orchestration of N
+    independent LTESniffer subprocesses, each with a per-cell tag.
+  - GSMTAP UDP output (F13, deferred 3.4) — superseded operationally by
+    the FIFO live-stream (F12 / Phase 3.5).
+  - UHD-async overflow markers in pcap (F25, deferred 3.1) — needs
+    UHD async-msg queue subscription in LTESniffer_Core.
+
+------------------------------------------------------------------------------
+19. FILE LAYOUT
+------------------------------------------------------------------------------
+
+LTESniffer repo:
+  src/
+    include/      JSONEmitter.h, ArgManager.h, LTESniffer_Core.h, PcapWriter.h, …
+    src/          JSONEmitter.cc, ArgManager.cc, LTESniffer_Core.cc,
+                  PcapWriter.cc, SubframeWorker.cc, …
+  build/          cmake build dir
+  scripts/
+    kill-ltesniffer.sh         sudoers-whitelisted kill wrapper
+    setup-chrony-gpsdo.sh      chrony refclock installer
+
+  gui/
+    PROTOCOL.md       JSON event schema
+    README.md         setup + features quick-ref
+    USER_GUIDE.txt    THIS FILE
+    WORKPLAN.md       4-phase improvement plan + per-phase validation
+    backend/
+      main.py            FastAPI app, REST + WS, SPA mount
+      sniffer.py         SnifferRunner — subprocess + FIFO reader
+      mock.py            MockRunner — synthetic events
+      config.py          SnifferConfig pydantic + argv builder
+      known_cells.py     KnownCell + load/save (Phase 5)
+      captures.py        pcap discovery + safe download
+      spectrum.py        uhd_fft launcher + preflight
+      usrp.py            uhd_find_devices wrapper + auto-config
+      auth.py            bearer token + middleware gate
+      recorder.py        SessionRecorder + ReplayRunner
+      metrics.py         Prometheus exporter
+      zmq_pub.py         ZeroMQ publisher
+      state_tracker.py   Phase 4 per-RNTI state machine
+      analytics.py       Phase 4 RNTI churn analyzer
+    frontend/
+      src/
+        pages/{Dashboard,Config,Help}.tsx
+        components/{StatusBar,CaptureControls,SpectrumButton,CellCard,
+                    MetricsTiles,PacketFeed,RBWaterfall,RNTITable,
+                    LogPanel,CapturesPanel,IdentitiesPanel}.tsx
+        lib/{store,api,types,color,useStableTick}.ts
+        App.tsx, main.tsx, index.css
+
+User config (mode 0600 on all):
+  ~/.config/ltesniffer-gui/
+    config.json        active SnifferConfig
+    known_cells.json   working freqs registry
+    token              256-bit auth token
+
+User data:
+  ~/.local/share/ltesniffer-gui/sessions/
+    session_<iso8601>_<seq>.jsonl.zst    rolling 50 MB
+
+Default capture output:
+  ~/ltesniffer-captures/                 (cfg.captures_dir)
+    ltesniffer_<mode>_<ts>_<seq>.pcap    rotated MAC pcap
+    api_collector.pcap                   API-mode pcap
+    iq_sample_dl.bin, mcs_statistic.csv, ul_sample.raw  (misc C++ outputs)
+
+==============================================================================
+                              END OF GUIDE
+==============================================================================

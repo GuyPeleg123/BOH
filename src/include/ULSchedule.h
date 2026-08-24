@@ -72,10 +72,10 @@ public:
     void                 push_rar_ULSche(uint32_t tti, const std::vector<DCI_UL>& rar_dci_ul);
     void                 deleteULSche(uint32_t tti);
     void                 delete_rar_ULSche(uint32_t tti);
-    std::vector<DCI_UL>* getULSche(uint32_t tti);
-    std::vector<DCI_UL>* get_rar_ULSche(uint32_t tti);
-    int                  get_ul_tti(uint32_t cur_tti);
-    int                  get_rar_ul_tti(uint32_t cur_tti);
+    std::vector<DCI_UL>  getULSche(uint32_t tti);      // by value: a raw pointer into the
+    std::vector<DCI_UL>  get_rar_ULSche(uint32_t tti); // map dangled when another worker erased the key
+    uint32_t             get_ul_tti(uint32_t cur_tti);
+    uint32_t             get_rar_ul_tti(uint32_t cur_tti);
 
     void                 set_config();
     bool                 get_config()                    {return  config;   }

@@ -1439,6 +1439,7 @@ void MCSTracking::write_csv_file(uint16_t rnti, dl_sniffer_mcs_tracking_t &stati
         csv_file << mcs_sc_str << ',';
     }
     csv_file << "\n";
+    csv_file.flush();
 }
 
 /*__________________Manage UE Specific Configuation___________________*/

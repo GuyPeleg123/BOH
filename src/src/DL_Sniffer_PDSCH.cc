@@ -2,6 +2,28 @@
 
 float p_a_array[8]{-6, -4.77, -3, -1.77, 0, 1, 2, 3};
 
+/* srsRAN implements PDSCH spatial-multiplexing predecoding only for 1 and 2 Tx
+ * ports; for a 4-Tx-port cell every UE-data PDSCH (TM3/TM4) hits
+ * srsran_predecoding_multiplex's unimplemented branch and floods
+ * "Error predecoding multiplex: not implemented for 4 Tx ports". This wrapper
+ * skips exactly that case (4 ports + spatial-mux/CDD) and reports a clean decode
+ * failure instead. Everything else — paging/SIB and single-port or transmit-
+ * diversity PDSCH (PORT0/DIVERSITY), and all of the uplink — is untouched. */
+static int ul_sniffer_decode_pdsch_4pguard(srsran_ue_dl_t*      q,
+                                           srsran_dl_sf_cfg_t*  sf,
+                                           srsran_pdsch_cfg_t*  cfg,
+                                           srsran_pdsch_res_t*  res)
+{
+	if (q->cell.nof_ports >= 4 &&
+	    (cfg->grant.tx_scheme == SRSRAN_TXSCHEME_SPATIALMUX ||
+	     cfg->grant.tx_scheme == SRSRAN_TXSCHEME_CDD))
+	{
+		for (int tb = 0; tb < SRSRAN_MAX_CODEWORDS; tb++) res[tb].crc = false;
+		return SRSRAN_SUCCESS;   // skipped cleanly, no error flood
+	}
+	return srsran_ue_dl_decode_pdsch(q, sf, cfg, res);
+}
+
 PDSCH_Decoder::PDSCH_Decoder(uint32_t idx,
 							 LTESniffer_pcap_writer *pcapwriter,
 							 MCSTracking *mcs_tracking,
@@ -86,7 +108,7 @@ int PDSCH_Decoder::decode_imsi_tmsi_paging(uint8_t *sdu_ptr, int length)
 	int ret = SRSRAN_ERROR;
 	pcch_msg_s pcch_msg;
 	asn1::cbit_ref bref(sdu_ptr, length);
-	if (pcch_msg.unpack(bref) == asn1::SRSASN_SUCCESS or pcch_msg.msg.type().value == pcch_msg_type_c::types_opts::c1)
+	if (pcch_msg.unpack(bref) == asn1::SRSASN_SUCCESS and pcch_msg.msg.type().value == pcch_msg_type_c::types_opts::c1)
 	{
 		paging_s *paging = &pcch_msg.msg.c1().paging();
 		if (paging->paging_record_list_present)
@@ -227,7 +249,8 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 							  uint32_t cur_rnti,
 							  std::string table,
 							  std::string RNTI_name,
-							  uint32_t tti)
+							  uint32_t tti,
+							  bool write_pcap_en)
 {
 	int ret = 0;
 	mimo_ret = dl_sniffer_config_mimo(&falcon_ue_dl->q->cell, cur_format, cur_ran_dci_dl, cur_grant);
@@ -254,7 +277,7 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 		// main function to decode
 		if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 		{
-			if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+			if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 			{
 				ERROR("ERROR: Decoding PDSCH");
 			}
@@ -265,7 +288,10 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 			if (pdsch_res[tb].crc)
 			{
 				int result_length = pdsch_cfg->grant.tb[tb].tbs / 8;
-				write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
+				// In DUAL_MODE, decode_dl_mode() already wrote this PDU; the
+				// caller suppresses re-writing here to avoid PCAP duplicates.
+				if (write_pcap_en)
+					write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
 
 				if (RNTI_name == "P_RNTI" && (api_mode == 2 || api_mode == 3))
 				{ // IMSI catching modes
@@ -290,19 +316,23 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 					{
 						int payload_length = pdu.get()->get_payload_size();
 						uint8_t *sdu_ptr = pdu.get()->get_sdu_ptr();
-						/* Decode RRC Connection Setup when found valid sdu from MAC pdu*/
-						ltesniffer_ue_spec_config_t ue_config;
-						int rrc_ret = decode_rrc_connection_setup(sdu_ptr, payload_length, &ue_config);
-						if (rrc_ret == SRSRAN_SUCCESS)
-						{ // success means RRC Connection Setup
-							is_rrc_connection_setup = true;
-							ret = UL_SNIFFER_FOUND_CON_SET;
-							if (!mcs_tracking->check_default_config())
-							{
-								mcs_tracking->update_default_ue_config(ue_config);
-								mcs_tracking->set_has_default_config();
+						uint8_t lcid = pdu.get()->get_sdu_lcid();
+
+						if (lcid == 0) {
+							/* Decode RRC Connection Setup when found valid sdu from MAC pdu*/
+							ltesniffer_ue_spec_config_t ue_config;
+							int rrc_ret = decode_rrc_connection_setup(sdu_ptr, payload_length, &ue_config);
+							if (rrc_ret == SRSRAN_SUCCESS)
+							{ // success means RRC Connection Setup
+								is_rrc_connection_setup = true;
+								ret = UL_SNIFFER_FOUND_CON_SET;
+								if (!mcs_tracking->check_default_config())
+								{
+									mcs_tracking->update_default_ue_config(ue_config);
+									mcs_tracking->set_has_default_config();
+								}
+								mcs_tracking->update_ue_config_rnti(cur_rnti, ue_config);
 							}
-							mcs_tracking->update_ue_config_rnti(cur_rnti, ue_config);
 						}
 					}else if (pdu.get()->is_sdu() && pdu.get()->get_sdu_lcid() == 1 && (api_mode == 0 || api_mode == 3)){
 						int sdu_length = pdu.get()->get_payload_size();
@@ -359,10 +389,10 @@ int PDSCH_Decoder::run_decode(int &mimo_ret,
 	}
 }
 
-int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result)
+int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_result> *rar_result, bool write_pcap_en)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -386,7 +416,7 @@ int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_resu
 
 			/*try only 64QAM table*/
 			DL_Sniffer_rar_result result;
-			int ret = run_rar_decode(cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, result);
+			int ret = run_rar_decode(cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, result, write_pcap_en);
 			if (ret == SRSRAN_SUCCESS)
 			{
 				rar_result->push_back(std::move(result));
@@ -435,7 +465,7 @@ int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_resu
 				int mimo_ret = SRSRAN_SUCCESS;
 				bool unknown_mcs;
 				/*Only uses 64QAM MCS table*/
-				int ret = run_decode(mimo_ret, cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, "64QAM table", RNTI_name, tti);
+				int ret = run_decode(mimo_ret, cur_format, cur_ran_dci_dl, cur_grant, cur_rnti, "64QAM table", RNTI_name, tti, write_pcap_en);
 				if (ret == UL_SNIFFER_FOUND_CON_SET)
 				{
 					found_con_ret = true;
@@ -459,7 +489,7 @@ int PDSCH_Decoder::decode_ul_mode(uint32_t rnti, std::vector<DL_Sniffer_rar_resu
 int PDSCH_Decoder::decode_SIB() // change to decode SIB
 {
 	uint32_t tti = sfn * 10 + sf_idx;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -517,7 +547,7 @@ int PDSCH_Decoder::decode_SIB() // change to decode SIB
 				// main function to decode
 				if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 				{
-					if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+					if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 					{
 						ERROR("ERROR: Decoding PDSCH");
 					}
@@ -572,7 +602,7 @@ int PDSCH_Decoder::decode_SIB() // change to decode SIB
 int PDSCH_Decoder::decode_mac_ce(uint32_t rnti)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -674,7 +704,8 @@ int PDSCH_Decoder::run_rar_decode(srsran_dci_format_t cur_format,
 								  srsran_dci_dl_t *cur_ran_dci_dl,
 								  srsran_pdsch_grant_t *cur_grant,
 								  uint32_t cur_rnti,
-								  DL_Sniffer_rar_result &result)
+								  DL_Sniffer_rar_result &result,
+								  bool write_pcap_en)
 {
 	// std::cout << "Runing table: " << table << std::endl;
 	std::string RNTI_name = "RA_RNTI";
@@ -705,7 +736,7 @@ int PDSCH_Decoder::run_rar_decode(srsran_dci_format_t cur_format,
 		if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 		{
 			// std::cout << "Runing table: " << table << " -- 1" << std::endl;
-			if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+			if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 			{
 				ERROR("ERROR: Decoding PDSCH");
 			}
@@ -715,7 +746,10 @@ int PDSCH_Decoder::run_rar_decode(srsran_dci_format_t cur_format,
 			if (pdsch_res[tb].crc)
 			{
 				int result_length = pdsch_cfg->grant.tb[tb].tbs / 8;
-				write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
+				// In DUAL_MODE, decode_dl_mode() already wrote this RAR PDU;
+				// the caller suppresses re-writing here to avoid duplicates.
+				if (write_pcap_en)
+					write_pcap(RNTI_name, pdsch_res[tb].payload, result_length, cur_rnti, tti, false);
 
 				/*Unpack PDSCH msg to receive rar*/
 				std::time_t epoch = std::time(nullptr);
@@ -743,7 +777,7 @@ int PDSCH_Decoder::decode_rar(DL_Sniffer_rar_result &result)
 {
 	uint32_t tti = sfn * 10 + sf_idx;
 	int ret = SRSRAN_ERROR;
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (const auto& decoding_mem : (*ran_dl_collection))
 	{
 		/* set up variable*/
 		int harq_ret[SRSRAN_MAX_CODEWORDS] = {DL_SNIFFER_NEW_TX, DL_SNIFFER_NEW_TX};
@@ -882,7 +916,7 @@ int PDSCH_Decoder::decode_dl_mode()
 {
 	uint32_t tti = sfn * 10 + sf_idx;
 	// printf("[%d] SF: %d-%d Nof_DCI = %d \n", idx, sfn, sf_idx, ran_dl_collection->size());
-	for (auto decoding_mem : (*ran_dl_collection))
+	for (auto decoding_mem : (*ran_dl_collection))   // by value: this loop mutates decoding_mem (e.g. line ~1160)
 	{
 		if ((decoding_mem.ran_pdsch_grant->tb[0].tbs > 0 && decoding_mem.ran_dci_dl->rnti > 0 &&									 // only decode if packet length > 0 and rnti != 0,
 			 !(nof_antenna == 1 && (decoding_mem.ran_pdsch_grant->nof_tb == 2 || decoding_mem.ran_pdsch_grant_256->nof_tb == 2))) || // only decode DCI with 2 TB if having 2 RX antennas,
@@ -994,7 +1028,7 @@ int PDSCH_Decoder::decode_dl_mode()
 					// main function to decode
 					if (pdsch_cfg->grant.tb[0].enabled || pdsch_cfg->grant.tb[1].enabled)
 					{
-						if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+						if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 						{
 							ERROR("ERROR: Decoding PDSCH");
 						}
@@ -1107,7 +1141,7 @@ int PDSCH_Decoder::decode_dl_mode()
 					}
 
 					/*main function to decode */
-					if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+					if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 					{
 						ERROR("ERROR: Decoding PDSCH");
 					}
@@ -1204,7 +1238,7 @@ int PDSCH_Decoder::decode_dl_mode()
 						}
 
 						// main function to decode
-						if (srsran_ue_dl_decode_pdsch(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
+						if (ul_sniffer_decode_pdsch_4pguard(falcon_ue_dl->q, dl_sf, pdsch_cfg, pdsch_res))
 						{
 							ERROR("ERROR: Decoding PDSCH");
 						}
@@ -1483,3 +1517,4 @@ void PDSCH_Decoder::print_api_dl(uint32_t tti, uint16_t rnti, int id, std::strin
 	std::cout << std::left << std::setw(25) << msg_name;
 	std::cout << std::endl;
 }
+

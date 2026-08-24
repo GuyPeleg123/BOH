@@ -1,59 +1,3 @@
-/*
- * LTESniffer_Core.cc — Main runtime core for LTESniffer.
- *
- * Overview
- * --------
- * This file contains the top-level run loop that drives the entire passive LTE
- * capture session.  Starting from a set of CLI arguments (Args), the core:
- *
- *   1. Opens the RF device (USRP B210 or similar via UHD/srsRAN RF layer) or,
- *      in offline mode, opens a pre-recorded IQ sample file.
- *
- *   2. Optionally performs automatic cell search (PSS/SSS/PBCH) to discover the
- *      target eNodeB.  If cell search is disabled, the cell is configured
- *      manually from Args::cell_id and Args::nof_prb.
- *
- *   3. Initialises srsRAN's ue_sync engine for LTE frame synchronisation and
- *      timing recovery.  The callback srsran_rf_recv_wrapper() feeds raw IQ
- *      samples from the RF device into ue_sync on every call.
- *
- *   4. Enters the main subframe loop:
- *        a. Calls srsran_ue_sync_zerocopy() to obtain one time-aligned LTE
- *           subframe (1 ms) of IQ data.
- *        b. State DECODE_MIB  — waits for subframe index 0 and decodes the
- *           Master Information Block (MIB/PBCH) to obtain the System Frame
- *           Number (SFN) and final cell parameters.  Transitions to
- *           DECODE_PDSCH once the MIB is found.
- *        c. State DECODE_PDSCH — hands the subframe buffer to a free
- *           SubframeWorker thread from the Phy pool.  Each worker blindly
- *           decodes PDCCH (DCI), then decodes PDSCH (DL data) or PUSCH (UL
- *           data) for every active RNTI found.
- *
- *   5. Writes decoded MAC PDUs to a PCAP file so they can be opened directly
- *      in Wireshark:
- *        - Downlink mode : ltesniffer_dl_mode.pcap
- *        - Uplink mode   : ltesniffer_ul_mode.pcap
- *
- *   6. Periodically updates the MCS-tracking database and, when HARQ mode is
- *      enabled, the HARQ retransmission database.  Prints a one-line per-second
- *      subframe throughput report to stdout.
- *
- * Key state machine
- * -----------------
- *   DECODE_MIB  -->  (MIB found)  -->  DECODE_PDSCH
- *   DECODE_PDSCH --> (sync lost > 5 frames) --> DECODE_MIB  (re-sync)
- *
- * Output files
- * ------------
- *   ltesniffer_dl_mode.pcap  — MAC-LTE PCAP (DL mode, DLT=147)
- *   ltesniffer_ul_mode.pcap  — MAC-LTE PCAP (UL mode, DLT=147)
- *
- * Dependencies
- * ------------
- *   srsRAN (ue_sync, rf, pbch, chest), FALCON (falcon_ue_dl, RNTIManager),
- *   Phy, SubframeWorker, MCSTracking, HARQ, ULSchedule, PcapWriter.
- */
-
 #include <stdio.h>
 #include <iostream>
 #include <assert.h>
@@ -87,6 +31,46 @@
 #define ENABLE_AGC_DEFAULT
 using namespace std;
 
+cf_t  uhd_dummy_buffer0[LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE];
+cf_t  uhd_dummy_buffer1[LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE];
+cf_t  uhd_dummy_buffer2[LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE];
+cf_t  uhd_dummy_buffer3[LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE];
+cf_t* uhd_dummy_buffer[4] = {uhd_dummy_buffer0, uhd_dummy_buffer1, uhd_dummy_buffer2, uhd_dummy_buffer3}; //dummy buffer to offset data
+bool  align_usrp = true;
+
+// RF error visibility: UHD Rx overflows/lates were silently swallowed (no handler
+// was ever registered), hiding the real cause of the -A 2 decode collapse. Count
+// and rate-limit-print them so streaming health is observable.
+static std::atomic<unsigned long> rf_overflow_a{0}, rf_overflow_b{0};
+static void lte_rf_error_handler(void* arg, srsran_rf_error_t error) {
+  const char* which = static_cast<const char*>(arg);
+  std::atomic<unsigned long>& ctr = (which && which[0] == 'B') ? rf_overflow_b : rf_overflow_a;
+  const char* kind = nullptr;
+  switch (error.type) {
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_OVERFLOW:  kind = "OVERFLOW";  break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_LATE:      kind = "LATE";      break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_UNDERFLOW: kind = "UNDERFLOW"; break;
+    case srsran_rf_error_t::SRSRAN_RF_ERROR_RX:        kind = "RX-ERROR";  break;
+    default: return;
+  }
+  unsigned long n = ++ctr;
+  if (n == 1 || n % 50 == 0) {
+    fprintf(stderr, "[RF %s] %s (count=%lu)\n", which ? which : "?", kind, n);
+  }
+}
+std::atomic<bool> uhd_stop(false);// std::atomic<bool> uhd_stop(false);
+std::mutex mtx_a;
+std::mutex mtx_b;
+std::condition_variable cv;         // to notify all uhd streamming threads to start getting samples
+std::condition_variable a_fn_cv;    // notify the waiting-main thread that uhd stream a has finished
+std::condition_variable b_fn_cv;    // notify the waiting-main thread that uhd stream b has finished
+bool a_triggered = false;
+bool b_triggered = false;
+bool a_finished = false;
+bool b_finished = false;
+uint32_t nof_sf = 0;
+UhdStreamThread uhd_stream_thread;  //control multiple uhd threads
+
 LTESniffer_Core::LTESniffer_Core(const Args& args):
   go_exit(false),
   args(args),
@@ -97,8 +81,11 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   harq_mode(args.harq_mode),
   sniffer_mode(args.sniffer_mode),
   ulsche(args.target_rnti, &ul_harq, args.en_debug),
-  api_mode(args.api_mode)
+  api_mode(args.api_mode),
+  json_emitter(args.json_output)
 {
+  json_emitter.emitHello(args);
+  srsran_filesink_init(&file_sink, "iq_sample_dl.bin", SRSRAN_COMPLEX_FLOAT_BIN);
   /*create pcap writer and name of output file*/    
   auto now = std::chrono::system_clock::now();
   std::time_t cur_time = std::chrono::system_clock::to_time_t(now);
@@ -118,6 +105,8 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   std::string pcap_file_name_api = "api_collector.pcap";
   if (sniffer_mode == DL_MODE){
     pcap_file_name = "ltesniffer_dl_mode.pcap";
+  } else if (sniffer_mode == DUAL_MODE) {
+    pcap_file_name = "ltesniffer_dual_mode.pcap";
   } else {
     pcap_file_name = "ltesniffer_ul_mode.pcap";
   }
@@ -125,7 +114,7 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
   /*Init HARQ*/
   harq.init_HARQ(args.harq_mode);
   /*Set multi offset in ULSchedule*/
-  ulsche.set_multi_offset(args.sniffer_mode);
+  ulsche.set_multi_offset((args.sniffer_mode == DUAL_MODE) ? UL_MODE : args.sniffer_mode);
   /*Create PHY*/
   phy = new Phy(args.rf_nof_rx_ant,
                 args.nof_sniffer_thread,
@@ -141,10 +130,14 @@ LTESniffer_Core::LTESniffer_Core(const Args& args):
                 args.harq_mode,
                 &ulsche);
   phy->getCommon().setShortcutDiscovery(args.enable_shortcut_discovery);
+
   std::shared_ptr<DCIConsumerList> cons(new DCIConsumerList());
   if(args.dci_file_name != "") {
     cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIToFile>(new DCIToFile(phy->getCommon().getDCIFile()))));
-  } 
+  }
+  if(json_emitter.isOpen()) {
+    cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIToJSON>(new DCIToJSON(json_emitter))));
+  }
   // if(args.enable_ASCII_PRB_plot) {
   //   cons->addConsumer(static_pointer_cast<SubframeInfoConsumer>(std::shared_ptr<DCIDrawASCII>(new DCIDrawASCII())));
   // }
@@ -170,10 +163,12 @@ bool LTESniffer_Core::run(){
   falcon_ue_dl_t     falcon_ue_dl;
   srsran_dl_sf_cfg_t dl_sf;
   srsran_pdsch_cfg_t pdsch_cfg;
-  srsran_ue_sync_t   ue_sync;
+  srsran_ue_sync_t   ue_sync_a;
+  srsran_ue_sync_t   ue_sync_b;
 
 #ifndef DISABLE_RF
-  srsran_rf_t rf;             // to open RF devices
+  srsran_rf_t rf_a;           // to open RF devices
+  srsran_rf_t rf_b;
 #endif
   int ret, n;                 // return
   uint8_t mch_table[10];      // unknown
@@ -185,17 +180,21 @@ bool LTESniffer_Core::run(){
   uint16_t nof_lost_sync = 0;
   int mcs_tracking_timer = 0;
   int update_rnti_timer = 0;
+  bool start_recording = false;
   /* Set CPU affinity*/
   if (args.cpu_affinity > -1) {
     cpu_set_t cpuset;
     pthread_t thread;
 
+    CPU_ZERO(&cpuset);   // was uninitialized stack garbage -> undefined affinity mask
     thread = pthread_self();
     for (int i = 0; i < 8; i++) {
       if (((args.cpu_affinity >> i) & 0x01) == 1) {
         printf("Setting pdsch_ue with affinity to core %d\n", i);
         CPU_SET((size_t)i, &cpuset);
       }
+    }
+    {
       if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset)) {
         ERROR("Error setting main thread affinity to %d", args.cpu_affinity);
         exit(-1);
@@ -207,50 +206,149 @@ bool LTESniffer_Core::run(){
 #ifndef DISABLE_RF
   if (args.input_file_name == "") {
     printf("Opening RF device with %d RX antennas...\n", args.rf_nof_rx_ant);
-    char rfArgsCStr[1024];
-    strncpy(rfArgsCStr, args.rf_args.c_str(), 1024);
-    if (srsran_rf_open_multi(&rf, rfArgsCStr, args.rf_nof_rx_ant)) {
-      fprintf(stderr, "Error opening rf\n");
+    char rfArgsCStr_a[1024];
+    char rfArgsCStr_b[1024];
+
+    /* ---------- Build rf_a args ----------
+     * Priority for DL/UL/DUAL:
+     *   1. -X flag (usrp_a_args)  — explicit dual-USRP override
+     *   2. -a flag (rf_args)      — single-USRP / generic rfargs
+     *   3. Auto: no serial specified, UHD picks the first available device.
+     *      num_recv_frames / recv_frame_size kept for throughput.
+     * The old hardcoded serials (32FCD4C / 3367EF9) are gone; pass -X/-Z
+     * if you need to pin specific serials for dual-USRP operation.        */
+    // Throughput/buffering args: absorb host-scheduling jitter under the doubled
+    // -A 2 dual-radio load. Previously only the -a/auto branch set these; the
+    // explicit-serial -X/-Z path (used by dual mode) opened with UHD DEFAULT
+    // buffering and silently overflowed mid-subframe, stitching discontinuous IQ
+    // into antenna-0's buffer -> PSS autocorrelation collapsed -> ue_sync stuck
+    // in FIND -> 0 DL decode at -A 2. recv_frame_size=16360 = B210 USB3 max xfer.
+    const std::string tput = ",num_recv_frames=512,recv_frame_size=8000";
+    std::string rf_a_string;
+    if (!args.usrp_a_args.empty()) {
+      rf_a_string = args.usrp_a_args + tput;
+    } else if (!args.rf_args.empty()) {
+      rf_a_string = args.rf_args + tput;
+    } else {
+      // Auto-detect: blank args → UHD opens the first enumerated device
+      rf_a_string = tput.substr(1);  // drop leading comma
+    }
+
+    /* ---------- Build rf_b args (UL/DUAL only) ---------- */
+    std::string rf_b_string;
+    if (!args.usrp_b_args.empty()) {
+      rf_b_string = args.usrp_b_args + tput;
+    } else {
+      // Auto-detect second USRP; caller must pass -Z if two identical models
+      rf_b_string = "clock=gpsdo" + tput;
+    }
+
+    /*The following strings are for USRP X310 for specific application*/
+    // rf_a_string = "clock=gpsdo,type=x300,addr=192.168.40.2";
+    // rf_b_string = "clock=gpsdo,type=x300,addr=192.168.30.2";
+
+    strncpy(rfArgsCStr_a, rf_a_string.c_str(), 1023); rfArgsCStr_a[1023] = '\0';
+    strncpy(rfArgsCStr_b, rf_b_string.c_str(), 1023); rfArgsCStr_b[1023] = '\0';
+
+    // Always open rf_a (needed by all modes)
+    if (srsran_rf_open_multi(&rf_a, rfArgsCStr_a, args.rf_nof_rx_ant)) {
+      fprintf(stderr, "Error opening rf_a\n");
       exit(-1);
     }
-    /* Set receiver gain */
-    if (args.rf_gain > 0) {
-      srsran_rf_set_rx_gain(&rf, args.rf_gain);
-    } else {
-      printf("Starting AGC thread...\n");
-      if (srsran_rf_start_gain_thread(&rf, false)) {
-        ERROR("Error opening rf");
+
+    // UL 2-RX diversity (opt-in via env UL_DIVERSITY): open the UL USRP (rf_b)
+    // with 2 RX channels while the DL radio (rf_a) keeps its own antenna count.
+    // -A is coupled to BOTH radios and -A 2 breaks DL, so we decouple UL here.
+    // sf_buffer_b[0..3] are already allocated; the streamer fills as many
+    // channels as rf_b was opened with. Default (unset) = unchanged behaviour.
+    uint32_t ul_nof_rx_ant = (getenv("UL_DIVERSITY") ? 2u : args.rf_nof_rx_ant);
+
+    // rf_b is only needed for UL/DUAL mode
+    if (sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) {
+      if (srsran_rf_open_multi(&rf_b, rfArgsCStr_b, ul_nof_rx_ant)) {
+        fprintf(stderr, "Error opening rf_b — UL/DUAL mode requires a second USRP\n");
         exit(-1);
       }
-      srsran_rf_set_rx_gain(&rf, srsran_rf_get_rx_gain(&rf));
-      cell_detect_config.init_agc = srsran_rf_get_rx_gain(&rf);
+      rf_b_open = true;  // class member
+      if (ul_nof_rx_ant > 1) printf("UL 2-RX diversity ENABLED: rf_b opened with %u channels\n", ul_nof_rx_ant);
+    }
+
+    // Make UHD Rx overflow/late visible (previously swallowed silently).
+    srsran_rf_register_error_handler(&rf_a, lte_rf_error_handler, (void*)"A");
+    if (rf_b_open) srsran_rf_register_error_handler(&rf_b, lte_rf_error_handler, (void*)"B");
+
+    /* Set receiver gain.
+     * rf_a (DL) keeps the original behaviour: fixed if -g>0 else AGC.
+     * rf_b (UL) is independent: -G <dB> pins a FIXED UL gain (bursty UL decodes
+     * better with a fixed high gain than with AGC riding the noise floor); if
+     * -G unset it follows -g / AGC exactly as before. UL SNR is the yield
+     * limiter, so raising it via a dedicated UL gain is the primary lever. */
+    // --- rf_a (DL) ---
+    if (args.rf_gain > 0) {
+      srsran_rf_set_rx_gain(&rf_a, args.rf_gain);
+    } else {
+      printf("Starting AGC thread (rf_a/DL)...\n");
+      if (srsran_rf_start_gain_thread(&rf_a, false)) {
+        ERROR("Error opening rf_a");
+        exit(-1);
+      }
+      srsran_rf_set_rx_gain(&rf_a, srsran_rf_get_rx_gain(&rf_a));
+      cell_detect_config.init_agc = srsran_rf_get_rx_gain(&rf_a);
+    }
+    // --- rf_b (UL) ---
+    if (rf_b_open) {
+      if (args.ul_rf_gain >= 0) {
+        srsran_rf_set_rx_gain(&rf_b, args.ul_rf_gain);
+        printf("UL (rf_b) FIXED gain = %.1f dB (-G)\n", args.ul_rf_gain);
+      } else if (args.rf_gain > 0) {
+        srsran_rf_set_rx_gain(&rf_b, args.rf_gain);
+      } else {
+        printf("Starting AGC thread (rf_b/UL)...\n");
+        if (srsran_rf_start_gain_thread(&rf_b, false)) {
+          ERROR("Error opening rf_b");
+          exit(-1);
+        }
+        srsran_rf_set_rx_gain(&rf_b, srsran_rf_get_rx_gain(&rf_b));
+      }
+      // 2-RX: antenna 1 currently has NO LNA, so give it its own (higher) gain to
+      // range the ADC — srsran_rf_set_rx_gain sets ALL channels the same, so we
+      // override channel 1 here. UL_ANT1_GAIN default 76 (B210 max).
+      if (ul_nof_rx_ant > 1) {
+        double g1 = getenv("UL_ANT1_GAIN") ? atof(getenv("UL_ANT1_GAIN")) : 76.0;
+        srsran_rf_set_rx_gain_ch(&rf_b, 1, g1);
+        printf("UL 2-RX gains: ant0=%.1f dB (LNA), ant1=%.1f dB (no LNA)\n",
+               (double)args.ul_rf_gain, g1);
+      }
     }
 
     /* set receiver frequency */
-    if (sniffer_mode == UL_MODE && args.ul_freq != 0){
+    if (sniffer_mode == DL_MODE) {
+      // DL-only: tune rf_a to downlink frequency
       printf("Tunning DL receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
-      if (srsran_rf_set_rx_freq(&rf, 0, args.rf_freq + args.file_offset_freq)) {
+      if (srsran_rf_set_rx_freq(&rf_a, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq)) {
+        ERROR("Tunning DL Freq failed\n");
+      }
+    } else if ((sniffer_mode == UL_MODE || sniffer_mode == DUAL_MODE) && args.ul_freq != 0){
+      printf("Tunning DL receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
+      if (srsran_rf_set_rx_freq(&rf_a, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq)) {
         ///ERROR("Tunning DL Freq failed\n");
       }
-      /*Uplink freg*/
       printf("Tunning UL receiver to %.3f MHz\n", (double) (args.ul_freq / 1000000));
-      if (srsran_rf_set_rx_freq(&rf, 1, args.ul_freq )){
+      if (srsran_rf_set_rx_freq(&rf_b, ul_nof_rx_ant, args.ul_freq )){
         //ERROR("Tunning UL Freq failed \n");
       }
-    } else if (sniffer_mode == UL_MODE && args.ul_freq == 0){
-      ERROR("Uplink Frequency must be defined in the UL Sniffer Mode \n");
-    } else if (sniffer_mode == DL_MODE && args.ul_freq == 0){
-      printf("Tunning receiver to %.3f MHz\n", (args.rf_freq + args.file_offset_freq) / 1000000);
-      srsran_rf_set_rx_freq(&rf, args.rf_nof_rx_ant, args.rf_freq + args.file_offset_freq);
-    } else if (sniffer_mode == DL_MODE && args.ul_freq != 0){
-        ERROR("Uplink Frequency must be 0 in the DL Sniffer Mode \n");
+    } else {
+      ERROR("UL/Dual mode requires a UL frequency (-u). This branch needs 2 USRPs for UL/Dual sniffing.\n");
     }
 
+    // LTESniffer exact-PCI: forces the SSS N_id_1 (with -l/force_N_id_2 → exact PCI).
+    // -1 (default) leaves cell-search behaviour unchanged. See ForcedPciAcquisition doc.
+    cell_detect_config.force_N_id_1 = args.force_N_id_1;
     if (args.cell_search){
       uint32_t ntrial = 0;
       do {
-        ret = rf_search_and_decode_mib(
-            &rf, args.rf_nof_rx_ant, &cell_detect_config, args.force_N_id_2, &cell, &search_cell_cfo);
+        ret = rf_search_and_decode_mib_multi_usrp(
+            &rf_a, args.rf_nof_rx_ant, &cell_detect_config, args.force_N_id_2, &cell, &search_cell_cfo);
         if (ret < 0) {
           ERROR("Error searching for cell");
           exit(-1);
@@ -267,21 +365,40 @@ bool LTESniffer_Core::run(){
       cell.phich_length     = SRSRAN_PHICH_NORM;
       cell.phich_resources  = SRSRAN_PHICH_R_1_6;
     }
-    srsran_rf_stop_rx_stream(&rf);
-    // srsran_rf_flush_buffer(&rf);
+    srsran_rf_stop_rx_stream(&rf_a);
+    if (rf_b_open) srsran_rf_stop_rx_stream(&rf_b);
     if (go_exit) {
-      srsran_rf_close(&rf);
+      uhd_stop = true;
+      if (a_triggered == false){
+        std::unique_lock<std::mutex> lock_a(mtx_a);
+        a_triggered = true;
+      }
+      if (b_triggered == false){
+        std::unique_lock<std::mutex> lock_b(mtx_b);
+        b_triggered = true;
+      }
+      cv.notify_all();
+      // srsran_rf_close(&rf_a);
+      // srsran_rf_close(&rf_b);
       exit(0);
     }
 
     /* set sampling frequency */
     int srate = srsran_sampling_freq_hz(cell.nof_prb);
+    json_emitter.emitCell(cell, args.rf_freq, args.ul_freq, srate > 0 ? srate : 0.0);
     if (srate != -1) {
       printf("Setting sampling rate %.2f MHz\n", (float)srate / 1000000);
-      float srate_rf = srsran_rf_set_rx_srate(&rf, (double)srate);
-      if (srate_rf != srate) {
+      float srate_rf_a = srsran_rf_set_rx_srate(&rf_a, (double)srate);
+      if (srate_rf_a != srate) {
         ERROR("Could not set sampling rate");
         exit(-1);
+      }
+      if (rf_b_open) {
+        float srate_rf_b = srsran_rf_set_rx_srate(&rf_b, (double)srate);
+        if (srate_rf_b != srate) {
+          ERROR("Could not set sampling rate");
+          exit(-1);
+        }
       }
     } else {
       ERROR("Invalid number of PRB %d", cell.nof_prb);
@@ -305,13 +422,13 @@ bool LTESniffer_Core::run(){
     char* tmp_filename = new char[args.input_file_name.length()+1];
     strncpy(tmp_filename, args.input_file_name.c_str(), args.input_file_name.length());
     tmp_filename[args.input_file_name.length()] = 0;
-    if (srsran_ue_sync_init_file_multi(&ue_sync,
+    if (srsran_ue_sync_init_file_multi(&ue_sync_a,
                                        args.nof_prb,
                                        tmp_filename,
                                        args.file_offset_time,
                                        args.file_offset_freq,
                                        args.rf_nof_rx_ant)) { //args.rf_nof_rx_ant
-      ERROR("Error initiating ue_sync");
+      ERROR("Error initiating ue_sync_a");
       exit(-1);
     }
     delete[] tmp_filename;
@@ -327,20 +444,37 @@ bool LTESniffer_Core::run(){
         decimate = args.decimate;
       }
     }
-    if (srsran_ue_sync_init_multi_decim(&ue_sync,
+    if (srsran_ue_sync_init_multi_usrp(&ue_sync_a,
                                         cell.nof_prb,
                                         cell.id == 1000,
+                                        srsran_rf_recv_multi_usrp_wrapper,
                                         srsran_rf_recv_wrapper,
-                                        args.rf_nof_rx_ant,
-                                        (void*)&rf,
+                                        args.rf_nof_rx_ant, //args.rf_nof_rx_ant
+                                        (void*)&rf_a,
+                                        (void*)&rf_b,
                                         decimate)) {
-      ERROR("Error initiating ue_sync");
+      ERROR("Error initiating ue_sync_a");
       exit(-1);
     }
-    if (srsran_ue_sync_set_cell(&ue_sync, cell)) {
-      ERROR("Error initiating ue_sync");
+    // if (srsran_ue_sync_init_multi_decim(&ue_sync_b,
+    //                                     cell.nof_prb,
+    //                                     cell.id == 1000,
+    //                                     srsran_rf_recv_wrapper,
+    //                                     1, //args.rf_nof_rx_ant
+    //                                     (void*)&rf_b,
+    //                                     decimate)) {
+    //   ERROR("Error initiating ue_sync_b");
+    //   exit(-1);
+    // }
+
+    if (srsran_ue_sync_set_cell(&ue_sync_a, cell)) {
+      ERROR("Error initiating ue_sync_a");
       exit(-1);
     }
+    // if (srsran_ue_sync_set_cell(&ue_sync_b, cell)) {
+    //   ERROR("Error initiating ue_sync_b");
+    //   exit(-1);
+    // }
 #endif
   }
 
@@ -352,11 +486,12 @@ bool LTESniffer_Core::run(){
 
   /*Get 1 worker from available list*/
   std::shared_ptr<SubframeWorker> cur_worker(phy->getAvail());
-  cf_t** cur_buffer = cur_worker->getBuffers();
+  cf_t** cur_buffer_a = cur_worker->getBuffers_a();
+  cf_t** cur_buffer_b = cur_worker->getBuffers_b();
 
   /* Config mib */
   srsran_ue_mib_t ue_mib;
-  if (srsran_ue_mib_init(&ue_mib, cur_buffer[0], cell.nof_prb)) {
+  if (srsran_ue_mib_init(&ue_mib, cur_buffer_a[0], cell.nof_prb)) {
     ERROR("Error initaiting UE MIB decoder");
     exit(-1);
   }
@@ -366,10 +501,10 @@ bool LTESniffer_Core::run(){
   }
 
   // Disable CP based CFO estimation during find
-  ue_sync.cfo_current_value       = search_cell_cfo / 15000;
-  ue_sync.cfo_is_copied           = true;
-  ue_sync.cfo_correct_enable_find = true;
-  srsran_sync_set_cfo_cp_enable(&ue_sync.sfind, false, 0);
+  ue_sync_a.cfo_current_value       = search_cell_cfo / 15000;
+  ue_sync_a.cfo_is_copied           = true;
+  ue_sync_a.cfo_correct_enable_find = true;
+  srsran_sync_set_cfo_cp_enable(&ue_sync_a.sfind, false, 0);
   
   ZERO_OBJECT(dl_sf);
   ZERO_OBJECT(pdsch_cfg);
@@ -383,21 +518,52 @@ bool LTESniffer_Core::run(){
 
 #ifndef DISABLE_RF
   if (args.input_file_name == "") {
-    srsran_rf_start_rx_stream(&rf, false);
-  }
-#endif
-#ifndef DISABLE_RF
-  if (args.rf_gain < 0 && args.input_file_name == "") {
-    srsran_rf_info_t* rf_info = srsran_rf_get_info(&rf);
-    srsran_ue_sync_start_agc(&ue_sync,
-                             srsran_rf_set_rx_gain_th_wrapper_,
-                             rf_info->min_rx_gain,
-                             rf_info->max_rx_gain,
-                             static_cast<double>(cell_detect_config.init_agc));
+    /* Common-epoch latch for the dual-radio case. Before streaming, latch BOTH
+       radios' time registers to the SAME shared-1PPS edge. Previously each radio
+       free-ran on its own epoch (~2.3s apart), so the recv-wrapper's UL/DL sample
+       realignment — gated on time_sec_a == time_sec_b — was permanently dormant,
+       leaving the UL FFT window at a random per-run offset from the true UL
+       subframe (wildly variable / mostly-zero UL yield regardless of signal).
+       Both handles are already open, so these two calls fall inside the same 1PPS
+       window and schedule the reset on the same next edge; we then wait one full
+       PPS period for it to take before starting the streams. Requires a shared
+       external 1PPS on both B210s (the dual-mode hardware prerequisite). */
+    if (rf_b_open && !getenv("LTESNIFFER_NO_PPS_SYNC")) {
+      srsran_rf_sync(&rf_a);
+      srsran_rf_sync(&rf_b);
+      usleep(1100000); // let the next common PPS edge latch on both radios
+      time_t sa = 0, sb = 0; double fa = 0, fb = 0;
+      srsran_rf_get_time(&rf_a, &sa, &fa);
+      srsran_rf_get_time(&rf_b, &sb, &fb);
+      printf("[PPS-SYNC] post-latch device time: A=%ld.%06.0f B=%ld.%06.0f | diff=%.1f us (secs_eq=%d)\n",
+             (long)sa, fa * 1e6, (long)sb, fb * 1e6,
+             ((double)(sa - sb) + (fa - fb)) * 1e6, (int)(sa == sb));
+      fflush(stdout);
+    }
+    if (rf_b_open) srsran_rf_start_rx_stream(&rf_b, false);
+    srsran_rf_start_rx_stream(&rf_a, false);
   }
 #endif
 
-  ue_sync.cfo_correct_enable_track = !args.disable_cfo;
+#ifndef DISABLE_RF
+  if (args.rf_gain < 0 && args.input_file_name == "") {
+    srsran_rf_info_t* rf_info_a = srsran_rf_get_info(&rf_a);
+    srsran_rf_info_t* rf_info_b = srsran_rf_get_info(&rf_b);
+    srsran_ue_sync_start_agc(&ue_sync_a,
+                             srsran_rf_set_rx_gain_th_wrapper_,
+                             rf_info_a->min_rx_gain,
+                             rf_info_a->max_rx_gain,
+                             static_cast<double>(cell_detect_config.init_agc));
+    // srsran_rf_info_t* rf_info_b = srsran_rf_get_info(&rf_b);
+    // srsran_ue_sync_start_agc(&ue_sync_b,
+    //                          srsran_rf_set_rx_gain_th_wrapper_,
+    //                          rf_info_b->min_rx_gain,
+    //                          rf_info_b->max_rx_gain,
+    //                          static_cast<double>(cell_detect_config.init_agc));
+  }
+#endif
+
+  ue_sync_a.cfo_correct_enable_track = !args.disable_cfo;
   srsran_pbch_decode_reset(&ue_mib.pbch);
 
   // Variables for measurements
@@ -418,22 +584,23 @@ bool LTESniffer_Core::run(){
 
     /* Set default verbose level */
     set_srsran_verbose_level(args.verbose);
-    ret = srsran_ue_sync_zerocopy(&ue_sync, cur_worker->getBuffers(), max_num_samples);
+    ret = srsran_ue_sync_zerocopy_multi_usrp(&ue_sync_a, cur_worker->getBuffers_a(), cur_worker->getBuffers_b(), max_num_samples);
     if (ret < 0) {
       if (args.input_file_name != ""){
         std::cout << "Finish reading from file" << std::endl;
       }
       ERROR("Error calling srsran_ue_sync_work()");
     }
-    // std:: cout << "CFO = " << srsran_ue_sync_get_cfo(&ue_sync) << std::endl;
+    // std:: cout << "CFO = " << srsran_ue_sync_get_cfo(&ue_sync_a) << std::endl;
 #ifdef CORRECT_SAMPLE_OFFSET
     float sample_offset =
-        (float)srsran_ue_sync_get_last_sample_offset(&ue_sync) + srsran_ue_sync_get_sfo(&ue_sync) / 1000;
+        (float)srsran_ue_sync_get_last_sample_offset(&ue_sync_a) + srsran_ue_sync_get_sfo(&ue_sync_a) / 1000;
     srsran_ue_dl_set_sample_offset(&ue_dl, sample_offset);
 #endif
 
     if (ret == 1){
-      uint32_t sf_idx = srsran_ue_sync_get_sfidx(&ue_sync);
+      uint32_t sf_idx = srsran_ue_sync_get_sfidx(&ue_sync_a);
+      // std::cout << "SF_idx: " << sf_idx << std::endl; 
       switch (state) {
         case DECODE_MIB:
           if (sf_idx == 0) {
@@ -443,10 +610,24 @@ bool LTESniffer_Core::run(){
             if (n < 0) {
               ERROR("Error decoding UE MIB");
               exit(-1);
+              std::cout << "Error decoding MIB" << std::endl;
             } else if (n == SRSRAN_UE_MIB_FOUND) {
-              srsran_pbch_mib_unpack(bch_payload, &cell, &sfn);
+              // Unpack into a scratch cell first: a corrupt PBCH can decode to an
+              // INVALID bandwidth (e.g. 125 PRB), which then crashes the FFT init
+              // downstream (ofdm.c "Invalid number of PRB 125" -> ue_mib FFT error
+              // -> exit). Validate before committing; reject bad decodes and keep
+              // searching instead of aborting the whole capture.
+              srsran_cell_t decoded_cell = cell;
+              srsran_pbch_mib_unpack(bch_payload, &decoded_cell, &sfn);
+              if (!srsran_nofprb_isvalid(decoded_cell.nof_prb)) {
+                printf("[MIB] Rejecting corrupt MIB decode (invalid nof_prb=%u) — retrying cell search.\n",
+                       decoded_cell.nof_prb);
+                break;  // stay in DECODE_MIB; retry on the next opportunity
+              }
+              cell = decoded_cell;
               srsran_cell_fprint(stdout, &cell, sfn);
               printf("Decoded MIB. SFN: %d, offset: %d\n", sfn, sfn_offset);
+              json_emitter.emitMIB(sfn, sfn_offset);
               sfn   = (sfn + sfn_offset) % 1024;
               state = DECODE_PDSCH;
 
@@ -471,6 +652,7 @@ bool LTESniffer_Core::run(){
                   //disallow RNTI=0 for all formats
                 rntiManager.addForbidden(0x0, 0x0, f);
               }
+              start_recording = true;
             }
           }
           break;
@@ -535,6 +717,10 @@ bool LTESniffer_Core::run(){
         case UL_MODE:
           if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
           break;
+        case DUAL_MODE:
+          if (mcs_tracking_mode && args.target_rnti == 0){ mcs_tracking.update_database_dl(); }
+          if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
+          break;
         default:
           break;
         }
@@ -555,6 +741,13 @@ bool LTESniffer_Core::run(){
           if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
           mcs_tracking_timer = 0;
           break;
+        case DUAL_MODE:
+          if (api_mode == -1) {mcs_tracking.print_database_dl(); mcs_tracking.print_database_ul();}
+          if (mcs_tracking_mode && args.target_rnti == 0){ mcs_tracking.update_database_dl(); }
+          if (mcs_tracking_mode){ mcs_tracking.update_database_ul(); }
+          if (harq_mode && args.target_rnti == 0){ harq.updateHARQDatabase(); }
+          mcs_tracking_timer = 0;
+          break;
         default:
           break;
         }
@@ -563,7 +756,7 @@ bool LTESniffer_Core::run(){
       /*Change state to Decode MIB to find system frame number again*/
       if (state == DECODE_PDSCH && nof_lost_sync > 5){
         state = DECODE_MIB;
-        if (srsran_ue_mib_init(&ue_mib, cur_worker->getBuffers()[0], cell.nof_prb)) {
+        if (srsran_ue_mib_init(&ue_mib, cur_worker->getBuffers_a()[0], cell.nof_prb)) {
           ERROR("Error initaiting UE MIB decoder");
           exit(-1);
         }
@@ -575,14 +768,14 @@ bool LTESniffer_Core::run(){
         nof_lost_sync = 0;
       }
       nof_lost_sync++;
-      cout << "Finding PSS... Peak: " << srsran_sync_get_peak_value(&ue_sync.sfind) <<
-              ", FrameCnt: " << ue_sync.frame_total_cnt <<
-              " State: " << ue_sync.state << endl;
+      cout << "Finding PSS... Peak: " << srsran_sync_get_peak_value(&ue_sync_a.sfind) <<
+              ", FrameCnt: " << ue_sync_a.frame_total_cnt <<
+              " State: " << ue_sync_a.state << endl;
     }
     sf_cnt++;
 
   } // main loop
-
+  srsran_filesink_free(&file_sink);
   /* Print statistic of 256tracking*/
   if (mcs_tracking_mode){
     switch (sniffer_mode)
@@ -595,38 +788,64 @@ bool LTESniffer_Core::run(){
       mcs_tracking.merge_all_database_ul();
       if (api_mode == -1) {mcs_tracking.print_all_database_ul(); }
       break;
+    case DUAL_MODE:
+      mcs_tracking.merge_all_database_dl();
+      mcs_tracking.merge_all_database_ul();
+      if (api_mode == -1) {mcs_tracking.print_all_database_dl(); mcs_tracking.print_all_database_ul();}
+      break;
     default:
       break;
     }
   }
-
   phy->joinPending();
+
+  uhd_stop = true;
+  /*Waking up any waiting thread (a or b)*/
+  if (a_triggered == false){
+    std::unique_lock<std::mutex> lock_a(mtx_a);
+    a_triggered = true;
+  }
+  if (b_triggered == false){
+    std::unique_lock<std::mutex> lock_b(mtx_b);
+    b_triggered = true;
+  }
+  cv.notify_all();
 
   std::cout << "Destroyed Phy" << std::endl;
   if (args.input_file_name == ""){
-    srsran_rf_close(&rf);
-    //srsran_ue_dl_free(falcon_ue_dl.q);
-    srsran_ue_sync_free(&ue_sync);
+    // Order matters here. The streamer threads can still be inside
+    // srsran_rf_recv_with_time_multi() at this point — they were triggered
+    // one last time by the cv.notify_all() above and will block until UHD
+    // hands them samples (or hits timeout). Calling rf_close on either
+    // handle while one is mid-recv corrupts UHD's shared libusb session
+    // and segfaults inside the SC16→FC32 SIMD converter.
+    //
+    // Sequence:
+    //   1. stop_rx_stream  → makes any pending recv return immediately
+    //   2. join streamers  → guarantees neither thread is still in UHD
+    //   3. rf_close (a→b)  → sequential, no concurrent UHD teardown
+    srsran_rf_stop_rx_stream(&rf_a);
+    if (rf_b_open) srsran_rf_stop_rx_stream(&rf_b);
+    uhd_stream_thread.join();
+    srsran_rf_close(&rf_a);
+    if (rf_b_open) srsran_rf_close(&rf_b);
+
+    srsran_ue_sync_free(&ue_sync_a);
     srsran_ue_mib_free(&ue_mib);
   }
-  //common->getRNTIManager().printActiveSet();
-  cout << "Skipped subframe: " << skip_cnt << " / " << sf_cnt << endl;
-  //phy->getCommon().getRNTIManager().printActiveSet();
-  //rnti_manager_print_active_set(falcon_ue_dl.rnti_manager);
+  // uhd_stream_thread.~UhdStreamThread();
 
+  cout << "Skipped subframe: " << skip_cnt << " / " << sf_cnt << endl;
   phy->getCommon().printStats();
   cout << "Skipped subframes: " << skip_cnt << " (" << static_cast<double>(skip_cnt) * 100 / (phy->getCommon().getStats().nof_subframes + skip_cnt) << "%)" <<  endl;
   
-  /* Print statistic of 256tracking*/
-  // if (mcs_tracking_mode){ mcs_tracking.print_database_ul(); }
-
-  /* Print statistic of harq retransmission*/
-  //if (harq_mode){ harq.printHARQDatabase(); }
   return EXIT_SUCCESS;
 }
 
 void LTESniffer_Core::stop() {
+  uhd_stop = true;
   cout << "LTESniffer_Core: Exiting..." << endl;
+  json_emitter.emitBye("stop");
   go_exit = true;
 }
 
@@ -642,38 +861,6 @@ LTESniffer_Core::~LTESniffer_Core(){
   // phy         = nullptr;
   printf("Deleted DL Sniffer core\n");
 }
-
-/*
- * srsran_rf_recv_wrapper — srsRAN ue_sync receive callback.
- *
- * This function is registered as the sample-source callback when initialising
- * ue_sync via srsran_ue_sync_init_multi_decim().  On every call, ue_sync
- * requests exactly 'nsamples' complex samples; this wrapper forwards the call
- * to srsran_rf_recv_with_time_multi(), which performs the blocking SDR receive
- * (e.g. over a USB 3.0 link to a USRP B210).  The received IQ data is placed
- * directly into the SubframeWorker's pre-allocated buffers (zero-copy path).
- *
- * Parameters:
- *   h         — opaque handle cast to srsran_rf_t* (the open RF device)
- *   data_     — array of per-antenna IQ buffers (up to SRSRAN_MAX_PORTS)
- *   nsamples  — number of complex samples requested by ue_sync
- *   t         — optional srsRAN timestamp struct (not used here; passed as NULL)
- *
- * Returns the number of samples actually received, or a negative error code.
- */
-/*function to receive sample from SDR (usrp...)*/
-int srsran_rf_recv_wrapper( void* h,
-                            cf_t* data_[SRSRAN_MAX_PORTS], 
-                            uint32_t nsamples, 
-                            srsran_timestamp_t* t){
-  DEBUG(" ----  Receive %d samples  ----", nsamples);
-  void* ptr[SRSRAN_MAX_PORTS];
-  for (int i = 0; i < SRSRAN_MAX_PORTS; i++) {
-    ptr[i] = data_[i];
-  }
-  return srsran_rf_recv_with_time_multi((srsran_rf_t*)h, ptr, nsamples, true, NULL, NULL);
-}
-
 void LTESniffer_Core::setDCIConsumer(std::shared_ptr<SubframeInfoConsumer> consumer) {
   phy->getCommon().setDCIConsumer(consumer);
 }
@@ -709,4 +896,281 @@ void LTESniffer_Core::print_api_header(){
       std::cout << "-";
   }
   std::cout << std::endl;
+}
+
+/*function to receive sample from SDR (usrp...)*/
+int srsran_rf_recv_wrapper( void* h,
+                            cf_t* data_[SRSRAN_MAX_PORTS], 
+                            uint32_t nsamples, 
+                            srsran_timestamp_t* t){
+  DEBUG(" ----  Receive %d samples  ----", nsamples);
+  void* ptr[SRSRAN_MAX_PORTS];
+  for (int i = 0; i < SRSRAN_MAX_PORTS; i++) {
+    ptr[i] = data_[i];
+  }
+  return srsran_rf_recv_with_time_multi((srsran_rf_t*)h, ptr, nsamples, true, NULL, NULL);
+}
+
+int extractTimeSecond(time_t secs)
+{
+    struct tm* timeinfo;
+    timeinfo = localtime(&secs);
+    int seconds = timeinfo->tm_sec;
+    return seconds;
+}
+
+int srsran_rf_recv_multi_usrp_wrapper( void* rf_a,
+                                       void* rf_b,
+                                       cf_t* data_a[SRSRAN_MAX_PORTS],
+                                       cf_t* data_b[SRSRAN_MAX_PORTS], 
+                                       uint32_t nsamples, 
+                                       srsran_timestamp_t* t){
+  int ret = SRSRAN_ERROR;
+  void* ptr_a[SRSRAN_MAX_PORTS];
+  void* ptr_b[SRSRAN_MAX_PORTS];
+  for (int i = 0; i < SRSRAN_MAX_PORTS; i++) {
+    ptr_a[i] = data_a[i];
+    ptr_b[i] = data_b[i];
+  }
+  
+  uhd_stream_thread.prepare_stream_thread(rf_a, rf_b, nsamples, nsamples, ptr_a, ptr_b);
+  // PrintLifetime uhd_lifetime("UHD took: ");
+  {
+    std::unique_lock<std::mutex> lock_a(mtx_a);
+    std::unique_lock<std::mutex> lock_b(mtx_b);
+    a_triggered = true;
+    b_triggered = true;
+    cv.notify_all();
+  }
+
+  //wait until 2 threads finish
+  {
+      std::unique_lock<std::mutex> lock_a(mtx_a);
+      a_fn_cv.wait(lock_a, [] { return a_finished; });
+      a_finished = false;
+  }
+  {
+      std::unique_lock<std::mutex> lock_b(mtx_b);
+      b_fn_cv.wait(lock_b, [] { return b_finished; });
+      b_finished = false;
+  } 
+
+  //Check the received time of samples:
+  time_t rev_secs_a       = uhd_stream_thread.get_time_secs_a();
+  time_t rev_secs_b       = uhd_stream_thread.get_time_secs_b();
+  double rev_frac_secs_a  = uhd_stream_thread.get_time_frac_secs_a();
+  double rev_frac_secs_b  = uhd_stream_thread.get_time_frac_secs_b();
+  int time_sec_a          = extractTimeSecond(rev_secs_a);
+  int time_sec_b          = extractTimeSecond(rev_secs_b);
+
+  // if (nof_sf%200 == 0){
+  //   std::cout << "Nof_samples: " << nsamples << " -- Time a = " << rev_secs_a << " | " << rev_frac_secs_a << " -- ";
+  //   std::cout << "Time b = " << rev_secs_b << " | " << rev_frac_secs_b << std::endl;
+  // }
+
+  nof_sf++;
+
+  /* RF capture-integrity diagnostic (opt-in UL_TS_DIAG). Logs the FULL radio-A vs
+     radio-B hardware-timestamp difference every ~1000 subframes — UNCONDITIONALLY,
+     i.e. NOT gated on the seconds matching. This verifies whether radio B stays
+     sample-aligned with radio A over the whole capture, and whether the two device
+     clocks even share a second boundary (they only do when the shared PPS re-latch
+     ran; set_time_unknown_pps is skipped for single-antenna radios). Full diff =
+     (secs_a - secs_b) + (frac_a - frac_b), reported in us and samples. */
+  if (getenv("UL_TS_DIAG")) {
+    static uint64_t ts_n = 0, ts_realign = 0; static double ts_absmax_us = 0.0;
+    double full_diff_s = (double)(rev_secs_a - rev_secs_b) + (rev_frac_secs_a - rev_frac_secs_b);
+    double us = full_diff_s * 1e6, samp = full_diff_s * nsamples * 1000.0;
+    if (fabs(rev_frac_secs_a - rev_frac_secs_b) > 0.000001) ts_realign++;
+    if (fabs(us) > ts_absmax_us) ts_absmax_us = fabs(us);
+    if ((ts_n++ % 1000) == 0)
+      printf("[ULTS] sf=%llu | secs_eq=%d | A-B full diff = %.3f us (%.0f samples) | |max|=%.3f us | frac-realigns=%llu\n",
+             (unsigned long long)ts_n, (int)(time_sec_a == time_sec_b), us, samp,
+             ts_absmax_us, (unsigned long long)ts_realign);
+    fflush(stdout);
+  }
+
+  /* Sub-second SAMPLE alignment between the two radios.
+     Now that the Pi emits a REAL, coherent 1-PPS (the old pps.sh never toggled
+     GPIO18 at all), the two radios' FRACTIONAL second counters differ only by the
+     true sub-second sample skew (~sub-ms, stable), plus a CONSTANT integer-second
+     offset because each radio latches a different 1-PPS edge. That integer offset
+     does NOT affect subframe/sample alignment. Previously this whole block was
+     gated on time_sec_a == time_sec_b — which never held (radios ~2s apart) — so
+     the realign was a permanent no-op and the UL FFT window sat at a random per-run
+     offset from the true UL subframe (the root cause of low/variable UL yield).
+     Align on the WRAP-AWARE fractional skew, independent of the integer offset. */
+  {
+    double frac_diff = rev_frac_secs_a - rev_frac_secs_b;   // signed sub-second skew
+    if (frac_diff >  0.5) frac_diff -= 1.0;                 // wrap when fracs straddle a second boundary
+    if (frac_diff < -0.5) frac_diff += 1.0;
+    double diff_time  = fabs(frac_diff);
+    bool   a_ahead    = (frac_diff > 0.0);                  // A's frac later => A faster => trim B
+    /*if the time difference higher than 1 micro second, below 1 ms: fine trim*/
+    if (!uhd_stop && (diff_time > 0.000001) && (diff_time < 0.001)){
+      int nof_offset_sample = diff_time * nsamples * 1000;
+      nof_offset_sample = (nof_offset_sample > nsamples)? nsamples:nof_offset_sample;
+      void* dummy_ptr[SRSRAN_MAX_PORTS];
+      for (int i = 0; i < SRSRAN_MAX_PORTS; i++) dummy_ptr[i] = uhd_dummy_buffer[i];
+      if (a_ahead){
+        std::cout << "[USRP] Re-align samples from USRP B -- frac_a = " << rev_frac_secs_a << " -- frac_b= " << rev_frac_secs_b << " -- diff = " << diff_time << " -- nof_sample = " << nof_offset_sample << std::endl;
+        srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_b, dummy_ptr, nof_offset_sample, true, NULL, NULL);
+      }else{
+        std::cout << "[USRP] Re-align samples from USRP A -- frac_a = " << rev_frac_secs_a << " -- frac_b= " << rev_frac_secs_b << " -- diff = " << diff_time << " -- nof_sample = " << nof_offset_sample << std::endl;
+        srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_a, dummy_ptr, nof_offset_sample, true, NULL, NULL);
+      }
+    }
+    /*coarse (>= 1 ms): consume whole subframes, one-shot*/
+    else if (!uhd_stop && diff_time >= 0.001 && align_usrp){
+      int nof_loop = std::round(diff_time*1000);
+      void* dummy_ptr[SRSRAN_MAX_PORTS];
+      for (int i = 0; i < SRSRAN_MAX_PORTS; i++) dummy_ptr[i] = uhd_dummy_buffer[i];
+      std::cout << "[USRP] Re-align USRP " << (a_ahead?"B":"A") << " in multiple subframes (frac_second) = " << diff_time << " -- nof_loop = " << nof_loop << std::endl;
+      for (int dm_loop = 0; dm_loop < nof_loop; dm_loop++){
+        if (a_ahead && !uhd_stop){
+          srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_b, dummy_ptr, nsamples, true, NULL, NULL);
+        }else if (!a_ahead && !uhd_stop){
+          srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_a, dummy_ptr, nsamples, true, NULL, NULL);
+        }
+      }
+      align_usrp = false;
+    }
+  }
+
+  return SRSRAN_SUCCESS;
+}
+
+UhdStreamThread::UhdStreamThread(){
+  future_a = std::async(std::launch::async, [this](){
+      int th_ret;
+      pthread_t thread = pthread_self();
+      struct sched_param params;
+      params.sched_priority = 99; // Adjust the priority as needed
+      th_ret = pthread_setschedparam(thread, SCHED_FIFO, &params);
+      if (th_ret != 0) {
+          std::cerr << "Failed to set thread priority." << std::endl;
+      }      
+      this->get_data_stream_a();
+      std::cout << "Thread a finished" << std::endl;
+      return SRSRAN_SUCCESS;
+    });
+  future_b = std::async(std::launch::async, [this](){
+      int th_ret;
+      pthread_t thread = pthread_self();
+      struct sched_param params;
+      params.sched_priority = 99; // Adjust the priority as needed
+      th_ret = pthread_setschedparam(thread, SCHED_FIFO, &params);
+      if (th_ret != 0) {
+          std::cerr << "Failed to set thread priority." << std::endl;
+      }      
+      this->get_data_stream_b();
+      std::cout << "Thread b finished" << std::endl;
+      return SRSRAN_SUCCESS;
+    });
+}
+
+UhdStreamThread::~UhdStreamThread(){
+  uhd_stop = true;
+  // future_a.wait();
+  // future_b.wait();
+}
+
+void UhdStreamThread::run(){
+  // std::cout << "Getting IQ samples from USRPs " << std::endl;
+  // future_a = std::async(std::launch::async, [this](){
+  //     this->get_data_stream_a();
+  //   });
+  // future_b = std::async(std::launch::async, [this](){
+  //     this->get_data_stream_b();
+  //   });
+  // is_running = true;
+}
+
+void UhdStreamThread::prepare_stream_thread(void* rf_a_, void* rf_b_, int nsample_a, int nsample_b, void** ptr_a_, void** ptr_b_){
+  rf_a          = rf_a_;
+  rf_b          = rf_b_;
+  ptr_a         = ptr_a_;
+  ptr_b         = ptr_b_;
+  nof_sample_a  = nsample_a;
+  nof_sample_b  = nsample_b;
+}
+
+int UhdStreamThread::get_data_stream_a(){
+  while(!uhd_stop){
+    std::unique_lock<std::mutex> lock_a(mtx_a);
+    // Wake on EITHER a trigger from the wrapper OR a shutdown request. The
+    // predicate has to include uhd_stop because the shutdown path may not
+    // set a_triggered if it was already true, and we need a way out of the
+    // wait in that case.
+    cv.wait(lock_a, [] { return a_triggered || uhd_stop; });
+    // Critical: re-check uhd_stop BEFORE entering rf_recv. ptr_a is a stored
+    // pointer to the wrapper's stack-local array; once the wrapper returns,
+    // that pointer is dangling. The shutdown path sets a_triggered=true
+    // (line 711-714) from OUTSIDE the wrapper to wake us — if we proceed
+    // into srsran_rf_recv_with_time_multi here, the SC16→FC32 SIMD converter
+    // dereferences the stale pointer and segfaults inside libuhd.
+    if (uhd_stop) break;
+    a_triggered = false;
+    {
+      srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_a, ptr_a, nof_sample_a, true, &secs_a, &frac_secs_a);
+    }
+    {
+      a_finished = true;
+      a_fn_cv.notify_one();
+    }
+    lock_a.unlock();
+  }
+  // NOTE: do NOT call srsran_rf_close() here. Both streamer threads used to
+  // close their own RF handle, which trips two further races: (1) parallel
+  // rf_close on the two B210s corrupts UHD's shared libusb session, and
+  // (2) one streamer's rf_close can run while the other is still inside
+  // rf_recv. Closing is now done sequentially from the main shutdown path
+  // after UhdStreamThread::join().
+  return SRSRAN_SUCCESS;
+}
+
+int UhdStreamThread::get_data_stream_b(){
+  while(!uhd_stop){
+    std::unique_lock<std::mutex> lock_b(mtx_b);
+    cv.wait(lock_b, [] { return b_triggered || uhd_stop; });
+    // See get_data_stream_a() above for why this check is mandatory before
+    // entering rf_recv. Without it, shutdown's b_triggered=true + notify
+    // (line 715-718) wakes us with a stale ptr_b → segfault in libuhd's
+    // SIMD converter.
+    if (uhd_stop) break;
+    b_triggered = false;
+    {
+      srsran_rf_recv_with_time_multi((srsran_rf_t*)rf_b, ptr_b, nof_sample_b, true, &secs_b, &frac_secs_b);
+    }
+
+    {
+      b_finished = true;
+      b_fn_cv.notify_one();
+    }
+  }
+  return SRSRAN_SUCCESS;
+}
+
+void UhdStreamThread::join(){
+  // Block until both lambdas have returned. Safe to call once at shutdown;
+  // the underlying std::future<int> is move-only and one-shot. Idempotency
+  // is handled by future::valid() — a second call is a no-op.
+  if (future_a.valid()) future_a.wait();
+  if (future_b.valid()) future_b.wait();
+}
+
+std::string UhdStreamThread::frac_sec_double_to_string(double value, int precision)
+{
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(precision) << value;
+    std::string str = oss.str();
+
+    // Remove the decimal point
+    str.erase(std::remove(str.begin(), str.end(), '.'), str.end());
+
+    // Add leading zeros if necessary
+    int numZeros = precision - (str.length() - 1);
+    str = std::string(numZeros, '0') + str;
+    str = str.erase(0, 1);
+    return str;
 }

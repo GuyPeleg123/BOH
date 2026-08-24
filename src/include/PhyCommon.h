@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <mutex>
 #include "falcon/util/RNTIManager.h"
 #include "falcon/phy/falcon_phch/falcon_dci.h"
 #include "SubframeInfoConsumer.h"
@@ -67,6 +68,7 @@ private:
   RNTIManager rntiManager;
 
   DCIBlindSearchStats stats;
+  std::mutex stats_mutex;   // addStats() is called from every worker thread
 
   std::shared_ptr<DCIToFile> defaultDCIConsumer;
   std::shared_ptr<SubframeInfoConsumer> dciConsumer;

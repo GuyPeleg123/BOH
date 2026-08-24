@@ -1,1 +1,30 @@
-/build
+/build/
+
+# GUI backend python venv + caches
+gui/backend/.venv/
+**/__pycache__/
+*.pyc
+
+# Frontend build output / deps
+gui/frontend/node_modules/
+gui/frontend/dist/
+gui/frontend/dist-capture/
+gui/frontend/dist-decrypt/
+
+# Runtime capture artifacts (never commit; can contain sensitive RF/IP data)
+*.pcap
+*.bin
+*.raw
+*.csv
+mcs_statistic.csv
+clock_sync_options_report.txt
+iq_sample_dl.bin
+ul_sample.raw
+
+# Editor
+.vscode/
+.claude/settings.local.json
+.claude/worktrees/
+.claude/agent-memory/
+srsRAN.backtrace.crash
+*.crash

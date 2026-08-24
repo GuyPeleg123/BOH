@@ -34,6 +34,17 @@ public:
     void open(const std::string filename, const std::string api_filename, uint32_t ue_id = 0);
     void close();
 
+    // Rotation knobs (opt-in via env vars LTESNIFFER_PCAP_ROTATE_MB /
+    // LTESNIFFER_PCAP_ROTATE_MIN at open() time). Long captures otherwise
+    // produce one multi-GB file that's a pain to ship around.
+    void configure_rotation(size_t bytes, int minutes);
+
+    // Live PCAP-over-FIFO for Wireshark (F12). Opt-in via env var
+    // LTESNIFFER_PCAP_STREAM=/path/to/named-pipe. User runs
+    //   mkfifo /tmp/lte.pcap && wireshark -k -i /tmp/lte.pcap
+    // and frames stream live (libpcap global header on connect, then per-PDU
+    // records — identical wire format to the on-disk pcap, just on a FIFO).
+
     void set_ue_id(uint16_t ue_id);
 
     void write_dl_crnti(uint8_t *pdu, uint32_t pdu_len_bytes, uint16_t crnti, bool crc_ok, uint32_t tti, bool retx); //C RNTI
@@ -51,13 +62,37 @@ public:
     void write_dl_paging_api(uint8_t* pdu, uint32_t pdu_len_bytes, uint16_t rnti, bool crc_ok, uint32_t tti, bool retx);
 private:
     std::mutex pcap_mutex;
-    bool enable_write; 
+    bool enable_write;
     FILE *pcap_file;
     FILE *pcap_file_api;
     uint32_t ue_id;
+
+    // Rotation state. base_filename_ is the original `-F` value; we rewrite
+    // it with an ISO8601 timestamp + sequence number on each rotation.
+    std::string base_filename_;
+    std::string api_filename_;
+    size_t      rotate_bytes_ = 0;   // 0 = disabled
+    int         rotate_minutes_ = 0; // 0 = disabled
+    size_t      bytes_written_ = 0;
+    int         rotation_seq_ = 0;
+    long long   file_opened_ms_ = 0; // monotonic ms since epoch
+    // Periodic-flush counters (in writes, not bytes). Previously the flush
+    // condition was `(bytes_written_ & 63) == 0`, which actually fires only
+    // when bytes_written_ happens to be a multiple of 64 — for irregular PDU
+    // sizes that's stochastic (~1/64 chance per write) and can be zero for an
+    // entire low-volume capture. Real counters make it deterministic.
+    uint32_t    writes_since_flush_      = 0;
+    uint32_t    writes_since_flush_api_  = 0;
+    static constexpr uint32_t FLUSH_EVERY_N_WRITES = 64;
+    void rotate_if_needed_locked();
+    std::string make_rotated_name(const std::string& base);
+
+    // Live-stream FIFO for Wireshark
+    FILE* pcap_stream_file_ = nullptr;
+
     void pack_and_write(uint8_t* pdu, uint32_t pdu_len_bytes, uint32_t reTX, bool crc_ok, uint32_t tti,
                                 uint16_t crnti_, uint8_t direction, uint8_t rnti_type);
-    
+
     void pack_and_write_api(uint8_t* pdu, uint32_t pdu_len_bytes, uint32_t reTX, bool crc_ok, uint32_t tti,
                                 uint16_t crnti_, uint8_t direction, uint8_t rnti_type);
 };

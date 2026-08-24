@@ -137,7 +137,7 @@ int HARQ::is_retransmission(uint16_t RNTI,
 srsran_softbuffer_rx_t* HARQ::getHARQBuffer(uint16_t RNTI, int pid, int tid)
 {
     std::unique_lock<std::mutex> harq_lock(harq_mutex);
-    srsran_softbuffer_rx_t* tem_buffer;
+    srsran_softbuffer_rx_t* tem_buffer = nullptr;  // was uninitialized -> wild pointer returned on RNTI miss
     bool found = false;
     std::vector<std::shared_ptr<dl_sniffer_harq_entity_t>>::iterator iter;
     for (iter = harq_database.begin(); iter != harq_database.end(); iter++){
@@ -181,7 +181,7 @@ void HARQ::updateHARQRNTI(uint16_t RNTI,
             (*iter)->harq_process[pid].tb[tid].using_mutex.unlock();
         }
     }
-    if (found = false){
+    if (!found){
         //add RNTI
     }
     harq_lock.unlock();

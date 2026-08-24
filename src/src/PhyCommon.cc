@@ -55,6 +55,7 @@ FILE* PhyCommon::getStatsFile() {
 }
 
 void PhyCommon::addStats(const DCIBlindSearchStats& stats) {
+  std::lock_guard<std::mutex> lk(stats_mutex);
   this->stats += stats;
 }
 

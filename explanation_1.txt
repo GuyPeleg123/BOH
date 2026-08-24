@@ -1,0 +1,799 @@
+================================================================================
+  LTESniffer GUI — Full Project Handoff Document
+  Written: July 6, 2026
+  For: Any new person or AI taking over the project
+================================================================================
+
+This document covers everything: what the project is, how it works, every file,
+all features, what was built in these sessions, what is working, and what could
+be done next. Read this top-to-bottom before touching any code.
+
+--------------------------------------------------------------------------------
+1. WHAT THIS PROJECT IS (BIG PICTURE)
+--------------------------------------------------------------------------------
+
+LTESniffer is an open-source LTE downlink+uplink sniffer that runs on commodity
+Software Defined Radio (SDR) hardware — specifically USRP devices (by Ettus
+Research). It captures LTE radio frames from the air and decodes them into pcap
+files and JSON event streams.
+
+The project on this machine adds a WEB GRAPHICAL USER INTERFACE (GUI) on top of
+the existing LTESniffer C++ binary. The GUI lets an operator:
+  - Start/stop/restart an LTE capture without touching the command line
+  - Watch live decoded metrics (subframes, DCIs, packet rates, cell info)
+  - Browse detected UEs (devices on the LTE network), their RNTIs and identities
+  - Manage encryption keys used during live capture
+  - Browse, download, and post-process captured pcap files
+  - Decrypt captured pcap files after the fact using tshark + PDCP key injection
+  - Analyze Timing Advance (UE distance from cell) from pcap files
+  - View historical capture logs
+
+The audience is a telecom researcher / security researcher who has physical
+USRP hardware and wants to analyze LTE traffic in their lab.
+
+--------------------------------------------------------------------------------
+2. REPOSITORY AND CODE LOCATION
+--------------------------------------------------------------------------------
+
+Working directory on this machine:
+  /home/project44/multi-usrp/
+
+The GUI code (what we built) lives in:
+  /home/project44/multi-usrp/LTESniffer/gui/
+
+The original LTESniffer C++ source lives in:
+  /home/project44/multi-usrp/LTESniffer/src/
+  /home/project44/multi-usrp/LTESniffer/CMakeLists.txt
+
+The compiled LTESniffer binary is at:
+  /home/project44/multi-usrp/LTESniffer/build/src/LTESniffer
+
+GitHub fork (where changes are pushed):
+  https://github.com/GuyPeleg123/BOH  (branch: multi-usrp)
+
+To pull latest changes:
+  cd /home/project44/multi-usrp/LTESniffer
+  git pull boh multi-usrp   (or: git pull origin multi-usrp)
+
+--------------------------------------------------------------------------------
+3. DIRECTORY STRUCTURE (GUI CODE ONLY)
+--------------------------------------------------------------------------------
+
+/home/project44/multi-usrp/LTESniffer/gui/
+├── backend/                  ← Python FastAPI server
+│   ├── main.py               ← Main app entry point: all REST endpoints + WS
+│   ├── auth.py               ← Session-cookie authentication (bcrypt, HTTPS)
+│   ├── sniffer.py            ← Subprocess lifecycle for LTESniffer binary
+│   ├── config.py             ← SnifferConfig model + load/save to disk
+│   ├── captures.py           ← pcap file listing, download, decrypt, organize
+│   ├── keyderiv.py           ← LTE key derivation (3GPP TS 33.401) — pure stdlib
+│   ├── keys.py               ← Keys file read/write (live-capture key store)
+│   ├── metrics.py            ← Prometheus metrics bus (optional /metrics endpoint)
+│   ├── analytics.py          ← RNTI churn analyzer
+│   ├── recorder.py           ← Session recorder (saves events to .jsonl.zst)
+│   ├── state_tracker.py      ← Lightweight state machine for capture lifecycle
+│   ├── runlogs.py            ← Historical per-capture log file listing
+│   ├── spectrum.py           ← Launch external spectrum analyzer tool
+│   ├── usrp.py               ← USRP device discovery (uhd_find_devices)
+│   ├── known_cells.py        ← Saved cell bookmarks (freq/USRP/mode presets)
+│   ├── mock.py               ← Mock runner for UI development without hardware
+│   ├── serve.py              ← Startup helper (uvicorn launch)
+│   ├── https.py              ← Self-signed TLS certificate generation
+│   ├── zmq_pub.py            ← Optional ZeroMQ event publisher
+│   └── pyproject.toml        ← Python package definition + dependencies
+│
+├── frontend/                 ← React + TypeScript + Vite + Tailwind CSS
+│   ├── src/
+│   │   ├── App.tsx            ← Root component: auth state, routing
+│   │   ├── main.tsx           ← React DOM entry point
+│   │   ├── index.css          ← Global CSS + Tailwind directives
+│   │   ├── lib/
+│   │   │   ├── store.ts       ← External store (useSyncExternalStore), WS lifecycle
+│   │   │   ├── api.ts         ← All HTTP/WS API calls
+│   │   │   ├── types.ts       ← TypeScript type definitions
+│   │   │   ├── color.ts       ← Color helpers for charts
+│   │   │   └── useStableTick.ts ← 1-second tick hook to throttle expensive renders
+│   │   ├── pages/
+│   │   │   ├── Dashboard.tsx  ← Main live-capture dashboard page
+│   │   │   ├── UEsPage.tsx    ← UE / RNTI tracking page
+│   │   │   ├── CapturesPage.tsx ← Captured pcap browser page
+│   │   │   ├── LogHistoryPage.tsx ← Historical log viewer page
+│   │   │   ├── Config.tsx     ← Sniffer config editor page
+│   │   │   ├── Keys.tsx       ← Encryption keys management page
+│   │   │   ├── Login.tsx      ← Login page (shown when not authenticated)
+│   │   │   └── Help.tsx       ← Help page (renders USER_GUIDE.txt)
+│   │   └── components/
+│   │       ├── StatusBar.tsx  ← Top navigation bar with tabs + WS status
+│   │       ├── CaptureControls.tsx ← Start/Stop/Restart buttons
+│   │       ├── CellCard.tsx   ← Decoded cell info (PCI, PRB, freq, mode)
+│   │       ├── MetricsTiles.tsx ← Live metric tiles (DCIs/s, UEs, runtime)
+│   │       ├── PacketTypeCounter.tsx ← DL/UL packet type counter table
+│   │       ├── LogPanel.tsx   ← Live scrolling log panel
+│   │       ├── IdentitiesPanel.tsx ← Live identity (IMSI/TMSI) feed
+│   │       ├── CapturesPanel.tsx ← pcap list + Decrypt button trigger
+│   │       ├── DecryptModal.tsx ← Post-capture decryption modal dialog
+│   │       ├── LogHistoryPanel.tsx ← List of past capture logs
+│   │       ├── RNTITable.tsx  ← (legacy, kept but not in main dashboard)
+│   │       ├── PacketFeed.tsx ← (legacy, kept but not in main dashboard)
+│   │       ├── SpectrumButton.tsx ← Launch spectrum analyzer button
+│   │       ├── WiresharkButton.tsx ← Launch Wireshark live-stream button
+│   │       └── ErrorBoundary.tsx ← React error boundary for crash recovery
+│   ├── index.html            ← HTML entry point
+│   ├── vite.config.ts        ← Vite build config (proxies /api to backend)
+│   ├── tailwind.config.js    ← Tailwind CSS config
+│   ├── tsconfig.json         ← TypeScript config
+│   └── package.json          ← Node dependencies
+│
+├── PROTOCOL.md               ← Documents the JSON event protocol (C++ → backend)
+├── README.md                 ← GUI-specific README
+├── USER_GUIDE.txt            ← English user guide (served at /api/help)
+├── USER_GUIDE_HE.txt         ← Hebrew user guide
+└── WORKPLAN.md               ← Phased improvement plan (phases 1-4)
+
+Additionally:
+/home/project44/multi-usrp/LTESniffer/scripts/
+├── ta_report.py              ← NEW: Timing Advance UE distance analyzer script
+├── kill-ltesniffer.sh        ← Kills orphaned LTESniffer processes (sudo-safe)
+└── setup-chrony-gpsdo.sh     ← GPSDO clock sync setup helper
+
+--------------------------------------------------------------------------------
+4. HOW THE SYSTEM WORKS (ARCHITECTURE)
+--------------------------------------------------------------------------------
+
+The system has three layers:
+
+LAYER 1: LTESniffer C++ binary
+  - Receives raw IQ samples from USRP hardware over USB/Ethernet
+  - Decodes LTE downlink (and optionally uplink) frames
+  - Outputs decoded data in two streams:
+    a) A pcap file (standard Wireshark-compatible capture file)
+    b) A JSON event stream over a named pipe (FIFO) passed via -J flag
+  - Events include: cell found, subframe decoded, UE identity, statistics, logs
+
+LAYER 2: Python FastAPI backend (gui/backend/main.py)
+  - Runs as a web server on port 8443 (HTTPS) or 8000
+  - Manages the LTESniffer subprocess lifecycle (start/stop/restart)
+  - Reads the JSON event FIFO and fans events out to all WebSocket clients
+  - Serves a REST API for config, keys, captures, USRP detection, etc.
+  - Has a mock mode (LTESNIFFER_GUI_MOCK=1) that generates fake data for UI dev
+  - Has a replay mode (LTESNIFFER_GUI_REPLAY=<path>) to replay recorded sessions
+  - Handles authentication (session cookies, bcrypt password hashing)
+  - Performs post-capture pcap processing via tshark (decrypt, organize)
+
+LAYER 3: React frontend (gui/frontend/src/)
+  - Single-page React app served as static files from the backend
+  - Connects to the backend via WebSocket (/api/events) for live data
+  - Uses an external store (useSyncExternalStore) for fast selective re-renders
+  - Calls REST endpoints for config, captures, keys, etc.
+  - Built with: React 18, TypeScript, Vite, Tailwind CSS, React Router
+
+DATA FLOW (live capture):
+  USRP hardware → LTESniffer binary → JSON FIFO → Python backend
+  → WebSocket → React frontend (store.ts reducer) → UI components
+
+DATA FLOW (pcap download/decrypt):
+  Browser → POST /api/captures/decrypt → backend calls tshark → returns result
+
+--------------------------------------------------------------------------------
+5. THE EVENT PROTOCOL (PROTOCOL.md)
+--------------------------------------------------------------------------------
+
+The C++ LTESniffer binary emits newline-delimited JSON to the FIFO. Event types:
+
+  hello     - Emitted once at startup with all CLI args
+  log       - Free-form log message (info/warn/error/debug)
+  cell      - Cell found: PCI, PRB count, frequency, FDD/TDD mode
+  mib       - MIB (Master Information Block) decoded
+  sf        - Rich subframe event: DL/UL DCIs with RNTI, MCS, TBS, RB alloc
+  sf_tick   - Lightweight per-subframe heartbeat (no DCI detail, keeps UI alive)
+  identity  - UE identity discovered: IMSI, M-TMSI, GUTI, UE capability
+  stats     - Periodic stats: subframes processed, RNTIs seen, CFO, RSRP, CPU%
+  bye       - Final event before clean shutdown
+  lifecycle - (backend-injected) started/stopped lifecycle events
+
+Frontend store.ts handles all these events in a single reducer function
+(applyEvents) and updates the relevant slices of state. React components
+subscribe to only the slice they need, so not every component re-renders
+on every event (important since events arrive at up to 1000/s from real LTE).
+
+--------------------------------------------------------------------------------
+6. AUTHENTICATION & SECURITY
+--------------------------------------------------------------------------------
+
+The GUI uses session-cookie authentication:
+
+  - First run: auto-generates admin credentials (username: admin, random 24-char
+    password). Prints the password ONCE to stderr with a banner. Stored as bcrypt
+    hash in ~/.config/ltesniffer-gui/auth.json (mode 0600).
+  - Login: POST /api/login with username/password. Returns a session cookie.
+    Cookie is HttpOnly (no JS access), Secure (HTTPS only), SameSite=Strict.
+  - Session TTL: 8 hours idle. In-memory store (sessions lost on restart).
+  - Rate limiting: max 10 failed logins per IP per 5-minute window.
+  - WebSocket: authenticates via the same session cookie (same-origin auto-sends).
+  - All /api/* endpoints require authentication except /api/health, /api/login.
+  - TLS: self-signed cert auto-generated in ~/.config/ltesniffer-gui/tls/.
+
+Binding modes (set via LTESNIFFER_GUI_BIND env var):
+  - Default: binds to detected LAN IP (for LAN access from laptop/tablet)
+  - 127.0.0.1: loopback only (max security)
+  - 0.0.0.0: all interfaces (prints a warning)
+
+Security hardening done:
+  - LTESniffer binary path allowlisted (prevents arbitrary command injection)
+  - keys_file path restricted to safe directories
+  - Hex key material redacted from log events before broadcast
+  - Config/keys files saved with 0600 permissions
+  - FIFO path allowlist (only /tmp/ or ~/ltesniffer-captures/)
+
+To rotate credentials: delete ~/.config/ltesniffer-gui/auth.json and restart.
+To set custom credentials on first start: set LTESNIFFER_GUI_USER and
+LTESNIFFER_GUI_PASS environment variables.
+
+--------------------------------------------------------------------------------
+7. HOW TO START THE GUI (RUNNING THE PROJECT)
+--------------------------------------------------------------------------------
+
+Prerequisites:
+  - Python 3.10+ with the backend virtualenv at gui/backend/.venv
+  - Node.js 18+ for the frontend build
+  - The LTESniffer binary compiled at LTESniffer/build/src/LTESniffer
+  - tshark (Wireshark CLI) installed: sudo apt install tshark wireshark
+
+Step 1: Start the backend
+  cd /home/project44/multi-usrp/LTESniffer/gui/backend
+  source .venv/bin/activate
+  LTESNIFFER_GUI_BIND=<your-LAN-ip>  python -m uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile ~/.config/ltesniffer-gui/tls/key.pem --ssl-certfile ~/.config/ltesniffer-gui/tls/cert.pem
+
+  OR more simply, if serve.py exists:
+  LTESNIFFER_GUI_BIND=<LAN-ip> python serve.py
+
+  The backend serves the pre-built frontend from gui/frontend/dist/.
+
+Step 2 (OPTIONAL — only if frontend source changed):
+  cd /home/project44/multi-usrp/LTESniffer/gui/frontend
+  npm install
+  npm run build
+  (outputs to frontend/dist/, served by the backend)
+
+Step 3: Access the GUI
+  Open a browser and navigate to https://<server-ip>:8443
+  Accept the self-signed TLS certificate warning
+  Log in with admin / <password from startup banner>
+
+For development (frontend hot-reload):
+  - Start backend with LTESNIFFER_GUI_DEV=1 environment variable
+  - Run: cd frontend && npm run dev
+  - Access at http://localhost:5173 (Vite proxies /api calls to backend)
+
+For demo/development without real hardware:
+  - Start backend with LTESNIFFER_GUI_MOCK=1
+  - This generates synthetic LTE events so all UI components show live data
+
+To replay a recorded session:
+  - Start backend with LTESNIFFER_GUI_REPLAY=/path/to/session.jsonl.zst
+
+--------------------------------------------------------------------------------
+8. EVERY FEATURE — WHAT IS IMPLEMENTED AND WORKING
+--------------------------------------------------------------------------------
+
+DASHBOARD (pages/Dashboard.tsx):
+  ✅ Capture controls (Start/Stop/Restart) with live status indicator
+  ✅ Cell info card: PCI, PRB count, DL/UL frequency, FDD/TDD mode, sample rate
+  ✅ Metrics tiles:
+      - Total DCIs (downlink + uplink DCI count)
+      - DCIs/second rate
+      - Unique UEs (distinct C-RNTIs seen)
+      - Subframes processed
+      - Run-time elapsed clock (HH:MM:SS, ticks live while running)
+  ✅ Packet Type Counter: table showing DL/UL packet counts per DCI format
+  ✅ Live log panel (last 5000 lines, scrollable, color-coded by level)
+  ✅ Identities panel (live IMSI/TMSI discovery feed from API mode)
+  ✅ Spectrum analyzer button (launches external spectrum tool)
+  ✅ Wireshark live-stream button (opens Wireshark on the pcap FIFO)
+
+UEs PAGE (pages/UEsPage.tsx):
+  ✅ Identified UEs count (IMSI + M-TMSI distinct values)
+  ✅ Radio session statistics (C-RNTI count, active, ghost/one-hit detection)
+  ✅ Identity table: type badge, value, associated RNTIs, seen count, source
+  ✅ RNTI detail table: hex RNTI, class (C-RNTI/SI-RNTI/P-RNTI/RA-RNTI),
+      DL count, UL count, seconds since last seen, active/idle/ghost labels
+  ✅ RNTI classification per 3GPP 36.321 Table 7.1-1
+
+CONFIG PAGE (pages/Config.tsx):
+  ✅ Full sniffer configuration editor (all CLI flags exposed)
+  ✅ RF/hardware section: DL freq, UL freq, gain, antennas, rfargs
+  ✅ Dual-USRP mode: USRP A args + USRP B args (for DL+UL simultaneous capture)
+  ✅ Auto-detect USRPs button (reads connected devices, fills serial numbers)
+  ✅ GPSDO probe (checks if USRP has GPS-disciplined oscillator)
+  ✅ UL frequency auto-suggestion from DL freq (LTE FDD band table)
+  ✅ Sniffer mode selector (0=DL only, 1=DL+UL, 2=API mode)
+  ✅ Known cells / presets: save current config as a cell, load saved cells
+  ✅ Config is saved to ~/.config/ltesniffer-gui/config.json
+
+KEYS PAGE (pages/Keys.tsx):
+  ✅ Per-RNTI live-capture key management (K_RRCenc + K_UPenc)
+  ✅ Keys are saved to ~/.config/ltesniffer-gui/keys.json
+  ✅ Auto-wired: saving keys auto-updates config.keys_file
+  NOTE: These keys are for LIVE capture decryption (fed to LTESniffer binary
+        at startup). They are NOT the same as post-capture decryption keys.
+        LTESniffer uses these keys during capture to decrypt traffic in real-time.
+
+CAPTURES PAGE (pages/CapturesPage.tsx + components/CapturesPanel.tsx):
+  ✅ Lists all pcap files under the captures directory (and extra known roots)
+  ✅ Shows file size, modification time, source directory
+  ✅ "Live capture" badge appears on the file being actively written to
+  ✅ Download button (serves file via /api/captures/download)
+  ✅ Decrypt & Split button opens the DecryptModal for post-capture processing
+
+DECRYPT MODAL (components/DecryptModal.tsx):
+  ✅ Two output modes:
+      a) "Decrypt & Split per UE" — creates a folder with one sub-pcap per UE,
+         named by TMSI/IMSI when known, else by RNTI hex
+      b) "Decrypt to single file" — decrypts whole capture to one readable .txt
+  ✅ Two key-match modes (for organize mode):
+      a) "Auto-match to UEs" — backend heuristically tries each key against each
+         UE, picks the one that yields the most clean RRC/IP decodes
+      b) "By RNTI" — explicit RNTI-to-key mapping
+  ✅ Per-RNTI key entry rows: K_RRCenc (32 hex), K_UPenc (32 hex)
+  ✅ Key derivation UI: click 🔑 on any row to expand K_ASME + NAS count panel.
+      Server derives K_RRCenc/K_UPenc from K_ASME using 3GPP TS 33.401 KDF.
+  ✅ Cipher and integrity algorithm selectors (EEA0-3, EIA0-3)
+  ✅ Results panel: UE list with sub-pcap names, frame counts, matched key
+  ✅ Download decoded text (.txt) button
+  ✅ Wireshark UAT sidecar shown (drop into ~/.config/wireshark/)
+  ✅ Keys persisted in browser localStorage between sessions
+
+LOG HISTORY PAGE (pages/LogHistoryPage.tsx):
+  ✅ Lists all past capture run logs (one per capture, newest first)
+  ✅ Click any run to view its full sniffer.log text
+
+HELP PAGE (pages/Help.tsx):
+  ✅ Renders the full USER_GUIDE.txt content
+
+STATUS BAR (components/StatusBar.tsx):
+  ✅ Navigation tabs: Dashboard, UEs, Keys, Config, Captures, Log History, Help
+  ✅ WebSocket connection indicator (green pulsing / red)
+  ✅ Sniffer running indicator (green pulsing with PID / grey)
+  ✅ Current cell info (PCI, PRB, MHz) when connected to cell
+  ✅ Signed-in username + logout button
+
+BACKEND API ENDPOINTS (main.py — all working):
+  GET  /api/health              — server health check (auth-free)
+  POST /api/login               — create session
+  POST /api/logout              — drop session
+  GET  /api/whoami              — check current session
+  GET  /api/config              — get sniffer config
+  PUT  /api/config              — save sniffer config (with security validation)
+  GET  /api/status              — get running state
+  POST /api/capture/start       — start capture (optional config override)
+  POST /api/capture/stop        — stop capture
+  POST /api/capture/restart     — restart with new config
+  GET  /api/usrps               — list connected USRP devices
+  GET  /api/usrps/autoconfig    — auto-detect USRPs and suggest config patch
+  GET  /api/usrps/gpsdo         — probe USRPs for GPSDO presence
+  GET  /api/keys                — get current keys file
+  PUT  /api/keys                — save keys file
+  POST /api/keys/derive         — derive K_RRCenc/K_UPenc from K_ASME+NAS count
+  GET  /api/spectrum            — spectrum analyzer status
+  POST /api/spectrum/launch     — launch spectrum analyzer
+  POST /api/spectrum/stop       — stop spectrum analyzer
+  GET  /api/known-cells         — list saved cell presets
+  PUT  /api/known-cells         — save known cells file
+  POST /api/known-cells/{idx}/load     — load a preset into active config
+  POST /api/known-cells/save-current   — save current config as a preset
+  PUT  /api/known-cells/{idx}   — update a specific preset
+  DEL  /api/known-cells/{idx}   — delete a preset
+  GET  /api/analytics/rnti-churn — run RNTI churn analysis on a session file
+  GET  /api/logs/history        — list historical capture run logs
+  GET  /api/logs/content        — get text of one run's sniffer.log
+  GET  /api/captures            — list all pcap files
+  GET  /api/captures/download   — download a pcap file
+  POST /api/captures/decrypt    — post-capture PDCP decrypt (single file)
+  POST /api/captures/organize   — post-capture split+decrypt per UE (folder)
+  POST /api/wireshark/open      — launch Wireshark on the live pcap FIFO
+  GET  /api/help                — serve USER_GUIDE.txt
+  WS   /api/events              — WebSocket live event stream
+  GET  /metrics                 — Prometheus metrics endpoint
+
+TA REPORT SCRIPT (scripts/ta_report.py):
+  ✅ Standalone Python script (no GUI dependency)
+  ✅ Reads any LTESniffer MAC-LTE pcap
+  ✅ Extracts RAR Timing Advance (11-bit absolute, from random access events)
+  ✅ Extracts connected-mode TA Command MAC CEs (6-bit relative corrections)
+  ✅ Computes one-way distance: 1 TA step ≈ 78.07 meters
+  ✅ Reports: closest/farthest/median range, distance histogram (500m bins)
+  ✅ Reports per-RNTI drift (net movement in connected mode)
+  ✅ Optional CSV output (--csv out.csv)
+  Usage: python scripts/ta_report.py <pcap> [--csv out.csv]
+  Requirements: tshark must be on PATH
+
+--------------------------------------------------------------------------------
+9. KEY IMPLEMENTATION DETAILS (TECHNICAL NOTES FOR DEVELOPERS)
+--------------------------------------------------------------------------------
+
+FRONTEND STATE MANAGEMENT (store.ts):
+  The frontend does NOT use React Context for performance reasons. Instead it
+  uses a module-level external store with useSyncExternalStore. Components
+  subscribe to only the slice they need via the useStore(selector) hook.
+  This means a component that shows only cell info does NOT re-render when a
+  subframe event arrives (important: real LTE runs at up to 1000 events/sec).
+
+  The store is batched at 15 Hz (FLUSH_HZ=15) using a setTimeout debounce.
+  Events queue up in pendingRef between flushes. This is why the UI stays
+  responsive even at full LTE event rates.
+
+  The reducer (applyEvents) uses reference equality to avoid creating new
+  objects when nothing in a particular slice changed. This is critical for
+  the component bail-out optimization.
+
+POST-CAPTURE DECRYPTION (captures.py):
+  Background: LTESniffer pcap files use DLT 147 (MAC-LTE-framing). Every frame
+  tags UEId=0 (the LTESniffer convention). Wireshark's PDCP-LTE dissector keys
+  its per-UE decryption table by UEId, not RNTI.
+
+  The decrypt pipeline:
+  1. _rewrite_ueid_eq_rnti(): pure Python pcap byte-rewriter. Sets each frame's
+     UEId tag to equal its RNTI tag. This is done without calling tshark so it
+     works on any platform. Parses the raw pcap binary format (DLT 147 TLV tags).
+  2. Writes a Wireshark UAT string (pdcp_lte_ue_keys) mapping each RNTI to its
+     K_RRCenc and K_UPenc keys.
+  3. Calls tshark with -o uat:pdcp_lte_ue_keys:... options to dissect with keys.
+  4. Returns the decoded verbose text + saves the keyed pcap + .uat sidecar.
+
+  The organize_session() function additionally:
+  - Splits the capture into one sub-pcap per C-RNTI (ignoring one-hit ghosts)
+  - Tries to recover UE identities from RRC Connection Requests in the pcap
+    and from sniffer.log API tables
+  - In "auto" key-match mode: probes which key produces the most clean
+    RRC/IP decodes for each UE (heuristic using _decode_count())
+
+KEY DERIVATION (keyderiv.py):
+  Implements 3GPP TS 33.401 Annex A HMAC-SHA256 key derivation:
+    K_ASME + NAS_UL_COUNT → K_eNB → K_RRCenc, K_RRCint, K_UPenc, K_UPint
+  The 128-bit keys are the LAST 16 bytes (low 128) of the 256-bit KDF output.
+  Pure Python stdlib (hmac + hashlib). Includes self-test against srsRAN vectors.
+  To run self-test: python -m keyderiv
+
+TIMING ADVANCE DISTANCE MATH (ta_report.py):
+  One TA step = 16 × Ts, where Ts = 1/(15000 × 2048) seconds (LTE sample period)
+  One-way distance = 16 × Ts × speed-of-light / 2
+  Result: ≈ 78.07 meters per TA step (one-way)
+  This is a range ring around the eNB, not a position.
+  Without GPS + angle-of-arrival, you cannot get lat/lon — only distance.
+
+MOCK MODE (mock.py):
+  MockRunner generates synthetic events: fake cell, fake subframes with random
+  RNTIs, fake stats, fake log messages. This lets developers work on the UI
+  without any USRP hardware. Start with LTESNIFFER_GUI_MOCK=1.
+
+SESSION RECORDING (recorder.py):
+  Every live capture session is recorded to a .jsonl.zst file in
+  ~/.local/share/ltesniffer-gui/sessions/. These can later be replayed with
+  LTESNIFFER_GUI_REPLAY. This is useful for debugging UI issues and demos.
+
+--------------------------------------------------------------------------------
+10. WHAT WAS BUILT/CHANGED IN THESE SESSIONS (JUNE 14-16, 2026)
+--------------------------------------------------------------------------------
+
+The following features and changes were implemented during the AI-assisted
+development sessions documented in this project:
+
+June 14:
+  - Added real-time run-time elapsed counter to MetricsTiles
+  - Refactored dashboard layout (removed PacketFeed and RNTITable from main dashboard)
+  - Created PacketTypeCounter component (filterable table of DCI format types)
+  - Created CapturesPage wrapper (moved captures to its own top-level tab)
+  - Created LogHistoryPage wrapper (moved log history to its own top-level tab)
+  - Updated App.tsx routing and StatusBar navigation to add new tabs
+  - Removed unused rate formatting utilities and Resource blocks metric tile
+  - Committed and pushed all changes to GitHub (GuyPeleg123/BOH branch: multi-usrp)
+
+June 15:
+  - Integrated UEsPage component (was added upstream)
+  - Discovered and documented that tshark 3.6.2 is installed and can read
+    LTESniffer pcap format (DLT 147 / MAC-LTE)
+  - Designed and implemented the entire post-capture decryption feature:
+      - backend: _rewrite_ueid_eq_rnti() pcap byte-rewriter
+      - backend: decrypt_pcap() full tshark-based decryption pipeline
+      - backend: organize_session() per-UE split + optional decrypt
+      - backend: keyderiv.py full 3GPP TS 33.401 key derivation module
+      - backend: /api/captures/decrypt REST endpoint
+      - backend: /api/captures/organize REST endpoint
+      - backend: /api/keys/derive REST endpoint
+      - frontend: DecryptModal component with full UI
+  - Refined DecryptModal labels to be clearer about decrypt vs. organize operation
+  - Added K_ASME key derivation UI panel in DecryptModal (🔑 button per row)
+  - Updated terminology throughout to emphasize "Decrypt & Split" language
+
+June 16:
+  - Added ta_report.py standalone Timing Advance analysis script to scripts/
+
+--------------------------------------------------------------------------------
+11. WHAT STILL EXISTS BUT WAS SIMPLIFIED/REMOVED FROM MAIN VIEW
+--------------------------------------------------------------------------------
+
+These components still exist in the codebase but are NOT shown in the main
+dashboard (they were moved out or simplified during the June 14 session):
+
+  PacketFeed.tsx      — live scrolling packet feed (exists, not in dashboard)
+  RNTITable.tsx       — full RNTI stats table (exists, used in UEsPage indirectly)
+
+These exist in the frontend but were removed from the dashboard metrics:
+  - DCI-specific metric tiles (removed — info now in PacketTypeCounter)
+  - Resource blocks tile (removed as it was redundant)
+
+The underlying data for these components is still collected in the store.
+If someone wants to add them back, the data is available.
+
+--------------------------------------------------------------------------------
+12. KNOWN LIMITATIONS AND THINGS THAT NEED REAL HARDWARE TO TEST
+--------------------------------------------------------------------------------
+
+1. PCAP decryption accuracy:
+   - The UEId rewriting is done in pure Python against the DLT 147 frame format.
+     It has been logic-checked but not tested against a real LTESniffer pcap
+     with known keys. The algorithm is correct per the spec but needs live testing.
+   - Key derivation has been self-tested against srsRAN vectors and passes.
+
+2. tshark PDCP-LTE dissection:
+   - Confirmed tshark 3.6.2 reads LTESniffer pcaps (2433 packets tested).
+   - Full PDCP decryption with -o uat:pdcp_lte_ue_keys has been tested on
+     sample captures but the live decrypt workflow needs validation with keys
+     from a real connected LTE session.
+
+3. Auto key-match heuristic:
+   - The _decode_count() function runs tshark once per (UE, key) combination.
+     For a capture with many UEs and many keys, this is slow (O(n×m) tshark calls).
+     A real multi-UE capture with 10 UEs and 10 keys = 100 tshark invocations.
+     Each call may take 2-10 seconds. This should be warned in the UI.
+
+4. LTE identity recovery in pcap:
+   - _rnti_identity_map() uses tshark to find lte-rrc.m_TMSI in RRC Connection
+     Requests. This only works if LTESniffer captured the RRC layer (requires
+     SRB dissection enabled). With API mode (-z) on, sniffer.log may contain
+     identity tables that the code also parses.
+
+5. USRP auto-detect:
+   - usrp.py calls uhd_find_devices. This tool is not available in all
+     environments. The feature gracefully handles absence.
+   - GPSDO probe runs uhd_usrp_probe which opens each device — must NOT run
+     while a capture is active (the code already guards against this).
+
+6. ta_report.py:
+   - Requires tshark on PATH.
+   - Has not been tested against a real LTE pcap that includes RAR TA events.
+     The math and tshark field names are correct per LTE spec.
+
+--------------------------------------------------------------------------------
+13. REMAINING WORK / POTENTIAL NEXT STEPS
+--------------------------------------------------------------------------------
+
+The WORKPLAN.md file in gui/ contains a detailed 4-phase improvement plan.
+High-priority items not yet done:
+
+FROM WORKPLAN.md PHASE 1 (some done, some remaining):
+  - B1+B2: O_NONBLOCK FIFO write in JSONEmitter.h (C++ side) — prevents the
+    C++ binary from blocking if the backend is slow to read the FIFO.
+    Currently if the FIFO buffer fills up, the sniffer blocks. Needs C++ edit.
+
+FROM WORKPLAN.md PHASES 2-4 (not started):
+  Phase 2: UX improvements
+    - Live spectrum waterfall in the dashboard
+    - Cell search progress bar
+    - Config validation with real-time feedback
+
+  Phase 3: Analytics
+    - RNTI churn viewer (backend analytics.py exists but no frontend view)
+    - Session replay player with timeline scrubbing
+    - Export features (CSV, JSON)
+
+  Phase 4: Multi-USRP improvements
+    - Clock sync status in the UI
+    - Per-USRP RF quality metrics display
+
+OTHER POTENTIAL IMPROVEMENTS:
+  - Integrate ta_report.py into the GUI as a "Range Analysis" tab that runs
+    the script on a selected pcap and shows the histogram visually
+  - Add a "UE Timeline" view showing when each UE was active across a capture
+  - Test and validate the decrypt workflow against a real captured LTE session
+    with known keys (requires real hardware setup)
+  - Add progress indication for long-running tshark operations (currently
+    the decrypt modal just shows "Decrypting..." with no progress bar)
+  - Session history browsing: the recorder saves .jsonl.zst sessions but there
+    is no UI to browse/replay them
+
+--------------------------------------------------------------------------------
+14. FILE PATHS THAT MATTER (DATA FILES, NOT CODE)
+--------------------------------------------------------------------------------
+
+All runtime data is stored under the current user's home directory:
+
+  ~/.config/ltesniffer-gui/
+  ├── auth.json          — bcrypt-hashed admin credentials
+  ├── config.json        — sniffer configuration (SnifferConfig)
+  ├── keys.json          — per-RNTI live capture keys
+  ├── known_cells.json   — saved cell presets
+  └── tls/
+      ├── cert.pem       — self-signed TLS certificate
+      └── key.pem        — TLS private key (mode 0600)
+
+  ~/.local/share/ltesniffer-gui/sessions/
+  └── <timestamp>/
+      └── session.jsonl.zst   — compressed recorded session
+
+  Captures directory (configured in SnifferConfig.captures_dir):
+  Default: ~/ltesniffer-captures/
+  └── <run-tag>/
+      ├── ltesniffer_dl_mode.pcap     — main capture file
+      ├── sniffer.log                 — capture run log
+      ├── <stem>_keyed.pcap           — after decrypt: UEId-rewritten pcap
+      ├── <stem>_decrypted.txt        — after decrypt: verbose decode
+      ├── <stem>.pdcp_lte_ue_keys.uat — after decrypt: Wireshark UAT
+      └── <stem>_session/             — after organize: per-UE folder
+          ├── <stem>_full.pcap
+          ├── ue_tmsi-<v>.pcap
+          ├── ue_tmsi-<v>_decrypted.txt
+          └── session.json
+
+Sample pcap files (from the original LTESniffer repo) at:
+  /home/project44/multi-usrp/LTESniffer/pcap_file_example/
+
+--------------------------------------------------------------------------------
+15. HOW THE C++ AND PYTHON CONNECT (THE FIFO PROTOCOL)
+--------------------------------------------------------------------------------
+
+When the backend starts LTESniffer, it:
+1. Creates a temporary FIFO (named pipe): /tmp/ltesniffer-<uuid>.fifo
+2. Launches LTESniffer with the -J <fifo> flag
+3. Opens the FIFO for reading (async, using asyncio)
+4. Reads lines one by one, parses as JSON, broadcasts to WebSocket clients
+
+The C++ JSONEmitter class (src/include/JSONEmitter.h) writes to this FIFO.
+The FIFO is the only inter-process communication between C++ and Python.
+
+The backend also:
+- Reads stderr from the LTESniffer process (for raw log lines)
+- Monitors the process exit code
+- Injects synthetic "lifecycle" events (started/stopped) when the process
+  starts or exits, so the frontend knows the capture state
+
+Important: LTESniffer runs under sudo (via a sudoers whitelist) because it
+needs raw access to the USRP hardware. The backend itself does NOT run as root.
+
+--------------------------------------------------------------------------------
+16. DEVELOPMENT TIPS FOR SOMEONE PICKING THIS UP
+--------------------------------------------------------------------------------
+
+TO RUN LOCALLY WITHOUT HARDWARE:
+  cd /home/project44/multi-usrp/LTESniffer/gui/backend
+  source .venv/bin/activate
+  LTESNIFFER_GUI_MOCK=1 LTESNIFFER_GUI_DEV=1 uvicorn main:app --host 127.0.0.1 --port 8000
+
+  Then in another terminal:
+  cd /home/project44/multi-usrp/LTESniffer/gui/frontend
+  npm run dev
+
+  Access: http://localhost:5173
+
+TO BUILD THE FRONTEND:
+  cd /home/project44/multi-usrp/LTESniffer/gui/frontend
+  npm run build
+  # Output goes to frontend/dist/ which the backend serves statically
+
+TO ADD A NEW BACKEND ENDPOINT:
+  1. Add the endpoint function to main.py
+  2. Add the corresponding API call to frontend/src/lib/api.ts
+  3. Add TypeScript types to frontend/src/lib/types.ts if needed
+  4. Create or update the relevant frontend component
+
+TO ADD A NEW FRONTEND PAGE:
+  1. Create the page component in frontend/src/pages/
+  2. Import and add a <Route> in App.tsx
+  3. Add a navigation tab in StatusBar.tsx
+
+TO TEST DECRYPTION WITHOUT REAL KEYS:
+  - Use the sample pcaps in pcap_file_example/
+  - They are not encrypted, so running decrypt with any keys will show
+    how the UEId rewriting and tshark pipeline works (just won't actually decrypt)
+
+TO VERIFY KEY DERIVATION:
+  cd /home/project44/multi-usrp/LTESniffer/gui/backend
+  source .venv/bin/activate
+  python keyderiv.py
+  # Should print ALL PASS if the stdlib KDF matches srsRAN vectors
+
+TO COMMIT AND PUSH CHANGES:
+  cd /home/project44/multi-usrp/LTESniffer
+  git add -p   # stage only the changes you want
+  git commit -m "your message"
+  git push boh multi-usrp
+
+--------------------------------------------------------------------------------
+17. DEPENDENCIES SUMMARY
+--------------------------------------------------------------------------------
+
+BACKEND PYTHON DEPENDENCIES (from pyproject.toml):
+  - fastapi         — web framework
+  - uvicorn[standard] — ASGI server
+  - pydantic        — data validation
+  - bcrypt          — password hashing
+  - cryptography    — TLS certificate generation
+  - zstandard       — session recording compression
+  - pyzmq           — optional ZeroMQ event publisher
+
+EXTERNAL SYSTEM TOOLS:
+  - tshark (Wireshark CLI) — for pcap decryption and ta_report.py
+  - uhd_find_devices — for USRP detection (part of UHD driver)
+  - uhd_usrp_probe  — for GPSDO detection
+  - wireshark       — for live-stream Wireshark integration (optional)
+  - sudo            — LTESniffer runs with sudo (configured in /etc/sudoers)
+
+FRONTEND NODE DEPENDENCIES (from package.json):
+  - react, react-dom
+  - react-router-dom
+  - typescript
+  - vite
+  - tailwindcss + postcss + autoprefixer
+
+--------------------------------------------------------------------------------
+18. THINGS TO KNOW ABOUT THE HARDWARE (FOR CONTEXT)
+--------------------------------------------------------------------------------
+
+USRP (Universal Software Radio Peripheral) by Ettus Research / NI:
+  - These are software-defined radios that connect to the computer via USB (B210)
+    or Ethernet (X310, N310).
+  - They receive and transmit radio signals across a wide frequency range.
+  - For LTE downlink sniffing, you need at least one USRP (DL only mode).
+  - For DL+UL simultaneous capture (dual USRP mode), you need two USRPs.
+  - GPSDO = GPS-Disciplined Oscillator: an add-on that locks the USRP's clock
+    to GPS timing. Required for accurate uplink timing in dual-USRP mode.
+
+LTE terminology used throughout the code:
+  RNTI    — Radio Network Temporary Identifier (16-bit, identifies a UE session)
+  C-RNTI  — Cell-RNTI (0x003D-0xFFF3): the main per-UE identifier
+  SI-RNTI — System Information RNTI (0xFFFF): broadcast
+  P-RNTI  — Paging RNTI (0xFFFE): paging
+  RA-RNTI — Random Access RNTI (0x0001-0x003C): random access procedure
+  DCI     — Downlink Control Information (resource allocation grants)
+  PDCP    — Packet Data Convergence Protocol (the layer that ciphers user data)
+  PRB     — Physical Resource Block (frequency unit in LTE)
+  PCI     — Physical Cell Identity (0-503, identifies a cell)
+  MIB     — Master Information Block (cell's broadcast config)
+  K_ASME  — Master session key (256-bit, derived from AKA procedure)
+  K_eNB   — eNodeB key (256-bit, derived from K_ASME + NAS count)
+  K_RRCenc — RRC encryption key (128-bit, for control plane)
+  K_UPenc  — User Plane encryption key (128-bit, for data plane)
+  EEA2    — AES-CTR cipher (most common in LTE)
+  EIA2    — AES-CMAC integrity (most common in LTE)
+  TA      — Timing Advance (round-trip delay in samples; yields UE distance)
+  TBS     — Transport Block Size (bytes per DCI grant)
+
+--------------------------------------------------------------------------------
+19. SUMMARY OF WHAT WORKS, WHAT'S TESTED, WHAT NEEDS HARDWARE
+--------------------------------------------------------------------------------
+
+WORKS AND TESTED (no hardware needed):
+  ✅ Full frontend UI in mock mode (LTESNIFFER_GUI_MOCK=1)
+  ✅ Authentication (login, logout, session management)
+  ✅ Config save/load
+  ✅ Key derivation math (self-tested against srsRAN vectors)
+  ✅ Frontend routing and navigation
+  ✅ DecryptModal UI and form validation
+  ✅ ta_report.py script logic
+
+WORKS BUT NEEDS REAL CAPTURE TO FULLY VALIDATE:
+  ⚠️  pcap UEId rewriting (_rewrite_ueid_eq_rnti)
+  ⚠️  Full tshark PDCP decrypt pipeline
+  ⚠️  Auto key-match heuristic (_decode_count)
+  ⚠️  Identity extraction from RRC Connection Requests
+  ⚠️  ta_report.py on a real capture with RAR TA events
+
+REQUIRES HARDWARE:
+  🔧  USRP auto-detect and GPSDO probe
+  🔧  Live capture start/stop/restart
+  🔧  Real event stream from LTESniffer
+  🔧  Live Wireshark stream
+
+--------------------------------------------------------------------------------
+END OF HANDOFF DOCUMENT
+================================================================================

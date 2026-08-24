@@ -557,8 +557,9 @@ int DCISearch::search() {
   struct timeval timestamp;
   gettimeofday(&timestamp, nullptr);
   dciCollection.setTimestamp(timestamp);
-  std::string test_string = '[' + std::to_string(sfn) + '-' + std::to_string(sf_idx) + ']';
-  { //PrintLifetime lt(test_string + "FFT: ");
+  // (debug label string removed — was built every subframe but only used by
+  //  commented-out PrintLifetime/cout below)
+  { //PrintLifetime lt: per-subframe label was "[sfn-sf_idx]"
     if (srsran_ue_dl_decode_fft_estimate(falcon_ue_dl.q, sf, ue_dl_cfg) < 0) {
       ERROR("srsran_ue_dl_decode_fft_estimate failed");
     }
@@ -566,7 +567,12 @@ int DCISearch::search() {
     dciCollection.setSubframe(sfn, sf_idx, sf->cfi);
   }
   float snr_db = falcon_ue_dl.q->chest_res.snr_db;
-  if (snr_db > 6.0){
+  // std::cout << "SF:" << sfn << ":" << sf_idx << "SNR = " << snr_db << std::endl;
+  // LTESniffer: gate lowered 6.0 -> 3.0. With a single RX antenna on a 2-port
+  // cell the DL chest SNR hovers ~5-7 dB, so a 6.0 gate blocks the DCI blind
+  // search on most subframes (all-or-nothing yield). 3.0 lets marginal-SNR
+  // subframes attempt decode; false candidates are still rejected by DCI CRC.
+  if (snr_db > 3.0){
     //PrintLifetime lt(test_string + "DCI Blind Search: ");
     temp_dci0.clear();
     recursive_blind_dci_search(&dci_msg, sf->cfi);

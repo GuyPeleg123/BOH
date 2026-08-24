@@ -1,0 +1,756 @@
+==============================================================================
+              מ ד ר י ך   מ ש ת מ ש   מ ק י ף  —   L T E S n i f f e r   G U I
+                          מהדורת מעבדה Project44 · 2026-05-27
+==============================================================================
+
+מדריך זה מסביר כל פונקציה ומונח טכני במערכת בעברית פשוטה, גם אם אתה לא
+מכיר ברשתות 4G/LTE או בקוד המערכת. כדאי לקרוא בסדר; הסעיפים בנויים זה
+על גבי זה. בסוף יש מילון מושגים מורחב לעיון מהיר.
+
+הערה: זוהי מהדורת לכידה-בלבד (ענף sniffer-nodecrypt). כל יכולות פענוח
+ה-PDCP וניהול המפתחות הוסרו. כל שאר היכולות — לכידת pcap, הגדרות,
+sessions, דשבורד, spectrum, Wireshark ולוגים — ללא שינוי.
+
+------------------------------------------------------------------------------
+פרק 0 — תקציר מנהלים: מה המערכת הזאת בכלל עושה?
+------------------------------------------------------------------------------
+
+LTESniffer הוא "מאזין פאסיבי" לרשת סלולרית 4G/LTE. "פאסיבי" אומר שהמערכת
+*לא* משדרת כלום, רק קולטת את הגלים הקיימים באוויר — בדיוק כמו רדיו רגיל
+שמאזין לתחנת FM. ההבדל: במקום מוסיקה, היא קולטת תעבורת נתונים סלולרית
+ומפענחת אותה (מה שאפשר לפענח מבחוץ — חלקים מוצפנים).
+
+מה אפשר לראות:
+  • באילו תדרים פעיל תא סלולרי (Cell) באזור
+  • איזה אופרטור / איזו תחנת בסיס מולנו (לפי PCI — מזהה תא)
+  • כמה משתמשים (UE — User Equipment) פעילים, ובאיזה קצב הם מקבלים/שולחים
+  • איזה מודולציה ומה גודל החבילות (MCS, TBS)
+  • את החבילות עצמן בפורמט Wireshark פתוח (MAC PDUs)
+
+מה זה GUI? Graphical User Interface — ממשק גרפי בדפדפן שמציג את כל
+הנתונים שמאזין ה-C++ אוסף. במקום לעבוד עם שורת פקודה, פותחים דפדפן.
+
+------------------------------------------------------------------------------
+פרק 1 — רקע: איך עובדת רשת 4G/LTE? (מאוד פשוט)
+------------------------------------------------------------------------------
+
+1.1 תחנת בסיס (eNodeB / eNB)
+    אנטנה הסלולרית שעל הגג / על העמוד. היא משדרת ומקבלת אותות מהטלפונים
+    הסלולריים באזור. כל תחנת בסיס מנהלת לפחות "תא" אחד (Cell) — באופרטור
+    גדול אפשר למצוא 3-6 תאים על אותה תחנה (לכל כיוון אנטנה).
+
+1.2 התא (Cell) ומזהה תא (PCI)
+    כל תא משדר זהות יחודית בשם PCI (Physical Cell ID), מספר בין 0 ל-503.
+    כשמחפשים תא — מחפשים את ה-PSS וה-SSS שלו. אלה אותות סינכרון שהתחנה
+    משדרת כל 5 מילי-שניות. כששומעים אותם, יודעים את ה-PCI ויודעים מתי
+    מתחיל ה-frame הבא.
+
+1.3 מבנה הזמן (Frame / Subframe)
+    הזמן ברשת LTE מחולק ל"מסגרות" (Frames) באורך 10 מילי-שניות, וכל
+    מסגרת מחולקת ל-10 "תת-מסגרות" (Subframes) באורך 1 מילי-שנייה כל אחת.
+    כל הסעיפים בתוך מסגרת ממוספרים: SFN.sf (System Frame Number + subframe).
+    דוגמה: 872.3 = מסגרת מספר 872, תת-מסגרת מספר 3.
+
+1.4 משאבים (Resource Blocks / PRB)
+    בכל תת-מסגרת המידע מחולק על תדרים. יחידת המידע הקטנה ביותר נקראת PRB
+    (Physical Resource Block) — בלוק של 12 תדרי-משנה רוחב 180kHz.
+    תא של רוחב פס 20MHz נותן 100 PRBs בכל תת-מסגרת. רוחב 10MHz = 50 PRB.
+    רוחב 5MHz = 25 PRB. ב-GUI יופיע "100 PRB" אם התא 20MHz.
+
+1.5 כיוונים (DL = Downlink, UL = Uplink)
+    DL = "Downlink"   = מהתחנה למטהול (אתה צופה ביוטיוב — DL)
+    UL = "Uplink"     = מהטלפון לתחנה (אתה שולח הודעה — UL)
+    ברשת 4G ה-DL וה-UL בדרך-כלל בתדרים שונים (FDD = Frequency Division
+    Duplex). למשל בפס B3 הישראלי: DL בערך 1805-1880MHz, UL בערך
+    1710-1785MHz, ויש מרווח 95MHz ביניהם.
+
+1.6 ערוצי בקרה ומידע
+    הרשת משדרת מספר ערוצים לוגיים שונים בו-זמנית:
+      PSS/SSS    — אותות סינכרון (חיפוש תא)
+      PBCH       — Physical Broadcast Channel, נושא את ה-MIB
+      MIB        — Master Information Block, "ברוכים הבאים לתא הזה",
+                   נשלח כל 40ms. מכיל פרטי תא בסיסיים.
+      SIB1/SIB2  — System Information Block, פרטים נוספים על התא
+                   (לוח זמני שידור, פרמטרי גישה).
+      PDCCH      — Physical Downlink Control Channel, מודיע "DCI"
+                   (Downlink Control Information) — מי מקבל מה ואיפה.
+      PDSCH      — Physical Downlink Shared Channel, הנתונים עצמם
+                   ב-DL (וידאו, אפליקציות, וכו').
+      PUSCH      — Physical Uplink Shared Channel, הנתונים ב-UL.
+
+    LTESniffer מפענח בעיקר את PDCCH (DCIs) כי משם רואים מי משתמש בתא ומה
+    הם עושים. את PDSCH (הנתונים עצמם) הוא מנסה לפענח, אבל הם מוצפנים
+    ברמת PDCP, ולכן רואים רק מטא-דאטה ולא את התוכן.
+
+1.7 מזהה משתמש זמני (RNTI)
+    Radio Network Temporary Identifier — מזהה זמני שהתחנה נותנת לכל UE
+    מחובר. 16-ביט. נראה ב-GUI כמו "0x49a9" או "18857". כל DCI מתייחס
+    ל-RNTI יעד. ה-RNTI מתחלף לעתים קרובות (כל פעם שה-UE עובר לסטטוס
+    "idle" וחוזר ל-"connected"), ולכן רואים הרבה RNTIs ב-session ארוך.
+
+1.8 פרמטרי DCI שתראה ב-GUI
+    fmt   — פורמט ה-DCI (1A, 0, 4, 7, וכו'). כל פורמט אומר משהו שונה
+            על הקצאת המשאבים (איזה PRBs, איזה מודולציה).
+    mcs   — Modulation and Coding Scheme (0-31). יותר = קצב נתונים גבוה
+            יותר אך פחות עמיד לרעש. MCS גבוה = איכות אות טובה ב-UE.
+    nprb  — מספר ה-PRBs שהוקצו ל-UE הזה ב-subframe הזה.
+    tbs   — Transport Block Size, גודל הבלוק בביטים. למשל TBS=12345 =
+            ~1500 בתים ל-UE בתת-מסגרת אחת.
+    ndi   — New Data Indicator (0 או 1). אומר אם זה שידור חדש או חזרה.
+    harq  — Hybrid ARQ process number. עד 8 שידורים מקבילים, HARQ עוזר
+            ל-UE לאחד שידור עם חזרה אם הראשון נכשל.
+
+------------------------------------------------------------------------------
+פרק 2 — חומרה: מה מחובר ולמה?
+------------------------------------------------------------------------------
+
+2.1 USRP (Universal Software Radio Peripheral)
+    קופסה שיודעת לקלוט גלי רדיו בטווח רחב מאוד (כמה מ-MHz עד GHz) ולתת
+    אותם למחשב כדגימות דיגיטליות. במעבדה שלנו מדובר ב-B210, דגם נפוץ
+    של חברת Ettus / National Instruments.
+
+    כל USRP מזוהה בסידורי (Serial), למשל "32FCD4C". יש לנו שתי יחידות:
+      USRP A — Serial 32FCD4C — לרוב משמש ל-DL (Downlink)
+      USRP B — Serial 3367EF9 — לרוב משמש ל-UL (Uplink)
+
+    במצב Dual (sniffer_mode = 2) אנחנו מקליטים DL ו-UL במקביל — שדרוג
+    משמעותי כי כך רואים את שני כיווני התעבורה.
+
+2.2 GPSDO (GPS-Disciplined Oscillator)
+    שעון אטומי-קליל ש-locking אל לוויני GPS. הוא נותן את ה-10MHz reference
+    ל-USRP. ה-LTE דורש סינכרון זמן מדויק בין AGC/PDCCH; בלי GPSDO השעונים
+    "שוחים" וה-decoding כושל.
+
+    שני מצבי GPSDO שתראה בלוגים:
+      gps_locked = True — ה-GPSDO רואה מספיק לוויינים (לרוב 4+)
+      ref_locked = True — היציאה של 10MHz disciplined בפועל
+
+    שניהם חייבים להיות True בשני ה-USRP. אם רק gps_locked=True אבל
+    ref_locked=False — יש בעיה בקליטת ה-GPS או באיכות ה-GPSDO.
+
+2.3 אנטנות
+    על כל USRP יש שני שערים: RX2 ו-TX/RX. ה-RX2 לקליטה בלבד. רוב
+    הזמן נשתמש ב-RX2 עם אנטנת לוג-פריודית או באנטנה דיפול עם פילטר
+    על פס B3.
+
+------------------------------------------------------------------------------
+פרק 3 — תוכנה: איך המערכת מורכבת?
+------------------------------------------------------------------------------
+
+מבנה כללי:
+
+        ┌───────────────┐   צינור JSON   ┌──────────────┐  WebSocket  ┌──────────────┐
+        │  LTESniffer   │ ──────────────▶│   Backend    │ ◀──────────▶│   Frontend   │
+        │  (C++ binary) │                │  (Python /   │  REST + WS   │ (React + Vite)│
+        │  כ-decoder    │                │   FastAPI)   │              │   בדפדפן     │
+        └───────────────┘                └──────────────┘              └──────────────┘
+                │                              │                              │
+                ▼                              ▼                              ▼
+            קבצי pcap                  ~/.config/ltesniffer-gui/         מסך הדשבורד
+            (MAC PDUs)                     config.json,
+                                            known_cells.json, token
+
+3.1 LTESniffer (C++)
+    התוכנית שעושה את העבודה הכבדה. קולטת דגימות מ-USRP דרך UHD, מפענחת
+    את ה-PHY (PSS/SSS/PBCH/PDCCH/PDSCH/PUSCH), כותבת:
+      • MAC PDUs בפורמט pcap (DLT 147 = MAC-LTE, Wireshark מבין)
+      • זרם אירועי JSON (Cell, MIB, sf, sf_tick, stats, ...) ל-FIFO שה-backend קורא
+      • כשמוגדרת FIFO לזרם חי (LTESNIFFER_PCAP_STREAM): מעתיק כל MAC PDU גם לשם
+
+    התוכנית רצה כ-root דרך sudo (USRP דורש הרשאות USB).
+
+3.2 Backend (Python / FastAPI)
+    שרת ה-HTTP/WS. אחראי על:
+      • הפעלה/הפסקה של תהליך ה-LTESniffer (subprocess)
+      • קריאה של ה-JSON FIFO ושידור בערוץ WebSocket לדפדפן
+      • שמירת config (תדרים, gain, USRPs, וכו')
+      • שמירת known_cells (תאים מוצלחים שגילית)
+      • הפעלת Spectrum analyzer ו-Wireshark
+      • Authentication (bearer token לגישה מרחוק)
+
+    נכנסים אליו ב-http://127.0.0.1:8000/  (פורט 8000, בכניסה לוקאלית בלי
+    סיסמה; ברשת מקומית — צריך טוקן מ-~/.config/ltesniffer-gui/token).
+
+3.3 Frontend (React)
+    הדפדפן. בנוי מ-React + Vite + Tailwind. מקבל אירועים בערוץ WebSocket,
+    מציג את כל המידע בזמן אמת. בנוי כ-SPA (Single Page Application) —
+    מסך אחד עם ניווט בתוך הדפדפן.
+
+------------------------------------------------------------------------------
+פרק 4 — התקנה (פעם אחת בלבד)
+------------------------------------------------------------------------------
+
+4.1 חבילות מערכת (אובונטו / דביאן)
+    sudo apt install build-essential cmake libuhd-dev libboost-all-dev \
+                     libfftw3-dev python3-pip python3-venv \
+                     gnuradio-uhd uhd-host wireshark
+
+4.2 הורדת firmware ל-USRP (פעם אחת)
+    sudo /usr/lib/uhd/utils/uhd_images_downloader.py
+
+4.3 בניית ה-LTESniffer
+    cd LTESniffer
+    cmake -S . -B build
+    cmake --build build -j$(nproc)
+    # קובץ הריצה נמצא ב: build/src/LTESniffer
+
+4.4 התקנת ה-backend
+    cd gui/backend
+    python3 -m venv .venv
+    .venv/bin/pip install -e .
+    .venv/bin/pip install pyzmq prometheus_client zstandard
+
+4.5 בניית ה-frontend
+    cd gui/frontend
+    npm install
+    npm run build   # יוצר תיקיית dist/, ה-backend מגיש אותה
+
+4.6 הוספת המשתמש לקבוצת wireshark (כדי שתוכל לפתוח Wireshark מה-GUI)
+    sudo usermod -aG wireshark $USER
+    # לאחר מכן יש להתנתק ולהתחבר מחדש (groups מתעדכנים רק בכניסה חדשה)
+
+4.7 הגדרת sudo NOPASSWD ל-kill-wrapper
+    # כדי שה-backend יוכל להרוג את LTESniffer כשמכבים אותו
+    echo "$USER ALL=(root) NOPASSWD: /path/to/LTESniffer/scripts/kill-ltesniffer.sh" \
+        | sudo tee -a /etc/sudoers.d/ltesniffer
+
+------------------------------------------------------------------------------
+פרק 5 — הפעלה ראשונה: Mock Mode (בלי USRP)
+------------------------------------------------------------------------------
+
+מצב Mock מייצר אירועים פיקטיביים — אין USRP, אין רדיו, רק בודקים שה-GUI
+עובד והדפדפן מציג נתונים.
+
+5.1 הפעלה במצב mock
+    cd gui/backend
+    LTESNIFFER_GUI_MOCK=1 .venv/bin/uvicorn main:app --port 8000
+
+5.2 פתיחה בדפדפן
+    http://127.0.0.1:8000/
+
+5.3 בדפדפן: לוחצים על "▶ Start"
+    אמורים לראות אירועים זורמים: cell card מקבל ערך (PCI=42 או דומה),
+    טבלת RNTI מתמלאת, גרף ה-waterfall מתעדכן.
+
+חשוב: ב-mock mode כפתור ה-Spectrum מושבת — אין USRP אמיתי.
+
+------------------------------------------------------------------------------
+פרק 6 — הפעלה אמיתית (real mode) עם USRP
+------------------------------------------------------------------------------
+
+6.1 ודא ש-USRPs מחוברים והנורית הצהובה (GPSDO LOCK) דולקת
+    בודקים בטרמינל:
+        uhd_find_devices
+    אמור להציג את ה-B210 שלך + serial.
+
+6.2 הפעלת ה-backend
+    cd gui/backend
+    .venv/bin/uvicorn main:app --port 8000
+    # או אם הוספת את עצמך לקבוצת wireshark וצריך לרענן את הגרופים:
+    sudo -u $USER nohup .venv/bin/uvicorn main:app --port 8000 \
+        > /tmp/ltesniffer-gui.log 2>&1 &
+
+6.3 פתיחה בדפדפן: http://127.0.0.1:8000/
+
+6.4 הגדרת התדרים (לחיצה על "Config" בתפריט העליון):
+    • rf_freq    = תדר ה-DL בהרץ (למשל 1845000000 לתא Pelephone B3)
+    • ul_freq    = תדר ה-UL בהרץ (למשל 1750000000)
+    • rf_gain    = -1 לבחור AGC (אוטומטי) או מספר 50-70 לרוב פעולות
+    • sniffer_mode = 2 (Dual — גם DL וגם UL במקביל)
+    • cell_search = True (מחפש את הקצאת התא אוטומטית)
+    • usrp_a_args = "clock=gpsdo,serial=32FCD4C"
+    • usrp_b_args = "clock=gpsdo,serial=3367EF9"
+    שמירה ב-"Save & Restart Capture"
+
+6.5 חוזרים ל-Dashboard. אם הכל תקין:
+    תוך 10-15 שניות תראה "● running pid NNNN" למעלה-מימין,
+    שמופיע cell card עם PCI ומפענחים DCIs.
+
+------------------------------------------------------------------------------
+פרק 7 — סיור על מסכי ה-GUI
+------------------------------------------------------------------------------
+
+7.1 שורת הסטטוס (סרגל עליון)
+    ─────────────────────────────────────────────────────────────────────
+    LTESniffer  [Dashboard] [Config] [Help]   ● connected
+                                                      ● running pid 1234
+                                                      PCI 325 · 100 PRB · 1845.0 MHz
+    ─────────────────────────────────────────────────────────────────────
+
+    "Dashboard" — המסך הראשי עם הטבלאות והגרפים
+    "Config"    — הגדרות (תדרים, USRPs, וכו')
+    "Help"      — המדריך הזה (קצר) + קישור להורדה
+
+7.2 ה-Dashboard — מסך ראשי
+
+    שורה 1: בקרות וכרטיס תא
+    ─────────────────────────────────────────────────────────────────────
+    שמאל:
+       [▶ Start]  [■ Stop]  [⟳ Restart]   ← בקרות capture
+       [📡 Spectrum]  [🦈 Wireshark]      ← פתיחת כלי הדיוט
+    ימין: כרטיס תא ─ PCI, PRB, רוחב פס, תדרי DL/UL, mode (FDD/TDD),
+                       sample_rate, רמת CFO (Carrier Freq Offset)
+
+    שורה 2: מטריקות (Metrics Tiles, מתעדכנות פעם בשניה)
+    ─────────────────────────────────────────────────────────────────────
+    ┌───────────┬───────────┬───────────┬───────────┬─────────┬─────────┐
+    │ UEs seen  │ DCIs total│ DL/UL split│Throughput│ RBs/s  │ Health %│
+    │  16       │  10,153   │  82%/18%  │  3.2 Mb/s│ 178    │  98%    │
+    └───────────┴───────────┴───────────┴───────────┴─────────┴─────────┘
+
+    שורה 3: גריד מרכזי — Packets | Waterfall | RNTIs
+    ─────────────────────────────────────────────────────────────────────
+
+    Packets (שמאל) — Live DCI feed
+        טבלה דינמית של כל DCI שמתפענח: כיוון (DL/UL), SFN.sf, זמן,
+        RNTI, פורמט, MCS, מספר PRBs, גודל TBS, NDI, HARQ, hex של ה-DCI.
+        כפתורים [ALL/DL/UL], שדה חיפוש RNTI, כפתור pause ❚❚.
+        אם תניע את העכבר על הטבלה — היא נעצרת אוטומטית כדי שתוכל לקרוא.
+
+    Waterfall (אמצע) — מפת חום זמן × תדר
+        ציר אנכי = זמן (חדש למטה), ציר אופקי = PRB.
+        Toggle [Alloc/Power]: Alloc צובע לפי RNTI (משתמש), Power צובע
+        לפי RSRP (חוזק האות, רק ב-DL).
+        Toggle [DL/UL]: רק במצב Alloc.
+
+    RNTIs (ימין) — טבלת משתמשים פעילים
+        כל שורה = RNTI אחד שראינו. מציג: צבע, ערך RNTI, "Last" (זמן
+        אחרון שנראה), DL count, DL RB, DL B, UL count, UL RB.
+        ניתן למיין לכל עמודה (לחיצה על הכותרת).
+        Checkbox "show only active" — מסנן רק מי שפעיל ב-5 שניות אחרונות.
+
+    שורה 4: לשוניות תחתונות
+    ─────────────────────────────────────────────────────────────────────
+    [Logs] [Captures] [Identities]
+
+    Logs        — שורות לוג מהיציאה הסטנדרטית של LTESniffer,
+                  מאירועי ה-state tracker, ומה-backend.
+    Captures    — רשימת קבצי pcap (MAC PDUs ב-DLT 147). כל קובץ עם גודלו
+                  וזמן יצירתו. כפתור הורדה. תווית "live capture" ירוקה
+                  מופיעה רק אם (capture רץ) AND (קובץ ב-captures_dir)
+                  AND (תוקן ב-20 שניות אחרונות).
+    Identities  — אם הופעל api_mode = 1, 2, 3, רשימת IMSI/TMSI/GUTI/UECapa
+                  שאספנו.
+
+7.3 כפתור 📡 Spectrum — Spectrum Analyzer
+    פתיחה של חלון uhd_fft (או gqrx) על המסך של ה-backend, מכוון לתדר
+    שאתה רואה כרגע. שימושי במיוחד לפני התחלת capture: רואה את האות בעין
+    ובוחר את התדר הנכון.
+
+    הטופס בפופ-אובר מאפשר לכוון:
+    ● Center freq (MHz)    — תדר המרכז (ברירת מחדל = התא הנוכחי)
+    ● Span / sample rate  — רוחב הספקטרום שתראה. presets:
+        1.4 MHz BW = 1.92 MS/s    — תא צר
+        5 MHz BW  = 7.68 MS/s
+        10 MHz BW = 15.36 MS/s
+        20 MHz BW = 23.04 MS/s    — תא רחב (הנפוץ ביותר)
+        wide 40 MHz = 40 MS/s    — סקירת רצועה רחבה
+        wide 56 MHz = 56 MS/s    — מקסימום ב-B210
+    ● RX gain (dB)         — ריק = AGC ברירת מחדל. נסה 50-70 לפעולות
+                              חלשות, 30-40 לאות חזק.
+    ● FFT size             — 1024 ברירת מחדל. גדול יותר = רזולוציה
+                              בתדר טובה יותר אבל יותר עומס CPU.
+    ● Averaging            — off/low/medium/high. medium מצוין לרוב.
+    ● Antenna (אופציונלי)  — לרוב מוסיף "RX2" או משאיר ריק.
+
+    איך לקרוא ספקטרום LTE?
+        רואים "מדף" שטוח רחב 5-20MHz — זה תא LTE.
+        רואים "פסגות מחודדות" - אלה תחנות AM/FM/רדיו אחרות.
+        אם רואים "אזור שטוח רחב 5-20MHz סביב התדר שלך" - מצויין, יש תא.
+
+7.4 כפתור 🦈 Wireshark — זרימה חיה של חבילות לדיסקטור
+    מאפשר לראות את ה-MAC PDUs בזמן אמת ב-Wireshark — כל פעם שמתפענחת
+    DCI, החבילה מועברת ל-Wireshark לפענוח/הצגה.
+
+    סדר העבודה (חשוב!):
+    1. ב-Config, הגדר: pcap_stream_fifo = "/tmp/lte.pcap"  → Save
+    2. ב-Dashboard, לחץ 🦈 Wireshark   ← נפתח Wireshark מאזין ל-FIFO
+    3. ב-Dashboard, לחץ ▶ Start         ← LTESniffer מתחיל לכתוב ל-FIFO
+
+    סדר זה קריטי: ה-C++ פותח את ה-FIFO ב-O_WRONLY|O_NONBLOCK; אם אין
+    קורא (Wireshark) ברגע הפתיחה, הוא נכשל בשקט וזרם החי לא יעבוד.
+
+    אם הסדר התבלגן: לחץ ⟳ Restart capture אחרי שה-Wireshark פתוח —
+    ה-C++ ייפתח-ייסגר וייפתח שוב את ה-FIFO, וזה יעבוד.
+
+    GUI מציג אזהרה אם הסדר לא תקין.
+
+7.5 מסך Config — הגדרות
+    טופס עם כל פרמטר שאפשר להגדיר. שדות עיקריים:
+
+    RF / hardware:
+    • rf_freq          — תדר DL בהרץ
+    • ul_freq          — תדר UL בהרץ
+    • rf_gain          — gain בדציבל (-1 = AGC)
+    • rf_nof_rx_ant    — מספר אנטנות (לרוב 1)
+    • usrp_a_args      — string פרמטרים ל-USRP A. דוגמה: "clock=gpsdo,serial=32FCD4C"
+    • usrp_b_args      — string פרמטרים ל-USRP B
+
+    Cell & mode:
+    • sniffer_mode     — 0=DL בלבד, 1=UL בלבד, 2=Dual (שניהם)
+    • cell_search      — True = חפש אוטומטית, False = השתמש ב-cell_id ידני
+    • cell_id          — PCI ידני אם cell_search=False
+    • nof_prb          — מספר PRBs בתא (6,15,25,50,75,100)
+    • target_rnti      — אם תרצה לפענח רק RNTI מסויים, שים אותו פה. 0 = כולם
+
+    Decoder:
+    • nof_sniffer_thread       — חוטים. ברירת מחדל 4. CPU טוב = יותר
+    • api_mode                 — -1 כבוי, 1 IMSI collecting, 2 UECapa, 3 הכל
+    • skip_secondary_meta_formats — True מהיר יותר אבל פחות מדוייק
+    • dci_format_split_ratio   — בין 0.0 ל-1.0. ברירת מחדל 0.5
+
+    Output files:
+    • pcap_file            — שם קובץ pcap
+    • pcap_stream_fifo     — נתיב FIFO לזרם חי ל-Wireshark
+                              (חייב להיות מתחת /tmp/ או ~/ltesniffer-captures/)
+
+    GUI:
+    • binary_path     — נתיב ל-LTESniffer C++. חייב להיות תחת
+                         <repo>/build/src/, /usr/local/bin, או /usr/bin
+    • captures_dir    — תיקיית פלט ה-pcaps
+    • sudo            — True = להריץ דרך sudo (USRPs דורש זאת)
+
+    מעל הטופס:
+    Known cells   — רשימת תאים ידועים, כפתור Load מעתיק לטופס
+    🔍 Auto-detect USRPs — מילוי אוטומטי של ה-serials
+
+------------------------------------------------------------------------------
+פרק 8 — תכונות מתקדמות
+------------------------------------------------------------------------------
+
+8.1 Known cells (רישום תאים מוצלחים)
+    כל פעם שמצאת תא שעובד טוב, לחץ על "+ Save current as known cell"
+    בעמוד Config. תופיע שורה חדשה ברשימה למעלה: label, DL/UL freq,
+    bandwidth, mode, ועוד. כפתור ↓ Load מעתיק לטופס באחת. כפתור ✕ מוחק.
+    שמור ב: ~/.config/ltesniffer-gui/known_cells.json
+
+8.2 Session Recorder (הקלטה של הרצה שלמה)
+    בכל הפעלת capture, ה-backend מקליט כל אירוע בקובץ דחוס:
+       ~/.local/share/ltesniffer-gui/sessions/session_<timestamp>_001.jsonl.zst
+    דחוסה ב-zstd. גודל ~50MB לקובץ, מסתובב אוטומטית.
+    כיבוי: LTESNIFFER_GUI_RECORD=0
+    שימוש: לבדיקה אחרי בעיה, ניתוח התנהגות, או החזרה (replay) של GUI.
+
+8.3 Replay (החזרה של session)
+    LTESNIFFER_GUI_REPLAY=<file.jsonl.zst> .venv/bin/uvicorn main:app
+    מנגן את כל האירועים כאילו הם בזמן אמת. שימושי לדמו / בדיקה ללא חומרה.
+
+8.4 Prometheus metrics
+    GET /metrics — מטריקות בפורמט Prometheus. שלב עם Prometheus + Grafana
+    לדשבורד היסטורי של תפוקה, RNTIs, בריאות-pipeline.
+
+8.5 ZMQ publisher (פרסום אירועים ב-PUB/SUB)
+    LTESNIFFER_GUI_ZMQ_BIND=tcp://127.0.0.1:5555 .venv/bin/uvicorn main:app
+    כל אירוע מתפרסם כ-PUB ב-ZeroMQ. לכל מי שרוצה לעבד עם סקריפט חיצוני.
+
+8.6 Phase-4 statefulness — מעקב משתמשים בזמן אמת
+    המערכת מנהלת state machine לכל RNTI:
+        IDLE → DATA → IDLE → FORGOTTEN
+    אירוע "ra_event" (Random Access) — first-seen-C-RNTI heuristic
+        (התקרבות ל-Msg4 בתהליך הצירוף לרשת)
+    אירוע "ue_state" — מעבר state של UE
+    הלוגים מציגים: "new UE rnti=0x49a9 first seen, sfn=872.3"
+
+8.7 RNTI Churn Analyzer (ניתוח offline)
+    GET /api/analytics/rnti-churn?path=<session.jsonl.zst>
+    מנתח כמה זמן כל RNTI חי, וכמה זמן עובר לפני שאותו ערך RNTI חוזר
+    לשימוש (Reuse delay). מועיל לכוונון הפרמטר UE_FORGET_AFTER_S.
+
+------------------------------------------------------------------------------
+פרק 9 — סדרי פעולה: מתי לעשות מה
+------------------------------------------------------------------------------
+
+9.1 התרחיש "אני רוצה להאזין לתא חדש שאני לא מכיר"
+    1. פתח Config, וודא ש-USRPs מחוברים (Auto-detect)
+    2. לחץ Spectrum, סרוק את הפס הרלוונטי (40 MHz wide):
+       • לאופרטור פלאפון: 1805-1855
+       • לאופרטור פרטנר: 1840-1900
+       • לאופרטור סלקום: ...
+    3. אם רואים "מדף" שטוח רחב 5-20MHz סביב תדר מסויים — זה התא
+    4. סגור Spectrum, ב-Config שים rf_freq לאותו תדר, ul_freq = הזוג שלו
+       (יש offset של 95MHz בפלאפון/פרטנר/סלקום ב-B3)
+    5. שמור ו-Restart Capture
+    6. תוך 15-30 שניות אמורים לראות PCI ומתחילים לבוא DCIs
+
+9.2 התרחיש "התא הזה מוצלח, אני רוצה להחזיר אליו אחרי"
+    1. בזמן שעובד, לחץ "+ Save current as known cell" ב-Config
+    2. תן לו שם משמעותי (אופרטור + מיקום)
+    3. מאוחר יותר, לחץ ↓ Load ליד הרשומה
+
+9.3 התרחיש "אני רוצה לראות חבילות בזמן אמת ב-Wireshark"
+    1. ב-Config, הגדר pcap_stream_fifo = /tmp/lte.pcap → Save
+    2. ב-Dashboard, לחץ 🦈 Wireshark   ← נפתח Wireshark
+    3. אם capture כבר רץ — לחץ ⟳ Restart
+    4. אם capture לא רץ — לחץ ▶ Start
+
+------------------------------------------------------------------------------
+פרק 10 — אבחון תקלות נפוצות
+------------------------------------------------------------------------------
+
+10.1 ה-Dashboard מציג "stopped" אבל אירועים זורמים
+     ← דף כללי מהקאש. עשה Ctrl+Shift+R (hard refresh).
+
+10.2 "Waiting for cell discovery..." לעולם לא מסתיים
+     ← LTESniffer לא מצליח לסנכרן עם תא בתדר הזה.
+       בדוק:
+       • Spectrum: האם רואים מדף LTE-shaped?
+       • Logs: יש שגיאות PSS / Cell-not-found?
+       • RX gain: נסה 60-70
+       • USRP: ‏GPSDO לוקד? gps_locked AND ref_locked?
+
+10.3 כפתור Spectrum אדום "⚠ Spectrum failed"
+     ← רחף עליו לראות את ה-stderr. נפוצות:
+       "No devices found" — USRP תפוס ע"י ה-sniffer; עצור capture
+       "Could not find path for image" — חסר UHD firmware images,
+           הרץ uhd_images_downloader.py
+
+10.4 קבצי pcap בגודל 0 בתים
+     ← תא סונכרן, MIB פוענח, אבל אין PDCCH דקודינג מצליח.
+       בדוק:
+       • RX gain — אולי גבוה מדי (clipping)?
+       • תן יותר זמן (60+ שניות)
+       • נסה תא אחר (אולי התא הזה לא פעיל מספיק)
+
+10.5 רואים sf_tick אבל לא sf
+     ← bug ישן ב-JSONEmitter (כבר תוקן בקומיט faa080f).
+       קמפל מחדש: cmake --build build -j$(nproc)
+
+10.6 שגיאת Wireshark: "Couldn't run /usr/bin/dumpcap in child process:
+     Permission denied"
+     ← המשתמש לא בקבוצת wireshark. תיקון:
+        sudo usermod -aG wireshark $USER
+        # להתנתק ולהיכנס מחדש, ולהפעיל מחדש את ה-backend.
+
+10.7 GPSDO troubleshooting
+     ← gps_locked=True אבל ref_locked=False:
+       • GPSDO רואה לוויינים אבל לא מצליח לדסציפלין את ה-10MHz
+       • זאת חולשה של ה-GPSDO. בלי ref_locked, התזמון "שוחה"
+       • התקן GPSDO טוב יותר או הוסף אנטנה חיצונית
+
+10.8 Wireshark פתוח אבל לא רואה חבילות
+     ← הקליק על Wireshark הופעל אחרי שה-capture כבר רץ. ה-C++
+       נכשל בפתיחת ה-FIFO. תיקון: לחץ ⟳ Restart capture כש-Wireshark
+       כבר פתוח. עכשיו ה-C++ ייפתח שוב את ה-FIFO וזה יעבוד.
+
+10.9 Firefox לא מצליח להתחבר ל-ws://127.0.0.1:8000/api/events
+     ← בדוק:
+       • הדפדפן מוגדר עם פרוקסי? (about:preferences#general → Network)
+       • ה-backend חי? (curl http://127.0.0.1:8000/api/health אמור להחזיר ok)
+       • נסה incognito window (Ctrl+Shift+P)
+
+------------------------------------------------------------------------------
+פרק 11 — מילון מושגים מורחב (Glossary)
+------------------------------------------------------------------------------
+
+AGC                — Automatic Gain Control. ה-RX gain מתכוונן אוטומטית
+                     בהתאם לעצמת האות. -1 ב-rf_gain = AGC פעיל.
+
+API mode (-z)      — מצב איסוף זהויות UE. 1=IMSI, 2=UECapa, 3=הכל.
+                     שומר ב-api_collector.pcap נפרד.
+
+bandwidth (BW)     — רוחב פס של תא. 1.4/3/5/10/15/20 MHz.
+
+bytes / B          — בתים. 8 ביטים. כשמופיע "DL B" בטבלת RNTIs, זה
+                     בייטים שעברו לאותו RNTI ב-DL.
+
+C-RNTI            — Cell RNTI. סוג ה-RNTI הנפוץ ביותר (טווח 0x003D..0xFFF3).
+                     ה-state tracker מסנן לפיו.
+
+CDMA / OFDMA      — שיטות modulation. 4G LTE משתמשת ב-OFDMA ב-DL ו-SC-FDMA
+                     ב-UL.
+
+CFI                — Control Format Indicator (1-3). אומר כמה OFDM symbols
+                     בכל subframe מקודשים ל-PDCCH.
+
+CFO                — Carrier Frequency Offset. הפרש תדר בין השעון של ה-USRP
+                     לתחנת הבסיס. רואים את זה בכרטיס Cell.
+
+CINR / RSRP        — מדדי איכות אות RX.
+
+DCI                — Downlink Control Information. הודעה ב-PDCCH שאומרת
+                     איזה UE מקבל איזה משאב ב-subframe הזה.
+
+dl_n / ul_n        — מספר ה-DCIs ב-DL/UL ב-subframe הזה (לפי sf_tick).
+
+E-UTRAN            — Evolved UTRAN. החלק הרדיו של 4G LTE.
+
+eNodeB / eNB       — Evolved NodeB. תחנת בסיס 4G.
+
+env_reset (sudo)   — תכונת sudo שמנקה משתני סביבה. מצריך env wrapping.
+
+FFT                — Fast Fourier Transform. הטרנספורם שעובר מ-זמן ל-תדר.
+                     ב-Spectrum analyzer, FFT size קובע רזולוציה בתדר.
+
+FIFO / Named Pipe — צינור משנה ל-IPC. /tmp/lte.pcap למשל. כותב פתח עם
+                     write, קורא עם read. גם פיירפוקס יכול לקרוא ממנו.
+
+GPSDO              — GPS-Disciplined Oscillator. שעון אטומי שמכוון לפי GPS.
+
+GUTI               — Globally Unique Temporary ID. גרסה רחבה יותר של TMSI.
+
+HARQ               — Hybrid Automatic Repeat Request. 8 תהליכים מקבילים
+                     שתומכים בחזרה (retransmission) חכמה.
+
+HFN                — Hyper Frame Number. חלק עליון של 32-bit COUNT ב-PDCP.
+
+I/Q samples        — Inphase/Quadrature, זוגות מספרים מרוכבים שמייצגים
+                     גל RF דגום בקצב המתאים.
+
+IMSI / IMEI / GUTI — מזהי משתמש סלולרי. IMSI הוא הקבוע, GUTI/TMSI זמני.
+
+L (DCI)            — Aggregation Level. כמה CCEs (Control Channel Elements)
+                     משולבים לקודד DCI. 1, 2, 4, 8. גבוה יותר = יותר עמיד.
+
+LTE                — Long Term Evolution. דור 4 של רשתות סלולריות.
+
+MAC                — Medium Access Control. שכבת 2 במודל ה-LTE. המוצר העיקרי
+                     של LTESniffer הוא MAC PDUs בפורמט pcap.
+
+MAC PDU            — Protocol Data Unit ב-MAC. החבילה הסופית עם header MAC
+                     ו-payload. נשמר ב-DLT 147 לקריאה ב-Wireshark.
+
+MCS                — Modulation and Coding Scheme. 0-31. גבוה יותר =
+                     מודולציה צפופה יותר (16QAM, 64QAM, 256QAM) ופחות
+                     redundancy. דורש איכות אות טובה.
+
+MIB                — Master Information Block. כל 40ms על PBCH. מכיל:
+                     bandwidth, system frame number, PHICH config.
+
+NAS                — Non-Access Stratum. ניהול mobility/security/session
+                     בין UE לליבה. ה-NAS uplink count עולה בכל message NAS
+                     שה-UE שולח.
+
+ncce               — מספר CCE התחלתי בפלט PDCCH. נחוץ לדיבוג.
+
+ndi                — New Data Indicator. 0/1. אם הפוך לעומת הקודם → נתון
+                     חדש; אם זהה → רטרנסמיט.
+
+nof_ports          — מספר האנטנות בתחנה. 1, 2, או 4.
+
+nof_prb            — מספר PRBs בתא. 6/15/25/50/75/100 (= 1.4/3/5/10/15/20 MHz).
+
+NOPASSWD (sudo)    — שורה בsudoers שמאפשרת sudo בלי סיסמה. נחוץ ל-backend
+                     להריץ LTESniffer בלי אינטראקציה.
+
+O_NONBLOCK         — דגל ב-open(2). open לא חוסם אם FIFO לא מוכן.
+
+OFDM               — Orthogonal Frequency Division Multiplexing. השכבה
+                     הפיזית ב-DL.
+
+PBCH               — Physical Broadcast Channel. הערוץ שמשדר MIB.
+
+PCAP / pcap        — Packet Capture format. הפורמט שבו נשמרים MAC PDUs.
+                     Wireshark פותח את זה.
+
+PCI                — Physical Cell ID. 0-503. מזהה את התא ייחודית באזור.
+                     מתפענח מ-PSS+SSS.
+
+PDCP               — Packet Data Convergence Protocol. שכבת ההצפנה ב-LTE.
+                     התוכן מוצפן; בלכידה פאסיבית רואים מטא-דאטה בלבד.
+
+PDSCH              — Physical Downlink Shared Channel. ערוץ הנתונים ב-DL.
+                     איפה ה-MAC PDUs שלנו יושבים.
+
+PHICH              — Physical HARQ Indicator Channel. ACK/NACK ל-UL HARQ.
+
+pid                — Process ID. מזהה תהליך ב-Linux.
+
+PRB                — Physical Resource Block. 12 sub-carriers × 7 OFDM
+                     symbols. אורך 0.5ms ורוחב 180kHz.
+
+prw / O_WRONLY     — Permissions / Write-Only open flag. FIFO בגודל 0 בתים
+                     ב-ls עם תווית "p" = FIFO.
+
+PSS / SSS          — Primary/Secondary Synchronization Signal. אותות שכל
+                     תא משדר. ל-LTE יש 3 PSS × 168 SSS = 504 PCIs.
+
+PUSCH              — Physical Uplink Shared Channel. ערוץ נתונים ב-UL.
+
+QAM                — Quadrature Amplitude Modulation. 16QAM=4 bits/symbol,
+                     64QAM=6, 256QAM=8. רואים את זה ב-MCS.
+
+RA / Random Access — תהליך הצירוף הראשוני של UE לתא. מתחיל בפרטיכל RACH.
+
+ra_event           — אירוע ב-LTESniffer GUI שמסמן זיהוי של C-RNTI חדש
+                     (הירוסטיקה ל-Msg4 of RA).
+
+ref_locked         — האם ה-10MHz reference של ה-USRP disciplined.
+
+REPLAY runner      — backend שמנגן session מוקלט במקום USRP אמיתי.
+
+rfargs / device_args — מחרוזת פרמטרים ל-UHD. דוגמה:
+                     "clock=gpsdo,serial=32FCD4C,type=b200"
+
+RNTI               — Radio Network Temporary Identifier. 16-bit.
+                     C-RNTI = למשתמשים פעילים, SI/P/RA-RNTI = מערכת.
+
+RSRP               — Reference Signal Received Power. עוצמת הסיגנל בקרבת UE.
+
+RX2 / TX/RX        — שמות שני השערים ב-B210. RX2 = receive only.
+
+s — sample rate    — תדירות הדגימה ב-USRP, בסמפלים לשניה.
+
+sample_rate        — הקצב שה-USRP מספק ל-CPU. למשל 30.72 MS/s ל-20MHz BW.
+
+SCellInfo          — מידע על Secondary Cells בה-RRC. (לא מוצג ב-GUI כעת.)
+
+session_recorder   — רכיב backend שמקליט את כל ה-broadcast bus ל-jsonl.zst.
+
+sf / subframe      — תת-מסגרת, 1ms. כל subframe יכול לשאת DCIs ו-PDSCH/PUSCH.
+
+sfn                — System Frame Number. 0-1023. עולה בכל 10ms.
+
+snipped:           — אם תראה "snipped" בלוגים זה PDU שלא נשמר במלואו.
+
+SR                 — Sample Rate (USRP) או Scheduling Request (UL).
+
+stats event        — אירוע סטטיסטי שמופיע פעם בשנייה. מכיל count של DCIs,
+                     CFO, drops, וכו'.
+
+sticky state       — מצב שמשתמר בין connections של WS. הדפדפן רואה את
+                     ה-cell event האחרון גם בחיבור חדש.
+
+TBS                — Transport Block Size. גודל הבלוק בביטים. נגזר מ-MCS
+                     ומספר ה-PRBs.
+
+TDD / FDD          — Time Division Duplex (DL/UL חולקים תדר אחד אך זמנים
+                     שונים) vs Frequency Division Duplex (תדרים שונים).
+                     בישראל בעיקר FDD ברצועות B3/B7.
+
+TMSI               — Temporary Mobile Subscriber Identity. גרסת IMSI זמנית.
+
+UE                 — User Equipment. הטלפון הסלולרי / המודם.
+
+UECapa             — UE Capability. מה ה-UE יודע לעשות (קצבי נתונים, פסים,
+                     אלגוריתמים נתמכים). מועיל לזיהוי דגם המכשיר.
+
+ue_state           — אירוע מ-state tracker: מעבר מצב של UE (IDLE/DATA/...)
+
+UHD                — USRP Hardware Driver. ה-library שמדבר עם USRP.
+
+uhd_fft            — תוכנת FFT real-time מ-GNU Radio. השרת מפעיל אותה
+                     ב-Spectrum.
+
+uvicorn            — ASGI server שמריץ את ה-backend.
+
+WebSocket          — פרוטוקול דו-כיווני מעל TCP. הדפדפן מקבל אירועים מ-backend.
+
+wireshark          — תוכנה גרפית שמציגה pcap. עם DLT 147 = MAC-LTE היא
+                     מציגה גם את שדות ה-MAC-LTE.
+
+zmq / ZeroMQ      — ספריית messaging. PUB/SUB / REQ/REP. ב-LTESniffer GUI
+                     זאת אפשרות פרסום אופציונלית של אירועים.
+
+zstd / zstandard   — אלגוריתם דחיסה מהיר. session recorder משתמש בו.
+
+==============================================================================
+                       סוף המדריך
+==============================================================================
+
+קישורים שימושיים:
+  • המדריך באנגלית (יותר טכני):  ~/work/LTESniffer/gui/USER_GUIDE.txt
+  • REST API + WS protocol:        ~/work/LTESniffer/gui/PROTOCOL.md
+  • workplan עם 4 phases:          ~/work/LTESniffer/gui/WORKPLAN.md
+
+אם משהו לא ברור — חזור על פרק הרקע (פרק 1) ופרק התקליט (פרק 7), שם רוב
+המושגים מוסברים. גם המילון בפרק 11 לעיון מהיר.

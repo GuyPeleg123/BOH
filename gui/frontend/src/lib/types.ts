@@ -1,0 +1,300 @@
+// Event types — mirror gui/PROTOCOL.md.
+
+export interface DCIDL {
+  rnti: number;
+  fmt: string;
+  mcs: number;
+  nprb: number;
+  tbs: number;
+  ndi: number;
+  harq: number;
+  ncce: number;
+  L: number;
+  hist: number;
+  hex: string;
+}
+
+export interface DCIUL extends Omit<DCIDL, "harq"> {}
+
+export type Event =
+  | { t: "hello"; ts: number; version: number; args: Record<string, any> }
+  | {
+      t: "cell";
+      ts: number;
+      pci: number;
+      nof_prb: number;
+      nof_ports: number;
+      cp: string;
+      mode: string;
+      dl_freq: number;
+      ul_freq: number;
+      sample_rate: number;
+    }
+  | { t: "mib"; ts: number; sfn: number; sfn_offset: number }
+  | { t: "frames"; ts: number; count: number; ul?: number; dl?: number }
+  | { t: "sf_tick"; ts: number; sfn: number; sf: number; cfi: number; dl_n: number; ul_n: number }
+  | {
+      t: "sf";
+      ts: number;
+      sfn: number;
+      sf: number;
+      cfi: number;
+      dl: DCIDL[];
+      ul: DCIUL[];
+      rb_dl: number[];
+      rb_ul: number[];
+      pwr_dl: number[];
+      pwr_min?: number;
+      pwr_max?: number;
+    }
+  | { t: "log"; ts: number; level: string; msg: string; source?: string }
+  | {
+      t: "stats";
+      ts: number;
+      sfn: number;
+      sf_processed: number;
+      sf_skipped: number;
+      nof_rnti: number;
+      rb_dl_total: number;
+      rb_ul_total: number;
+      cfo_hz: number;
+    }
+  | {
+      t: "identity";
+      ts: number;
+      sfn: number;
+      kind: string;
+      rnti: number;
+      value: string;
+      from: string;
+    }
+  | { t: "bye"; ts: number; reason: string }
+  | { t: "lifecycle"; event: "started" | "exited"; pid?: number; argv?: string[]; exit_code?: number };
+
+export interface SnifferConfig {
+  rf_freq: number;
+  ul_freq: number;
+  rf_gain: number;
+  ul_rf_gain: number;
+  rf_nof_rx_ant: number;
+  rf_args: string;
+  usrp_a_args: string;
+  usrp_b_args: string;
+  clock_source: string;
+  decimate: number;
+  cpu_affinity: number;
+  sniffer_mode: number;
+  api_mode: number;
+  cell_search: boolean;
+  force_n_id_2: number;
+  force_n_id_1: number;
+  cell_id: number;
+  nof_prb: number;
+  mcc: string;
+  mnc: string;
+  target_rnti: number;
+  nof_sniffer_thread: number;
+  skip_secondary_meta_formats: boolean;
+  dci_format_split_ratio: number;
+  dci_format_split_update_interval_ms: number;
+  enable_shortcut_discovery: boolean;
+  rnti_histogram_threshold: number;
+  mcs_tracking_mode: number;
+  en_debug: boolean;
+  pcap_file: string;
+  dci_file_name: string;
+  stats_file_name: string;
+  pcap_stream_fifo: string;
+  binary_path: string;
+  captures_dir: string;
+  sudo: boolean;
+  auto_split_enabled?: boolean;
+  auto_split_dims?: string[];
+  pcap_forward_enabled?: boolean;
+  pcap_forward_host?: string;
+  pcap_forward_port?: number;
+  pcap_forward_compress?: boolean;
+  pcap_receive_bind?: string;
+  pcap_receive_port?: number;
+}
+
+export interface ForwardStatus {
+  enabled: boolean;
+  state: "idle" | "starting" | "connected" | "retrying" | "error";
+  host: string;
+  port: number;
+  compress: boolean;
+  bytes_in: number;
+  records: number;
+  bytes_out: number;
+  connected_since: number | null;
+  connects: number;
+  last_error: string | null;
+}
+
+export interface ReceiveStatus {
+  enabled: boolean;
+  state: "idle" | "listening" | "connected" | "error";
+  bind: string;
+  port: number;
+  bytes_in: number;
+  records: number;
+  connections: number;
+  peer: string | null;
+  connected_since: number | null;
+  last_file: string | null;
+  last_error: string | null;
+  host_ip: string;
+}
+
+export interface CaptureFile {
+  path: string;
+  name: string;
+  size: number;
+  mtime: number;
+  source: string;
+  active: boolean;
+}
+
+export interface SessionIdentity {
+  label: string;
+  confidence: "imsi" | "guti" | "tmsi" | "rnti-only" | string;
+  m_tmsi: string | null;
+  mmec: string | null;
+  s_tmsi: string | null;
+  guti: string | null;
+  imsi: string | null;
+  plmn: string | null;
+  source: string | null;
+  id_via: "ul" | "paging" | "dl" | null;   // how the identity was learned
+  from_ul: boolean;                          // TMSI/IMSI seen in an uplink frame
+}
+export interface SessionTaSample { t: number; range_m: number | null; delta_m?: number; src: string; }
+export interface SessionTa {
+  anchor_ta: number | null;
+  anchor_range_m: number | null;
+  has_absolute: boolean;
+  n_samples: number;
+  samples: SessionTaSample[];
+  min_range_m: number | null;
+  median_range_m: number | null;
+  max_range_m: number | null;
+}
+export interface UeSession {
+  session_id: string;
+  c_rnti: number;
+  c_rnti_hex: string;
+  start: number;
+  end: number;
+  duration_s: number;
+  dl_frames: number;
+  ul_frames: number;
+  frames: number;
+  cell_identity: string | null;
+  plmn: string | null;
+  identity: SessionIdentity;
+  ta: SessionTa;
+}
+export interface SessionsResponse {
+  ok: boolean;
+  error: string | null;
+  note: string | null;
+  source: string | null;
+  sessions: UeSession[];
+  unmatched_rar: number;
+  paging: Array<{ t: number; m_tmsi?: string; mmec?: string; s_tmsi?: string | null; imsi?: string }>;
+  paging_summary?: {
+    records: number;
+    distinct_m_tmsi: number;
+    distinct_s_tmsi: number;
+    distinct_imsi: number;
+  };
+}
+export interface CellIdResponse {
+  ok: boolean;
+  error?: string;
+  source?: string;
+  cell_identity?: string;   // 28-bit ECI, hex e.g. "0x3830200"
+  eci?: number;
+  enb_id?: number;
+  enb_id_hex?: string;
+  sector?: number;
+  tac?: number | null;
+  tac_hex?: string | null;
+  mcc?: string | null;
+  mnc?: string | null;
+  plmn?: string | null;
+}
+export interface PinCellResponse {
+  ok: boolean;
+  error?: string;
+  cancelled?: boolean;
+  pci?: number;
+  nof_prb?: number;
+  cell_identity?: string;
+  tac?: number | null;
+  tac_hex?: string | null;
+  mcc?: string | null;
+  mnc?: string | null;
+  plmn?: string | null;
+}
+
+export interface BrowseEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+  is_pcap: boolean;
+}
+
+export interface BrowseResponse {
+  cwd: string | null;
+  parent: string | null;
+  default: string | null;   // the captures_dir (where the picker opens)
+  entries: BrowseEntry[];
+  error: string | null;
+}
+
+export interface CapturesResponse {
+  captures: CaptureFile[];
+  roots: string[];
+  captures_dir: string;
+}
+
+export interface KnownCell {
+  label: string;
+  dl_freq_mhz: number;
+  ul_freq_mhz: number;
+  bandwidth_mhz: number | null;
+  nof_prb: number;
+  pci: number | null;
+  sniffer_mode: number;
+  usrp_a_args: string;
+  usrp_b_args: string;
+  rf_gain: number;
+  last_success_iso: string;
+  notes: string;
+}
+
+export interface KnownCellsResponse {
+  cells: KnownCell[];
+  path: string;
+}
+
+export interface USRPDevice {
+  type?: string;
+  serial?: string;
+  name?: string;
+  product?: string;
+  [key: string]: string | undefined;
+}
+
+export interface RuntimeState {
+  running: boolean;
+  pid: number | null;
+  started_at: number | null;
+  exit_code: number | null;
+  last_error: string | null;
+  argv: string[];
+  mock?: boolean;
+}

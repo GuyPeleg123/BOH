@@ -273,10 +273,12 @@ void DCICollection::addCandidate(dci_candidate_t& cand,
 
     /* merge total RB map for RB allocation overview */
     for(uint32_t rb_idx = 0; rb_idx < dci_ul->ul_grant->L_prb; rb_idx++) {
-      if(rb_map_ul[dci_ul->ul_grant->n_prb[0] + rb_idx] != FALCON_UNSET_RNTI) {
+      uint32_t prb = dci_ul->ul_grant->n_prb[0] + rb_idx;
+      if (prb >= rb_map_ul.size()) break;   // guard mis-decoded DCI0 (bogus n_prb/L_prb -> heap OOB)
+      if(rb_map_ul[prb] != FALCON_UNSET_RNTI) {
         ul_collision = true;
       }
-      rb_map_ul[dci_ul->ul_grant->n_prb[0] + rb_idx] = cand.rnti;
+      rb_map_ul[prb] = cand.rnti;
     }
 
     if(SRSRAN_VERBOSE_ISINFO()) {

@@ -49,13 +49,13 @@ SubframeWorker::SubframeWorker(uint32_t idx,
   {
   case DL_MODE:
     /* Config for Downlink Sniffing function*/
-    srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer, max_prb, common.nof_rx_antennas);
+    srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer_a, max_prb, common.nof_rx_antennas);
     /* PDSCH decoder (Downlink)*/
     pdschdecoder = new PDSCH_Decoder(idx, pcapwriter, mcs_tracking, common.getRNTIManager(), harq, mcs_tracking_mode, harq_mode, common.nof_rx_antennas);
     break;
   case UL_MODE:
     /* Config for Downlink Sniffing function*/
-    srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer, max_prb, 1); // only 1 antenna for DL in the UL Sniffer Mode
+    srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer_a, max_prb, 1); // only 1 antenna for DL in the UL Sniffer Mode
     /* PDSCH decoder (Downlink)*/
     pdschdecoder = new PDSCH_Decoder(idx,
                                      pcapwriter,
@@ -69,18 +69,82 @@ SubframeWorker::SubframeWorker(uint32_t idx,
     puschdecoder = new PUSCH_Decoder(enb_ul,
                                      ul_sf,
                                      ulsche,
-                                     sfb.sf_buffer,
+                                     sfb.sf_buffer_b,
                                      sfb.sf_buffer_offset,
                                      ul_cfg,
                                      pcapwriter,
                                      mcs_tracking,
                                      mcs_tracking->get_debug_mode());
+    puschdecoder->set_decoder("a"); // a means decoder a
     /*Uplink enb init*/
-    if (srsran_enb_ul_init(&enb_ul, sfb.sf_buffer[1], 110))
+    if (srsran_enb_ul_init(&enb_ul, sfb.sf_buffer_b[0], 110))
     { // 110 = max PRB
       ERROR("Error initiating ENB UL");
       return;
     }
+    puschdecoder_b = new PUSCH_Decoder(enb_ul_b,
+                                     ul_sf,
+                                     ulsche,
+                                     sfb.sf_buffer_b,
+                                     sfb.sf_buffer_offset,
+                                     ul_cfg,
+                                     pcapwriter,
+                                     mcs_tracking,
+                                     mcs_tracking->get_debug_mode());
+    puschdecoder_b->set_decoder("b"); // b means decoder b
+    /*Uplink enb init*/
+    if (srsran_enb_ul_init(&enb_ul_b, sfb.sf_buffer_b[1], 110))
+    { // 110 = max PRB
+      ERROR("Error initiating ENB UL");
+      return;
+    }
+    break;
+  case DUAL_MODE:
+    /* Full multi-antenna DL + UL sniffing using both USRPs */
+    srsran_ue_dl_init(falcon_ue_dl.q, sfb.sf_buffer_a, max_prb, common.nof_rx_antennas);
+    pdschdecoder = new PDSCH_Decoder(idx,
+                                     pcapwriter,
+                                     mcs_tracking,
+                                     common.getRNTIManager(),
+                                     harq,
+                                     mcs_tracking_mode,
+                                     harq_mode,
+                                     common.nof_rx_antennas);
+    puschdecoder = new PUSCH_Decoder(enb_ul,
+                                     ul_sf,
+                                     ulsche,
+                                     sfb.sf_buffer_b,
+                                     sfb.sf_buffer_offset,
+                                     ul_cfg,
+                                     pcapwriter,
+                                     mcs_tracking,
+                                     mcs_tracking->get_debug_mode());
+    puschdecoder->set_decoder("a");
+    if (srsran_enb_ul_init(&enb_ul, sfb.sf_buffer_b[0], 110)) {
+      ERROR("Error initiating ENB UL");
+      return;
+    }
+    puschdecoder_b = new PUSCH_Decoder(enb_ul_b,
+                                       ul_sf,
+                                       ulsche,
+                                       sfb.sf_buffer_b,
+                                       sfb.sf_buffer_offset,
+                                       ul_cfg,
+                                       pcapwriter,
+                                       mcs_tracking,
+                                       mcs_tracking->get_debug_mode());
+    puschdecoder_b->set_decoder("b");
+    if (srsran_enb_ul_init(&enb_ul_b, sfb.sf_buffer_b[1], 110)) {
+      ERROR("Error initiating ENB UL");
+      return;
+    }
+    /* From-scratch calibrated-window UL decode (env UL_DENSE2 / GUI Dense Test).
+       Uses radio-A's initialized enb_ul + the shared snapshot scratch, in place
+       of puschdecoder->decode() when enabled. */
+    if (UlDenseDecoder::enabled())
+      densedecoder = new UlDenseDecoder(enb_ul, ul_sf, ul_cfg, ulsche,
+                                        sfb.sf_buffer_b, sfb.sf_buffer_offset,
+                                        pcapwriter, mcs_tracking);
     break;
   default:
     break;
@@ -94,6 +158,8 @@ SubframeWorker::~SubframeWorker()
   srsran_ue_dl_free(falcon_ue_dl.q);
   delete pdschdecoder;
   pdschdecoder = nullptr;
+  delete densedecoder;
+  densedecoder = nullptr;
   srsran_filesink_free(&filesink);
 }
 
@@ -117,16 +183,10 @@ void SubframeWorker::prepare(uint32_t _sf_idx, uint32_t _sfn, bool updateMetaFor
 
 uint16_t get_tti_ul_harq(uint16_t cur_tti)
 {
-  uint32_t temp_tti = cur_tti - 4;
-  if (temp_tti >= 0)
-  {
-    return temp_tti;
-  }
-  else
-  {
-    temp_tti = temp_tti + 10240;
-    return temp_tti;
-  }
+  // Wrap modulo the 10240-tti space. The old `uint32_t t=cur_tti-4; if(t>=0)`
+  // was always-true (unsigned), so for cur_tti<4 it underflowed instead of
+  // wrapping -> garbage key, silently losing UL grants every SFN rollover.
+  return (uint16_t)((cur_tti + 10240u - 4u) % 10240u);
 }
 
 // int update_rv(int old_rv){
@@ -141,8 +201,9 @@ uint16_t get_tti_ul_harq(uint16_t cur_tti)
 
 void SubframeWorker::work()
 {
-  std::string test_string = '[' + std::to_string(idx) + ']' + '[' + std::to_string(sfn) + '-' + std::to_string(sf_idx) + ']';
-  // PrintLifetime worker_lifetime(test_string + " Subframe took: ");
+  // (per-worker debug label string removed — built every subframe, only used by
+  //  the commented-out PrintLifetime below)
+  // PrintLifetime worker_lifetime("[idx][sfn-sf_idx] Subframe took: ");
   uint32_t tti = sfn * 10 + sf_idx;
   ul_sf.tti = tti;
   if (updateMetaFormats)
@@ -196,13 +257,32 @@ void SubframeWorker::work()
       // printf("[SIGNAL] Bad signal quality... \n");
     }
     break;
+  case DUAL_MODE:
+    // Full multi-antenna DCI search (no prepareDCISearch) + both DL and UL decode
+    snr_ret = dciSearch.search();
+    if (snr_ret == SRSRAN_SUCCESS)
+    {
+      stats += dciSearch.getStats();
+      common.addStats(dciSearch.getStats());
+      subframeInfo.getSubframePower().computePower(enb_ul.sf_symbols);
+      // Decode DL PDSCH first (all C-RNTIs, SIB, RAR → writes DL MAC PDUs to PCAP).
+      // run_ul_mode handles UL PUSCH + the DL subset needed for UL config learning
+      // (SIB2, RRC Connection Setup); the two passes are independent.
+      run_dl_mode(subframeInfo);
+      run_ul_mode(subframeInfo, tti);
+    }
+    break;
   default:
     break;
   }
   /*Update CFO for ue_sync in sync thread*/
   est_cfo = falcon_ue_dl.q->chest_res.cfo;
   falcon_ue_dl.q->chest_res.cfo = 0;
-  // common.consumeDCICollection(subframeInfo); //save DCI to file
+  // Invoke the consumer chain — this fans out the per-subframe SubframeInfo
+  // to every registered SubframeInfoConsumer (DCIToFile if -D was set,
+  // DCIToJSON whenever -J was set). Without this call the GUI's sf / sf_tick
+  // events never fire even though subframes are being processed at 1000 sf/s.
+  common.consumeDCICollection(subframeInfo);
   // print_nof_DCI(subframeInfo, tti);
 }
 
@@ -218,7 +298,7 @@ DCIBlindSearchStats &SubframeWorker::getStats()
 
 cf_t *SubframeWorker::getBuffer(uint32_t antenna_idx)
 {
-  return sfb.sf_buffer[antenna_idx];
+  return sfb.sf_buffer_a[antenna_idx];
 }
 
 void SubframeWorker::run_dl_mode(SubframeInfo &subframeInfo)
@@ -257,8 +337,13 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
     if (config == false)
     {
       ul_cfg.dmrs = ulsche->get_dmrs();
-      ;
+      
       if (srsran_enb_ul_set_cell(&enb_ul, falcon_ue_dl.q->cell, &ul_cfg.dmrs, nullptr))
+      {
+        ERROR("Error set cell ENB UL");
+        return;
+      }
+      if (srsran_enb_ul_set_cell(&enb_ul_b, falcon_ue_dl.q->cell, &ul_cfg.dmrs, nullptr))
       {
         ERROR("Error set cell ENB UL");
         return;
@@ -271,7 +356,6 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
       ul_cfg.hopping.hopping_offset = ulsche->sib2.rr_cfg_common.pusch_cfg_common.pusch_cfg_basic.pusch_hop_offset;
       ul_cfg.hopping.n_sb = ulsche->sib2.rr_cfg_common.pusch_cfg_common.pusch_cfg_basic.n_sb;
       ul_cfg.hopping.n_rb_ho = ulsche->sib2.rr_cfg_common.pusch_cfg_common.pusch_cfg_basic.pusch_hop_offset;
-      ;
 
       /*RAR decode hopping config to convert dci 0 to ul grant*/
       pdschdecoder->set_hopping(ul_cfg.hopping);
@@ -279,8 +363,10 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
       /*RACH detector config*/
       puschdecoder->set_rach_config(ulsche->get_prach_config());
       puschdecoder->set_configed();
+      puschdecoder_b->set_rach_config(ulsche->get_prach_config());
+      puschdecoder_b->set_configed();
     }
-    if (puschdecoder->get_configed())
+    if (puschdecoder->get_configed()&&puschdecoder_b->get_configed())
     {
       /*Decode DL messages but only TM1 as only having 1 antenna for DL*/
       pdschdecoder->init_pdsch_decoder(&falcon_ue_dl,
@@ -292,12 +378,16 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
 
       /*Create a vector to contain RAR decoding result*/
       std::vector<DL_Sniffer_rar_result> rar_result;
-      int ret = pdschdecoder->decode_ul_mode(ulsche->get_rnti(), &rar_result);
+      // In DUAL_MODE, run_dl_mode() already wrote every DL PDU to PCAP; the UL
+      // pass re-uses decode_ul_mode only for UL grant extraction (RAR) and
+      // RRC Connection Setup config learning, so suppress its PCAP writes.
+      bool ul_mode_write_pcap = (sniffer_mode != DUAL_MODE);
+      int ret = pdschdecoder->decode_ul_mode(ulsche->get_rnti(), &rar_result, ul_mode_write_pcap);
 
       /*Get Uplink and Downlink dci and grant lists*/
       std::vector<DCI_UL> dci_ul = subframeInfo.getDCICollection().getULSnifferDCI_UL();            // get UL DCI0 list
       std::vector<DL_Sniffer_DCI_DL> dci_dl = subframeInfo.getDCICollection().getDLSnifferDCI_DL(); // get DL DCI list
-      
+      // std::cout << "SF: " << tti/10 << "." << tti%10 << " -- Nof_DCI = " << dci_dl.size() << " / " << dci_ul.size() << std::endl;
       /*UL grant for RRC Connection Request is sent in RAR response (msg 2),
       / so convert UL grant from msg2 to general UL grant*/
       std::vector<DCI_UL> rar_dci_ul_vector;
@@ -340,12 +430,30 @@ void SubframeWorker::run_ul_mode(SubframeInfo &subframeInfo, uint32_t tti)
       ulsche->pushULSche(tti, dci_ul);
       /*Push current RAR grant to database to decode 4ms later*/
       ulsche->push_rar_ULSche(tti, rar_dci_ul_vector);
+      if (densedecoder) {
+        /* Calibrated-window from-scratch UL decode (UL_DENSE2). Replaces the
+           legacy per-grant decode; PRACH still handled by the legacy path. */
+        densedecoder->init(ulsche->getULSche(tti),
+                           ulsche->get_rar_ULSche(tti),
+                           ul_sf,
+                           &subframeInfo.getSubframePower());
+        densedecoder->decode();
+        // PRACH intentionally skipped in v1 dense mode (legacy PRACH state is not
+        // initialized on this path); PUSCH-window recovery is the focus here.
+      } else {
       puschdecoder->init_pusch_decoder(ulsche->getULSche(tti),
                                        ulsche->get_rar_ULSche(tti),
                                        ul_sf,
                                        &subframeInfo.getSubframePower());
+      // puschdecoder_b->init_pusch_decoder(ulsche->getULSche(tti),
+      //                                  ulsche->get_rar_ULSche(tti),
+      //                                  ul_sf,
+      //                                  &subframeInfo.getSubframePower());
       puschdecoder->decode();         // decode PUSCH
       puschdecoder->work_prach();     // decode PRACH
+      }
+      // puschdecoder_b->decode();         // decode PUSCH
+      // puschdecoder_b->work_prach();     // decode PRACH
       ulsche->deleteULSche(tti);      // delete current DCI0 list and uplink grant in the database after decoding
       ulsche->delete_rar_ULSche(tti); // also for RAR grant
     }

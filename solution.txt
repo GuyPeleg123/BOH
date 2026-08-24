@@ -1,0 +1,329 @@
+================================================================================
+LTESniffer — UL (uplink) capture investigation: findings, open questions, solution
+Date: 2026-07-15
+================================================================================
+
+THE SYMPTOM
+--------------------------------------------------------------------------------
+Dual-B210 sniffer decodes the downlink fine (hundreds–thousands of MAC frames per
+run) but only ~5–7 uplink frames land in the pcap, even in a "dense" cell where
+the eNB schedules THOUSANDS of UL grants (5000+ per 40 s run). The few UL frames
+we do get are almost all RRCConnectionReestablishmentRequest / CCCH (Msg3) — the
+single most robust uplink message that exists. We essentially never capture normal
+scheduled UL user data.
+
+Network under test: live commercial Cellcom Israel macro cell (MCC 425 / MNC 02,
+TAC 913, eNB id 14384), 4G with n78 5G redirect. This is a REAL macro cell with
+many real UEs, not a lab eNB (confirmed: 149 distinct C-RNTIs + rich SIB neighbor
+lists in a short capture). Working band: DL 1825 / UL 1730 (cell 217/238) and the
+"dense" cell PCI 83 on DL 1845 / UL 1750.
+
+
+WHAT WE RULED OUT (each with direct measurement, not theory)
+--------------------------------------------------------------------------------
+1. NOT a pcap-writing bug.
+   write_ul_crnti() fires unconditionally on every CRC success. Measured the live
+   decode-success counter vs the actual pcap UL-frame count on many runs — they
+   MATCH EXACTLY every time (2=2, 3=3, 6=6, 23=23). Every UL frame that decodes is
+   written. The pcap is faithful.
+
+2. NOT aggressive filtering.
+   The only pre-decode gate (investigate_valid_ul_grant) rejects structurally
+   invalid grants only (rnti=0, TBS=0 in both tables, invalid PRB count). There is
+   NO SNR/power threshold discarding weak-but-real grants.
+
+3. NOT a radio-sync bug (this WAS broken and is now FIXED — see below).
+
+4. NOT a timing / FFT-window bug.
+   Took 361 real failed-grant raw-IQ captures and swept the FFT window across
+   +/-1024 samples (+/-44 us — far beyond the cyclic prefix and the whole
+   DL-UL delay spread) through the REAL srsran decoder, offline, deterministically.
+   Result: ZERO grants recovered CRC, ZERO reached even 6 dB SNR at ANY window
+   position. Timing is not the bottleneck for these grants.
+
+5. The "GUI shows 118 UL but pcap has 4" confusion: NOT a bug, a mislabel.
+   The GUI "UL data" tile counted UL GRANTS SCHEDULED (DCI-0 assignments seen in
+   the downlink), not UL frames captured. Fixed the GUI to show real captured
+   counts from the pcap alongside the grant counts.
+
+
+WHAT WE FIXED (real bugs found and corrected)
+--------------------------------------------------------------------------------
+A. THE RASPBERRY-PI 1-PPS WAS DEAD. (root cause of the old "sync" failures)
+   The Pi's pps.service was green in systemctl but its own log showed, on EVERY
+   pulse forever: "pps.sh: Can't set pin value, not an output". The bash bit-bang
+   loop set GPIO18 to output once, then toggled it with SEPARATE pinctrl processes
+   whose output-mode did not persist -> every write hit an input pin. GPIO18 read
+   permanently low. The USRPs received ZERO 1-PPS pulses, ever.
+   FIX: wrote /usr/local/bin/pps_hw.c (in repo: scripts/rpi/pps_hw.c) — a single
+   long-lived process that holds GPIO18 as output, writes edges by direct BCM
+   register poke, and schedules every edge from a fixed epoch with
+   clock_nanosleep(TIMER_ABSTIME) so the 1 Hz period never drifts. Installed on the
+   Pi (pps.service now runs pps_start.sh which compiles+runs it). Verified with a
+   new tool build/ppscheck: the two B210s now latch the SAME 1-PPS edge — sub-second
+   skew collapsed from ~39,800 us to < 1 ms.
+
+B. THE DUAL-RADIO REALIGN WAS PERMANENTLY DORMANT.
+   The recv-wrapper code that aligns the UL radio to the DL radio was gated on
+   time_sec_a == time_sec_b, which was NEVER true (the radios latched different PPS
+   edges, ~2 s apart). So the alignment never ran and the UL sample window was at a
+   random per-run offset.
+   FIX: rewrote the gate (LTESniffer_Core.cc) to align on the WRAP-AWARE FRACTIONAL
+   skew regardless of the integer-second offset. Result (measured live): the realign
+   now fires once and the A-B skew locks to ~29 NANOSECONDS and holds for the whole
+   run. The two radios are now genuinely sample-locked.
+
+   NOTE: fixes A+B were necessary and correct, but they did NOT by themselves make
+   the UL yield jump — because the remaining limit is signal level (see below).
+
+
+THE CURRENT BEST-EVIDENCE EXPLANATION: THE UL WAS UNDER-RANGED IN THE ADC
+--------------------------------------------------------------------------------
+Definitive offline test: replayed the actual FAILING low-MCS grants (QPSK MCS 0/2,
+which decode at ~-2..0 dB in theory) through the real decoder with a wide timing
+sweep. Even at the BEST window they reach only ~1–2 dB SNR and never decode.
+
+Then measured the raw IQ level: the UL signal was peaking at only 0.36% of the
+ADC full-scale range — i.e. ~49 dB of UNUSED headroom — while the UL gain was set
+to only 30 dB WITH NO LNA. The signal was sitting almost at the bottom of the ADC,
+buried near the ADC quantization / instrument noise floor. THAT is what was pinning
+the effective SNR at ~1–2 dB — not the airlink itself. (The DL radio is properly
+ranged, which is why DL decodes fine; this is UL-specific.)
+
+Evidence that this is (at least partly) the throttle — raising UL gain helped SNR:
+    UL gain 30 dB : ADC 0.4% full-scale, UL SNR max 3.24 dB, mean 2.32 dB
+    UL gain 60 dB : ADC 2.4% full-scale, UL SNR max 5.50 dB, mean 3.00 dB   (+2.3 dB)
+    UL gain 70 dB : ADC 7.0% full-scale, UL SNR max 4.91 dB (quiet window, fewer UEs)
+Peak SNR rose ~2 dB purely from lifting the signal out of the instrument noise
+floor. The gain-70 run happened to hit a quiet/short traffic window (only ~2000
+grants vs ~5000), so its lower decode count is NOT a fair comparison — the SNR
+trend is the meaningful signal.
+
+INTERPRETATION: we were partly instrument-noise-limited (fixable with gain / LNA)
+and are now approaching the antenna-thermal-noise limit. The airlink SNR of these
+particular UEs at our antenna is genuinely marginal because this is a passive
+monitor of a live macro cell — real subscriber phones are far away and power-
+control their uplink to reach the TOWER, not us, so their UL arrives tens of dB
+weaker than the (close, high-power) downlink.
+
+
+WHAT TO CHECK NEXT (in priority order)
+--------------------------------------------------------------------------------
+1. FINISH THE GAIN SWEEP. We are at 7% ADC with ~23 dB headroom still unused.
+   Try UL gain 74–76 (B210 max is ~76 dB) in a BUSY traffic window and compare UL
+   SNR + decode count against gain 60 on a similar-density window. Watch for
+   overload (peak approaching 100% / clipping). This tells us where the
+   instrument-noise-vs-antenna-noise crossover is.
+
+2. ADD AN LNA ON THE UL (physical, highest-impact if the front end is the limit).
+   A low-noise amplifier at the UL antenna raises the signal before the B210's own
+   noise figure degrades it — the correct way to lift a genuinely weak UL. Pair it
+   with a UL-band filter to avoid out-of-band overload. (Config hint already in the
+   GUI: "no LNA -> 50, with LNA -> 30".) NOTE: earlier LNA experiments were
+   inconclusive/oscillating — use a proper UL-band LNA + filter and verify with the
+   ADC-utilization + SNR check we built.
+
+3. IMPROVE UL ANTENNA / GEOMETRY. Get the UL antenna higher / clearer / closer to
+   where the UEs are. This is the fundamental lever for a passive UL monitor.
+
+4. BETTER CHANNEL ESTIMATOR (software, uncertain gain, only worth it once ranged).
+   The current chest is LS + 3-tap smoothing. For the tiny 2-RB grants at marginal
+   SNR the channel estimate is noisy. A DFT/delay-domain denoiser or LMMSE could
+   squeeze a few more marginal grants once the signal is properly ranged. We have
+   the offline replay harness (build/src/ul_iq_replay) and 600 captured grants to
+   test any estimator deterministically before touching the live decoder.
+
+5. VERIFY DMRS CONFIG on strong grants (rule out a subtle config bug). The
+   cyclic-shift sweep (UL_DMRS_DIAG) could not fire because the grants were too weak
+   to clear even a -20 dB power gate. Re-run it once the gain is up and grants are
+   stronger: if a NON-signaled DMRS cyclic shift gives markedly higher SNR than the
+   signaled one, our DMRS extraction is wrong (a real, fixable bug). Currently
+   UNVERIFIED because there was no strong grant to test it on.
+
+6. THE DECISIVE EXPERIMENT — CONTROLLED UE. Put a phone with a Cellcom SIM close to
+   the UL antenna, camped on this cell, doing a sustained large UPLOAD, and capture.
+   A strong, close, known UL removes all ambiguity:
+     - if it decodes well (real DTCH/DCCH data, not just CCCH) -> the whole chain
+       works and the on-air limit is purely geometry (distant UEs). DONE.
+     - if even a strong close UE only yields CCCH -> there is a deeper UL decode
+       issue and we chase the PUSCH path with a signal we KNOW is strong.
+
+
+WHAT I THINK THE PROBLEM AND SOLUTION ARE
+--------------------------------------------------------------------------------
+PROBLEM: There is no single software bug swallowing the uplink. The pcap, filtering,
+and (after our fixes) the PPS sync and dual-radio alignment are all correct. The UL
+yield is limited by SIGNAL LEVEL / SNR at the receiver:
+  (a) an instrument-side throttle we already started removing — the UL was grossly
+      under-ranged in the ADC (0.4% full-scale at 30 dB gain, no LNA), which held
+      the effective SNR ~2 dB below where it should be; and
+  (b) a fundamental airlink limit — as a passive monitor of a live macro cell, we
+      hear distant subscribers' power-controlled uplink tens of dB weaker than the
+      downlink, so only the most robust messages (Msg3/CCCH) clear the decoder.
+
+SOLUTION (in order of expected impact):
+  1. RANGE THE UL PROPERLY. Keep raising UL gain toward ~74 dB and add a UL-band
+     LNA + filter so the signal sits in a healthy part of the ADC (roughly
+     10–30% full-scale) instead of 0.4%. This is the cheapest, highest-leverage
+     fix and it is already showing gains (+2.3 dB SNR from 30->60 dB).
+  2. IMPROVE UL RECEPTION GEOMETRY (antenna placement / height / direction).
+  3. THEN, if still short, a better channel estimator (DFT/LMMSE) to squeeze the
+     marginal grants — test offline first on the 600 captured grants.
+  4. To PROVE the chain end-to-end and separate geometry from any residual decode
+     issue: the controlled-UE upload test.
+
+Confidence: HIGH that it is not a pcap/filter/sync/timing bug (all measured).
+MEDIUM-HIGH that ADC under-ranging + true airlink weakness together explain it.
+The controlled-UE test (#6 above) is what would make it 100% certain.
+
+
+PER-UE TIMING — "how do we capture all UEs like the real eNB does?" (2026-07-15b)
+--------------------------------------------------------------------------------
+THE PHYSICS (why a passive sniffer is NOT automatically like the eNB):
+  - The eNB runs a closed loop: it measures each UE's round-trip delay and
+    commands a Timing Advance (TA) so the UE transmits EARLY by exactly 2x its
+    propagation delay. Result: every UE's UL arrives ALIGNED at the eNB's subframe
+    boundary, within the cyclic prefix. The eNB uses ONE FFT window for everyone.
+  - We are passive and at a DIFFERENT location. TA is computed for the eNB, not us.
+    Each UE's UL arrives at OUR antenna with a residual offset = (d_us - d_enb)/c
+    that depends on that UE's geometry. Measured spread at our site: about +/-10 us,
+    with each UE having its OWN roughly-stable offset (confirmed: repeat grants from
+    the same RNTI cluster tightly; different RNTIs sit at different offsets, e.g.
+    -4.8 to +7.1 us). ~1/3 of UEs land OUTSIDE the normal CP (~4.7 us).
+  - A grant whose window is off by more than the CP loses orthogonality (ISI/ICI)
+    and CANNOT decode at ANY SNR until the window is re-centred. So a single global
+    window (what the code effectively used) structurally throws away ~1/3 of UEs.
+
+THE CODE GAP (found this session):
+  - srsRAN's timing estimate res->ta_us is computed by srsran_vec_estimate_frequency
+    on the DMRS pilots — i.e. it is a PHASE-SLOPE estimate. A phase slope is only
+    meaningful WITHIN the CP; once the window is off by more than a CP the pilots are
+    corrupted by ISI and the slope is garbage. So ta_us CANNOT tell us how to reach a
+    beyond-CP UE (chicken-and-egg: you need the window roughly right to measure how
+    wrong it is). The old offset-retry used ta_us + a +/-64-sample (+/-2.8 us)
+    fallback — far too narrow for a +/-10 us spread, and mis-steered for beyond-CP UEs.
+
+THE FIX BUILT (software per-UE Timing Advance; the eNB-equivalent for a sniffer):
+  UL_Sniffer_PUSCH.cc — for each grant that carries real energy (chest-FREE
+  allocated-RB power >= UL_TIMING_ACQ_MINDB above the noise floor), do a WIDE
+  two-stage window search: coarse scan +/-UL_TIMING_ACQ_MAX samples (chest SNR as
+  the metric, which peaks when the window is centred on THAT UE), then a fine scan
+  around the peak, then decode at the peak window. This re-centres the FFT window
+  per-UE — the software equivalent of the per-UE TA the eNB commands — so we can
+  capture UEs whose UL lands outside the CP.
+  RT-SAFE: the search is ENERGY-GATED, so only the ~1% of grants that actually carry
+  signal pay for it; the ~99% noise grants are untouched (a blind wide sweep on every
+  grant drops ~11% of subframes — measured — and must never be used).
+  Env: UL_TIMING_ACQ=1 (on), UL_TIMING_ACQ_MAX=300 (samples, ~13 us each side),
+  UL_TIMING_ACQ_MINDB=3. OFF by default; wired into the GUI Dense Test.
+
+HONEST CAVEAT: per-UE timing is NECESSARY (it's the only way to capture beyond-CP
+UEs) but it is not SUFFICIENT at this site right now. Offline replay of the best
+gain-70 grants shows they cap at ~1-2 dB SNR even at the perfect window and gain
+only 0.2-1.7 dB from re-centring — because the underlying signal is marginal
+(distant UEs + still-imperfect ADC ranging). Timing acquisition PAYS OFF only once a
+UE has adequate SNR at the right window. So it combines with the gain/LNA/geometry
+work: gain gets the UE above the noise floor; per-UE timing puts the window where
+that UE actually is. The controlled-UE test (strong, close, known timing) is the
+clean way to SEE the window-shift recover a beyond-CP UE.
+
+
+GEOMETRY COMPUTED FROM REAL COORDINATES (2026-07-15c) — decisive
+--------------------------------------------------------------------------------
+Cell PCI 83 (TAC 19421): 34.821972, 32.146083
+Our sniffer:             34.815186, 32.142839
+Distance tower<->us  d(E,S) = 734 m  (one-way light time 2.45 us).
+
+HARD BOUND: the max possible UL arrival offset for ANY UE at our receiver is
+    |Δ|_max = 2·d(E,S)/c = 4.89 us  (= 113 samples @ 23.04 Msps ≈ ONE cyclic prefix)
+No UE — however far from the tower — can be offset more than this from our DL
+reference, because Δ = [d(U,S) − d(E,U) − d(E,S)]/c and the worst case is bounded
+by 2·d(E,S)/c (derived from the triangle inequality; TA = 2·d(E,U)/c cancels).
+
+CONSEQUENCES:
+1. Geometry is FAVORABLE. At only 734 m from the tower the per-UE timing spread is
+   at most ~1 CP. We are NOT in a "distant tower, huge timing spread" regime. A
+   correctly-centred window with at most a ~1-CP (±113-sample) shift covers every
+   UE. The blind ±13 us (±300-sample) search was massive overkill (and caused the
+   RT overload).
+2. The ±10 us "spread" we measured in the DL-UL delay is therefore NOT real per-UE
+   geometry — physics forbids >4.9 us. It is dominated by low-SNR estimation noise
+   (srsRAN's phase-slope ta_us scatters badly at 2-3 dB) plus any fixed nominal-
+   window offset. ~38% of measured delays exceed the 4.9 us geometric bound =
+   noise, not signal.
+3. This REINFORCES that SNR — not timing — is the binding constraint. Being only
+   734 m out, if the UL signal were strong, a near-nominal window would already
+   capture most UEs. It doesn't -> the signal is too weak (marginal SNR), exactly
+   the ADC-ranging / airlink-level story.
+
+REVISED TIMING PLAN (given the geometry):
+  - Replace the blind/energy-gated WIDE search with a NARROW per-UE centring:
+    at most ±113 samples (±4.9 us), which is cheap and RT-safe.
+  - TA-DIRECTED sizing: we already decode the RAR Timing Advance
+    (DL_Sniffer_PDSCH.cc:626, get_ta_cmd). Per UE, the offset bound is
+    −min(TA, 2·d(E,S)/c) with a KNOWN sign (UL arrives at/He before our DL ref),
+    so a UE with small TA needs an even tinier search. This makes per-UE centring
+    both cheap and correct.
+  - But this is a minor correction. The primary lever remains SNR: gain/LNA to
+    lift the UE above the noise floor, and — powerfully — getting even CLOSER to
+    the tower shrinks 2·d(E,S)/c further (at the tower, spread -> 0, we ARE the eNB)
+    AND raises received UL level.
+
+
+TWO MORE SOFTWARE LEVERS TESTED AND EXHAUSTED (2026-07-15d)
+--------------------------------------------------------------------------------
+DMRS cyclic-shift config bug — RULED OUT. Ran the 8-way cyclic-shift SNR sweep on
+25,343 UL grants (UL_DMRS_DIAG_PWR=-100). If our DMRS extraction were wrong, the
+peak SNR would sit at ONE consistent non-signaled shift. Instead the peak is
+SCATTERED across all 8 shifts (histogram ~flat: 21% at the signaled shift — above
+the 12.5% chance level, so the config is RIGHT — the rest scattered by noise). Even
+on high-RB-power grants (rawRBpow>=6 dB, n=637) the best of all 8 shifts reaches
+only ~0.8 dB median. So the high-energy-but-no-DMRS grants are NOT a config bug:
+that energy does not carry a correlatable PUSCH DMRS at any shift => it is
+interference / another UE / FALSE DCI detections (blind DCI search false positives),
+not real target-UE PUSCH we are mis-handling. (Implication: the "thousands of UL
+grants" over-counts real grants; our decode RATE on genuine grants is better than
+the raw ratio suggests.)
+
+Channel-estimator denoising — TESTED, marginal, insufficient. Added an override to
+ul_iq_replay (UL_CHEST_SMOOTH=len, Gaussian). On 20 marginal QPSK grants:
+    smooth 3 (default): avg chest SNR -0.43 dB, decoded 0/20
+    smooth 5          : avg chest SNR +0.29 dB, decoded 0/20   (+0.7 dB, no decodes)
+    smooth 9 / 15     : WORSE (-1.7 / -3.5 dB) — over-smoothing biases a tiny
+                        allocation whose channel varies across the RBs.
+A modest 3->5 tap bump buys ~0.7 dB but does NOT cross the decode threshold, and
+heavier smoothing hurts. The estimator lever is essentially exhausted.
+
+FINAL VERDICT (multiply confirmed, every independent method):
+  The captured UL at this site/time is SNR-LIMITED at ~1-2 dB. That decodes only the
+  most robust low-MCS/CCCH messages; higher-MCS grants (which need 8-15 dB) cannot
+  and should not decode. NO software change decodes a 1 dB grant. Ruled out with
+  data: pcap-write, filtering, sync, timing (geometry <=1 CP; wide sweep recovers
+  nothing), DMRS config, channel-estimator, ADC ranging (fixed 0.4%->7%, now
+  antenna-noise-limited). The remaining levers are PHYSICAL:
+    1. UL LNA (+ UL-band filter): lowers system noise figure — the correct fix for
+       an antenna-noise-limited receiver; directly raises effective SNR.
+    2. Closer to / in line of sight with the tower: raises received UL level AND
+       shrinks the timing spread (2·d/c). We are 734 m out; closer is strictly
+       better on both axes.
+    3. Better / higher UL antenna.
+  Software is at its limit for this signal level. The controlled-UE test (strong,
+  close, known UE uploading) is the clean way to prove the full chain works and
+  that the on-air shortfall is purely received-signal level.
+
+
+TOOLS / ARTIFACTS BUILT DURING THIS INVESTIGATION
+--------------------------------------------------------------------------------
+  scripts/rpi/pps_hw.c        precise register-poke 1-PPS generator for the Pi
+  build/ppscheck              verify the two B210s share a coherent 1-PPS (<1 ms)
+  build/refcheck              verify external 10 MHz + PPS lock on both radios
+  build/src/ul_iq_replay      offline replay of a captured UL grant through the
+                              real decoder; --widesweep does a timing search
+  scripts/replay_analyze.py   batch replay/equivalence + timing-recovery harness
+  GUI dense-test now also saves per-grant raw IQ + UL_FAIL/DMRS/TOFF diagnostics
+  GUI packet-type counters relabeled: "UL grants (scheduled)" vs "UL captured (pcap)"
+
+Current GUI config: ul_rf_gain raised 30 -> 60 -> 70 during testing. Recommend
+settling on the value that maximizes UL SNR without ADC clipping in a BUSY window
+(likely ~70–74 with no LNA, or ~30 once a proper UL LNA is installed).
+================================================================================

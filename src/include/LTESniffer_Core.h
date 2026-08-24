@@ -23,6 +23,7 @@
 #include <map>
 
 #include "ArgManager.h"
+#include "include/JSONEmitter.h"
 #include "falcon/common/SignalManager.h"
 #include "include/SubframeWorker.h"
 #include "include/ThreadSafeQueue.h"
@@ -40,6 +41,8 @@
 #include <boost/program_options/parsers.hpp>
 #include "srsue/hdr/ue.h"
 #include "falcon/prof/Lifetime.h"
+#include <thread>
+#include <chrono>
 
 using namespace srsue;
 namespace bpo = boost::program_options;
@@ -64,13 +67,13 @@ using namespace srsran;
 #define UL_SNIFFER_UL_MAX_OFFSET 200
 #define UL_SNIFFER_UL_OFFSET_32 32
 #define UL_SNIFFER_UL_OFFSET_64 64
+#define LTESNIFFER_DUMMY_BUFFER_NOF_SAMPLE (15 * 2048)
 
 typedef struct {
   cf_t* ta_temp_buffer;
   cf_t  ta_last_sample[UL_SNIFFER_UL_MAX_OFFSET];
   int   cnt =  0;
   int   sf_sample_size;
-
 } UL_Sniffer_ta_buffer_t;
 
 static SRSRAN_AGC_CALLBACK(srsran_rf_set_rx_gain_th_wrapper_)
@@ -78,34 +81,67 @@ static SRSRAN_AGC_CALLBACK(srsran_rf_set_rx_gain_th_wrapper_)
   srsran_rf_set_rx_gain_th((srsran_rf_t*)h, gain_db);
 }
 
-/* srsran_rf_recv_wrapper — see LTESniffer_Core.cc for full documentation.
- * Registered as the ue_sync receive callback; reads IQ samples from the RF
- * device into the SubframeWorker buffers on every ue_sync iteration. */
 int srsran_rf_recv_wrapper( void* h,
-                            cf_t* data_[SRSRAN_MAX_PORTS],
-                            uint32_t nsamples,
+                            cf_t* data_[SRSRAN_MAX_PORTS], 
+                            uint32_t nsamples, 
                             srsran_timestamp_t* t);
 
-/*
- * LTESniffer_Core — top-level runtime controller for a passive LTE capture
- * session.
- *
- * Responsibilities
- * ----------------
- *   - Opens the RF front-end (or IQ file) and configures the receive chain.
- *   - Runs optional automatic PSS/SSS/MIB cell search.
- *   - Initialises srsRAN ue_sync for continuous LTE frame synchronisation.
- *   - Drives the subframe state machine (DECODE_MIB → DECODE_PDSCH).
- *   - Dispatches time-aligned subframe buffers to a pool of SubframeWorker
- *     threads (managed by Phy) for blind PDCCH / PDSCH / PUSCH decoding.
- *   - Collects decoded MAC PDUs and writes them to a PCAP file via PcapWriter.
- *   - Maintains MCS-tracking and HARQ retransmission databases.
- *   - Handles OS signals (SIGINT / SIGTERM) to initiate a clean shutdown.
- *
- * The class is non-copyable.  Create exactly one instance per capture session
- * and call run() from the main thread; call stop() from a signal handler or
- * another thread to request a graceful exit.
- */
+int srsran_rf_recv_multi_usrp_wrapper( void* rf_a,
+                                       void* rf_b,
+                                       cf_t* data_a[SRSRAN_MAX_PORTS],
+                                       cf_t* data_b[SRSRAN_MAX_PORTS], 
+                                       uint32_t nsamples, 
+                                       srsran_timestamp_t* t);
+
+class UhdStreamThread{
+public:
+  UhdStreamThread();
+  ~UhdStreamThread();
+
+  void prepare_stream_thread(void* rf_a_, void* rf_b_, int nsample_a, int nsample_b, void** ptr_a_, void** ptr_b_);
+  int get_data_stream_a();
+  int get_data_stream_b();
+  void run();
+  std::string frac_sec_double_to_string(double value, int precision);  
+  bool check_running(){return is_running;}
+  time_t get_time_secs_a(){return secs_a;}
+  time_t get_time_secs_b(){return secs_b;}
+  double get_time_frac_secs_a(){return frac_secs_a;}
+  double get_time_frac_secs_b(){return frac_secs_b;}
+  void   set_nof_adjust_sample(int sample) { nof_adjust_sample = sample;}
+  int    get_nof_adjust_sample(){ return nof_adjust_sample;}
+  int    get_adjust_type(){return adjust_ab;}
+  void   set_adjust_type(int type){ adjust_ab = type;}
+
+  // Wait for both streamer threads to exit their receive loops. Must be
+  // called from the main shutdown path AFTER uhd_stop=true / cv.notify_all()
+  // and AFTER srsran_rf_stop_rx_stream() has been issued on both RF handles
+  // (otherwise an in-flight srsran_rf_recv_with_time_multi() can hang here).
+  // Once this returns, neither streamer is touching its rf_* handle anymore,
+  // so the caller can safely call srsran_rf_close() on each — sequentially,
+  // since UHD's libusb session is shared between the two B210s and parallel
+  // closes corrupt it.
+  void join();
+
+private:
+  int adjust_ab = 0; // 0: no, 1: a, 2: b
+  int nof_adjust_sample = 0;
+  int nof_sample_a = 0;
+  int nof_sample_b = 0;
+  bool is_running = false;
+  void* rf_a = nullptr;
+  void* rf_b = nullptr;
+  void** ptr_a = nullptr;
+  void** ptr_b = nullptr;
+  time_t secs_a = 0;
+  double frac_secs_a = 0;
+  time_t secs_b = 0;
+  double frac_secs_b = 0;
+  int   nsamples = 0;
+  std::future<int> future_a;
+  std::future<int> future_b;
+};
+
 class LTESniffer_Core : public SignalHandler {
 public:
   LTESniffer_Core(const Args& args);
@@ -125,24 +161,25 @@ private:
 
   void handleSignal() override;
 
-  Args                    args;             // full copy of CLI arguments passed to the constructor
-  int                     nof_workers;      // number of SubframeWorker threads (= args.nof_sniffer_thread)
-  int                     sniffer_mode;     // -m : DL_MODE=0 or UL_MODE=1
-  int                     api_mode    ;     // -z : security API mode (-1=off, 0–3=various levels)
-  bool                    go_exit = false;  // set to true by stop()/handleSignal() to break the main loop
-  enum receiver_state     { DECODE_MIB, DECODE_PDSCH} state; // current subframe processing state
-  std::mutex              harq_map_mutex;   // protects concurrent access to the HARQ database
-  Phy                     *phy;             // owns the SubframeWorker pool and common PHY state
-  LTESniffer_pcap_writer  pcapwriter;       // writes decoded MAC PDUs to a PCAP file
-  srsran::mac_pcap        mac_pcap;         // srsRAN MAC PCAP helper (backup / API path)
-  int                     mcs_tracking_mode; // -q : 0=disabled, 1=enabled MCS/256-QAM tracking
-  MCSTracking             mcs_tracking;     // per-RNTI MCS and 256-QAM modulation tracker
-  ULSchedule              ulsche;           // uplink scheduling oracle (maps DL DCI to UL grants)
-  UL_Sniffer_ta_buffer_t  ta_buffer;        // temporary IQ buffer used to receive UL samples
-                                            //   slightly ahead of the DL timing reference
-  std::atomic<float>      est_cfo;          // latest CFO estimate fed back from SubframeWorkers
-                                            //   (chest-based); used to steer the RF centre frequency
-  UL_HARQ                 ul_harq;          // uplink HARQ process tracker
-  HARQ                    harq;             // downlink HARQ retransmission tracker
-  int                     harq_mode;        // 0=HARQ disabled, 1=HARQ tracking enabled
+  Args                    args;
+  int                     nof_workers;
+  int                     sniffer_mode;     //-m
+  int                     api_mode    ;     // -z
+  bool                    go_exit = false;
+  bool                    rf_b_open = false;  // true only when rf_b was successfully opened (UL/DUAL mode)
+  enum receiver_state     { DECODE_MIB, DECODE_PDSCH} state;
+  std::mutex              harq_map_mutex;
+  Phy                     *phy;
+  LTESniffer_pcap_writer  pcapwriter;
+  srsran::mac_pcap        mac_pcap;
+  int                     mcs_tracking_mode;
+  MCSTracking             mcs_tracking;
+  ULSchedule              ulsche;
+  UL_Sniffer_ta_buffer_t  ta_buffer;
+  std::atomic<float>      est_cfo; //cfo from chest in subframe workers
+  UL_HARQ                 ul_harq; // test UL_HARQ
+  HARQ                    harq; // test HARQ function
+  int                     harq_mode;
+  srsran_filesink_t       file_sink = {};
+  JSONEmitter             json_emitter;     // newline-delimited JSON events for the gui/ backend (empty unless -J given)
 };

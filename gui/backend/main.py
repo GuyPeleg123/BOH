@@ -1,0 +1,996 @@
+"""FastAPI app — REST control plane + WebSocket event stream for the GUI."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import shutil
+import subprocess
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, PlainTextResponse
+
+import config as config_mod
+from config import SnifferConfig
+import pcap_forward
+from mock import MockRunner
+import captures as captures_mod
+import runlogs
+from auth import (
+    BIND, AUTH_PATH, COOKIE_NAME, SESSION_TTL_S,
+    require_session, require_session_ws,
+    verify_credentials, create_session, drop_session, session_user,
+)
+import auth as auth_mod
+import https as https_mod
+import zmq_pub
+from metrics import MetricsBus
+from recorder import SessionRecorder, ReplayRunner
+from state_tracker import StateTracker
+
+log = logging.getLogger(__name__)
+
+MOCK = os.environ.get("LTESNIFFER_GUI_MOCK", "").lower() in {"1", "true", "yes"}
+REPLAY = os.environ.get("LTESNIFFER_GUI_REPLAY", "").strip()
+
+# Two-tool split: this same GUI backend can run as either role. "capture"
+# (default) sniffs LTE and forwards the live pcap out; ships only the
+# Dashboard/Config frontend pages. "decrypt" additionally opens a
+# pcap-over-IP listener that a remote (or, for now, local) capture
+# instance's live forwarder connects out to — see pcap_receive.py /
+# pcap_forward.py — and ships the UEs/Sessions/Captures/Log History/Help
+# pages instead. The two frontend bundles are separate Vite builds with
+# disjoint module graphs (see frontend/vite.config.ts) — not a hidden nav.
+#
+# The backend mirrors that split at the import/route level, not just the
+# frontend: a capture-role deployment must have ZERO trace of session/UE
+# analysis (sessions.py, analytics.py's RNTI-churn, pcap_receive.py) — if
+# that device is lost, its disk should show nothing beyond "captures LTE
+# and forwards it somewhere". Symmetrically, a decrypt-role deployment
+# never touches USRPs/RF, so it doesn't need sniffer.py/usrp.py/spectrum.py/
+# known_cells.py at all. Each such module is imported ONLY on the role that
+# needs it, and its routes are registered ONLY on that role — so the other
+# role's deploy can physically omit the file and main.py still boots clean.
+GUI_ROLE = os.environ.get("LTESNIFFER_GUI_ROLE", "capture").strip().lower()
+FRONTEND_DIST = (Path(__file__).resolve().parent.parent / "frontend"
+                  / ("dist-decrypt" if GUI_ROLE == "decrypt" else "dist-capture"))
+
+if GUI_ROLE == "decrypt":
+    import pcap_receive
+    import analytics
+    import sessions
+else:
+    from sniffer import SnifferRunner
+    import sniffer as sniffer_mod
+    from usrp import find_devices, auto_config_patch, probe_all_gpsdo
+    from spectrum import SpectrumLauncher
+    import known_cells as known_cells_mod
+    from known_cells import KnownCellsFile, KnownCell, KNOWN_CELLS_PATH
+
+
+_KILL_SCRIPT = (
+    Path(__file__).resolve().parent.parent.parent / "scripts" / "kill-ltesniffer.sh"
+)
+
+
+def _kill_stale_ltesniffers() -> None:
+    """Kill any LTESniffer processes left over from a previous session.
+
+    This handles the case where the backend was killed without a clean shutdown
+    (SIGKILL, OOM-killer, power loss) and the LTESniffer subprocess (which runs
+    under sudo) was orphaned and left consuming memory.
+
+    Uses the dedicated kill-wrapper script (whitelisted in sudoers NOPASSWD)
+    so root-owned processes can be reached from the non-root backend.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "LTESniffer"],
+            capture_output=True, text=True, timeout=3
+        )
+        pids = result.stdout.strip().split()
+        if not pids:
+            return
+        log.warning(
+            "Startup: found %d stale LTESniffer process(es) (PIDs: %s) — killing.",
+            len(pids), " ".join(pids)
+        )
+        # First try unprivileged SIGKILL (works if process runs as same user).
+        subprocess.run(["pkill", "-KILL", "-x", "LTESniffer"], capture_output=True, timeout=3)
+        # Then use the sudoers-whitelisted script to reach root-owned processes.
+        if _KILL_SCRIPT.exists():
+            subprocess.run(["sudo", "-n", str(_KILL_SCRIPT)], capture_output=True, timeout=5)
+    except Exception as exc:
+        log.debug("_kill_stale_ltesniffers: %s", exc)
+
+
+# UHD on Linux drops samples ("O"/"D" in stderr) when the kernel socket buffer
+# is smaller than what the streamer needs at the configured sample rate. The
+# Ettus knowledge base recommends 24MB for 20-MHz LTE captures.
+_RMEM_MIN = 24 * 1024 * 1024
+
+
+def _check_rmem_max() -> None:
+    """Read /proc/sys/net/core/rmem_max and warn (with fix command) if low.
+
+    Only relevant for Ethernet-attached USRPs (X310/N310) — B210 is USB so
+    this knob doesn't affect it — but it's a one-liner to surface either way.
+    """
+    try:
+        with open("/proc/sys/net/core/rmem_max") as f:
+            current = int(f.read().strip())
+    except OSError as exc:
+        log.debug("rmem_max probe failed: %s", exc)
+        return
+    if current < _RMEM_MIN:
+        log.warning(
+            "net.core.rmem_max=%d (need >=%d for clean UHD streaming at >=20MHz). "
+            "Fix:  sudo sysctl -w net.core.rmem_max=%d "
+            "(persist by adding the line to /etc/sysctl.d/99-uhd.conf)",
+            current, _RMEM_MIN, _RMEM_MIN,
+        )
+
+
+_zmq = zmq_pub.maybe_create()
+_metrics = MetricsBus()
+_state_tracker = StateTracker(cell_id=0)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- startup ----
+    _kill_stale_ltesniffers()
+    _check_rmem_max()
+    await _metrics.start(runner)
+    await _state_tracker.start(runner)
+    if _zmq is not None:
+        await _zmq.start(runner)
+    if not REPLAY:
+        # Don't record a replay session — we'd double-write history with no value.
+        await _recorder.start(runner)
+    # If REPLAY is set, kick the replay off immediately so the dashboard sees data.
+    if REPLAY:
+        await runner.start(None)
+    # Auth banner so the operator can't miss the security posture they're in.
+    # HTTPS + session-cookie auth, no loopback bypass — every request authenticates.
+    log.warning(
+        "==================================================================\n"
+        "  GUI bound to %s — HTTPS + in-app Login page (no loopback bypass).\n"
+        "  Credentials: %s\n"
+        "  First start prints the auto-generated password to stderr ONCE.\n"
+        "  Sessions: in-memory, 8h idle timeout, HttpOnly Secure SameSite=Strict cookie.\n"
+        "  To rotate creds: delete %s and restart.\n"
+        "==================================================================",
+        BIND, AUTH_PATH, AUTH_PATH,
+    )
+    if GUI_ROLE == "decrypt":
+        cfg = config_mod.load()
+        pcap_receive.receiver.start(cfg.pcap_receive_bind, cfg.pcap_receive_port, cfg.captures_dir)
+        st = pcap_receive.receiver.status()
+        log.warning(
+            "==================================================================\n"
+            "  role=%s — pcap receive %s on %s:%s (state=%s)\n"
+            "  Point a capture instance's Live pcap forwarding at: %s:%s\n"
+            "  Incoming pcaps land in: %s\n"
+            "==================================================================",
+            GUI_ROLE, "READY" if st["state"] == "listening" else "FAILED",
+            cfg.pcap_receive_bind, cfg.pcap_receive_port, st["state"],
+            auth_mod._autodetect_lan_ip(), cfg.pcap_receive_port, cfg.captures_dir,
+        )
+    yield
+    # ---- shutdown ----
+    # Stop all subprocesses so nothing is orphaned when the server exits.
+    # This runs when uvicorn receives SIGINT / SIGTERM or is programmatically stopped.
+    log.info("Shutdown: stopping sniffer and spectrum processes…")
+    if GUI_ROLE == "decrypt":
+        pcap_receive.receiver.stop()
+    try:
+        await runner.stop()
+    except Exception as exc:
+        log.warning("Error stopping runner on shutdown: %s", exc)
+    if spectrum is not None:
+        try:
+            await spectrum.stop()
+        except Exception as exc:
+            log.warning("Error stopping spectrum on shutdown: %s", exc)
+    if _zmq is not None:
+        try:
+            await _zmq.stop()
+        except Exception as exc:
+            log.warning("Error stopping zmq on shutdown: %s", exc)
+    try:
+        await _metrics.stop()
+    except Exception as exc:
+        log.warning("Error stopping metrics on shutdown: %s", exc)
+    try:
+        await _recorder.stop()
+    except Exception as exc:
+        log.warning("Error stopping recorder on shutdown: %s", exc)
+    try:
+        await _state_tracker.stop()
+    except Exception as exc:
+        log.warning("Error stopping state_tracker on shutdown: %s", exc)
+    log.info("Shutdown: all subprocesses stopped.")
+
+
+# A decrypt-role instance never captures (no /api/capture/* routes exist on
+# it — see below), so it uses MockRunner purely as an inert stand-in that
+# satisfies _metrics/_state_tracker/_recorder/_zmq's shared "runner" interface
+# without needing sniffer.py/usrp.py present. It's never .start()ed, so it
+# never emits its synthetic events either — it just sits idle, same as a
+# real SnifferRunner would before a capture starts.
+if GUI_ROLE == "decrypt":
+    runner = MockRunner()
+    spectrum = None
+elif REPLAY:
+    runner = ReplayRunner(Path(REPLAY).expanduser())
+elif MOCK:
+    runner = MockRunner()
+else:
+    runner = SnifferRunner()
+if GUI_ROLE != "decrypt":
+    spectrum = SpectrumLauncher()
+_recorder = SessionRecorder()
+
+app = FastAPI(title="LTESniffer GUI Backend", lifespan=lifespan)
+# Tightened CORS: spec-compliant, only allows the bind host + dev server.
+# HTTPS is the production posture; HTTP is only listed for the vite dev server
+# during frontend hacking (it talks to the backend through the vite proxy).
+_allowed_origins = [
+    f"https://{BIND}:8443",
+    f"https://{BIND}:8000",  # if operator chose 8000 for HTTPS
+    "https://127.0.0.1:8443",
+    "https://localhost:8443",
+]
+# Plaintext vite dev origins are only allowed when explicitly developing — they
+# must never ship enabled on a credentialed-CORS admin console.
+if os.environ.get("LTESNIFFER_GUI_DEV") == "1":
+    _allowed_origins += ["http://localhost:5173", "http://127.0.0.1:5173"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(dict.fromkeys(_allowed_origins)),  # dedupe, preserve order
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Session-analysis routes live entirely in their own modules (sessions.py /
+# pcap_receive.py / analytics.py) — see the top-of-file comment. A
+# capture-role deployment that omits those files simply never gets these
+# routes registered at all; they're not disabled, they don't exist.
+if GUI_ROLE == "decrypt":
+    app.include_router(pcap_receive.router)
+    app.include_router(analytics.router)
+    app.include_router(sessions.router)
+
+
+# Auth-free routes. /api/login is obviously needed (you can't auth in if
+# you can't reach the login endpoint). /api/health stays open so operators
+# can distinguish "auth failed" (401) from "server down" (no response).
+# The SPA index at `/` is ALSO auth-free so the React app can boot, render
+# the Login.tsx page, and POST credentials. /assets/* serves the bundled
+# JS/CSS the SPA needs to render at all.
+_AUTH_FREE_PREFIXES = ("/api/health", "/api/login", "/assets/")
+_AUTH_FREE_EXACT: set[str] = {"/"}
+
+
+@app.middleware("http")
+async def _auth_gate(request, call_next):
+    """Block every /api/* request without a valid session cookie.
+
+    No WWW-Authenticate header on 401 — we explicitly DON'T want the
+    browser's native popup; the SPA's <Login> page handles auth UI.
+
+    The SPA shell (`/`) and its assets are served unauthenticated so the
+    React app can render the Login page; every /api/* call from that
+    Login page (except /api/login itself) requires a valid session
+    cookie."""
+    path = request.url.path
+    if path in _AUTH_FREE_EXACT or any(path.startswith(p) for p in _AUTH_FREE_PREFIXES):
+        return await call_next(request)
+    # Only gate /api/*; static SPA routes (catch-all in spa()) also flow
+    # through here, but if they're not in the auth-free list we still let
+    # them through so the SPA can render its own Login UI.
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    try:
+        await require_session(request)
+    except HTTPException as exc:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return await call_next(request)
+
+
+# ── Auth endpoints (the only /api/* paths the SPA can hit unauthenticated) ──
+
+class _LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+# Per-IP failed-login throttle (in-memory). bcrypt is slow but a strong password
+# can still be online-guessed without a rate limit; lock out an IP after too many
+# failures in a window.
+_LOGIN_FAILS: dict[str, list[float]] = {}
+_LOGIN_WINDOW_S = 300.0
+_LOGIN_MAX_FAILS = 10
+
+
+def _login_throttled(ip: str) -> bool:
+    now = time.monotonic()
+    fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    _LOGIN_FAILS[ip] = fails
+    return len(fails) >= _LOGIN_MAX_FAILS
+
+
+@app.post("/api/login")
+async def login(body: _LoginBody, request: Request, response: Response) -> dict[str, Any]:
+    """Validate credentials, mint a session, set the cookie.
+
+    On wrong creds we return 401 with a generic message ("invalid
+    credentials") rather than distinguishing wrong-user from wrong-pass —
+    enumeration defense in depth, layered on the constant-time verify."""
+    ip = request.client.host if request.client else "?"
+    if _login_throttled(ip):
+        raise HTTPException(status_code=429, detail="too many attempts, try again later")
+    # bcrypt(12) takes ~250ms; run it off the event loop so a login (or a flood
+    # of them) can't stall the live WS event stream.
+    if not await asyncio.to_thread(verify_credentials, body.username, body.password):
+        _LOGIN_FAILS.setdefault(ip, []).append(time.monotonic())
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    _LOGIN_FAILS.pop(ip, None)  # reset on success
+    token = create_session(body.username)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_S,
+        httponly=True,            # JS can't read it (XSS exfiltration defense)
+        secure=True,              # only over TLS (we're HTTPS-only)
+        samesite="strict",        # never sent on cross-site requests
+        path="/",
+    )
+    return {"ok": True, "username": body.username}
+
+
+@app.post("/api/logout")
+async def logout(request: Request, response: Response) -> dict[str, Any]:
+    """Drop the server-side session and clear the cookie. Idempotent —
+    works whether or not the caller had a valid session."""
+    drop_session(request.cookies.get(COOKIE_NAME))
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/whoami")
+async def whoami(request: Request) -> dict[str, Any]:
+    """Cheap auth probe for the SPA: returns 200 + username if the cookie
+    is valid, 401 otherwise. The SPA calls this on mount to decide
+    whether to show Login or Dashboard."""
+    user = session_user(request.cookies.get(COOKIE_NAME))
+    if not user:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    return {"username": user}
+
+
+# /api/health is intentionally token-free: lets a misconfigured client tell
+# the difference between "wrong token" (401) and "server down" (no response).
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    # auth_required is always True with the new HTTP Basic Auth model — no
+    # loopback bypass. Field kept for client-side compatibility.
+    out: dict[str, Any] = {"ok": True, "mock": MOCK, "auth_required": True, "role": GUI_ROLE}
+    if GUI_ROLE == "decrypt":
+        out["receiving"] = pcap_receive.receiver.status()["state"] in ("listening", "connected")
+    return out
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    from fastapi.responses import Response
+    body, content_type = _metrics.render()
+    return Response(content=body, media_type=content_type)
+
+
+@app.get("/api/config", response_model=SnifferConfig)
+async def get_config() -> SnifferConfig:
+    return config_mod.load()
+
+
+@app.get("/api/forward/status")
+async def get_forward_status() -> dict:
+    """Live pcap-forwarding status (state / bytes / reconnects) for the GUI."""
+    return pcap_forward.forwarder.status()
+
+
+@app.put("/api/config", response_model=SnifferConfig)
+async def put_config(cfg: SnifferConfig) -> SnifferConfig:
+    # Security gate: anything that becomes argv to a root-owned process must
+    # be validated server-side, not just sanitized client-side. Capture-only:
+    # binary_path/pcap_stream_fifo are LTESniffer-binary/local-Wireshark
+    # concerns that don't apply to a decrypt instance — which also doesn't
+    # have sniffer.py on disk to import (binary_path's field default is a
+    # non-empty string, so this ran on EVERY save, every role, until this
+    # guard — ModuleNotFoundError wasn't caught by `except PermissionError`,
+    # so it 500'd instead of being skipped).
+    if GUI_ROLE != "decrypt":
+        if cfg.binary_path:
+            try:
+                from sniffer import _resolve_and_validate_binary
+                _resolve_and_validate_binary(cfg.binary_path)
+            except PermissionError as e:
+                raise HTTPException(403, f"binary_path rejected: {e}")
+            except FileNotFoundError:
+                # Tolerate not-yet-built binary at save time; start will reject later.
+                pass
+        if cfg.pcap_stream_fifo:
+            # Fail fast on out-of-allowlist paths so the user gets a useful error
+            # at Save time, not 30s later when they hit ▶ Start. We don't actually
+            # mkfifo here (that happens at capture/start); just validate the path
+            # shape via the same helper. tolerates the path not existing yet.
+            try:
+                from sniffer import _STREAM_FIFO_ALLOWED_ROOTS
+                p = Path(cfg.pcap_stream_fifo).expanduser()
+                if not p.is_absolute() or p.is_symlink() or \
+                   not any(str(p).startswith(str(r) + os.sep) for r in _STREAM_FIFO_ALLOWED_ROOTS):
+                    raise PermissionError(
+                        f"must be an absolute non-symlink path under one of: "
+                        f"{', '.join(str(r) for r in _STREAM_FIFO_ALLOWED_ROOTS)}"
+                    )
+            except PermissionError as e:
+                raise HTTPException(403, f"pcap_stream_fifo rejected: {e}")
+    config_mod.save(cfg)
+    # Receive settings apply immediately — this instance never "starts a
+    # capture" to hook a restart into, so PUT /api/config is the only place
+    # a bind/port change can take effect.
+    if GUI_ROLE == "decrypt":
+        st = pcap_receive.receiver.status()
+        if st.get("bind") != cfg.pcap_receive_bind or st.get("port") != cfg.pcap_receive_port:
+            pcap_receive.receiver.start(cfg.pcap_receive_bind, cfg.pcap_receive_port, cfg.captures_dir)
+    return cfg
+
+
+@app.get("/api/status")
+async def status() -> dict[str, Any]:
+    return {"state": runner.state(), "mock": MOCK}
+
+
+# Cell-ID is a bounded tshark scan of SIB1; the identity is static per cell lock,
+# so cache it briefly to keep the dashboard poll cheap on a long/live pcap.
+_CELLID_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_CELLID_TTL_S = 15.0
+
+
+@app.get("/api/cell-id")
+async def cell_id() -> dict[str, Any]:
+    """WHICH tower we're on: E-UTRAN Cell Identity (+ eNB-ID / sector / TAC / PLMN)
+    read from SIB1 in the current (or latest) capture. PCI alone doesn't identify
+    a cell — many towers reuse the same PCI."""
+    cfg = config_mod.load()
+    running = bool(runner.state().get("running"))
+    pcaps = captures_mod.list_pcaps(cfg, running)
+    if not pcaps:
+        return {"ok": False, "error": "no capture available"}
+    pcap = pcaps[0]["path"]
+    now = time.monotonic()
+    hit = _CELLID_CACHE.get(pcap)
+    if hit and now - hit[0] < _CELLID_TTL_S:
+        info = hit[1]
+    else:
+        info = await asyncio.to_thread(captures_mod.read_cell_id, Path(pcap))
+        _CELLID_CACHE[pcap] = (now, info)
+    if not info:
+        return {"ok": False, "error": "SIB1 not decoded yet — cell identity unavailable", "source": pcap}
+    return {"ok": True, "source": pcap, **info}
+
+
+@app.post("/api/pin-cell")
+async def pin_cell() -> dict[str, Any]:
+    """Pin the configured PCI (+PRB), decode SIB1 until we read the MCC/MNC of the
+    cell transmitting there, then set the config to pinned mode (cell-search off)
+    with that PLMN. Needs the radios free (stop any capture first)."""
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    cfg = config_mod.load()
+    if bool(runner.state().get("running")):
+        return {"ok": False, "error": "Stop the current capture first — pinning needs the radios."}
+    import scanner
+    result = await asyncio.to_thread(scanner.pin_cell, cfg)
+    if result.get("ok"):
+        # Exact-PCI lock: fast search forcing both PSS group (-l) and SSS (-N).
+        cfg.cell_search = True
+        cfg.force_n_id_2 = result.get("n_id_2", cfg.cell_id % 3)
+        cfg.force_n_id_1 = result.get("n_id_1", cfg.cell_id // 3)
+        if result.get("mcc"):
+            cfg.mcc = result["mcc"]
+        if result.get("mnc"):
+            cfg.mnc = result["mnc"]
+        config_mod.save(cfg)
+    return result
+
+
+@app.post("/api/pin-cell/stop")
+async def pin_cell_stop() -> dict[str, Any]:
+    """Abort an in-flight Pin cell (user changed their mind mid-run)."""
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    import scanner
+    return scanner.cancel_pin()
+
+
+@app.post("/api/capture/start")
+async def capture_start(cfg: SnifferConfig | None = None) -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    if cfg is None:
+        cfg = config_mod.load()
+    else:
+        config_mod.save(cfg)
+    if runner.running:
+        raise HTTPException(409, "sniffer already running")
+    try:
+        await runner.start(cfg)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"failed to start: {e}")
+    return {"ok": True, "state": runner.state()}
+
+
+@app.post("/api/capture/dense-test")
+async def capture_dense_test() -> dict[str, Any]:
+    """TEMPORARY: start a normal capture with the UL diagnostics enabled.
+
+    Identical to /api/capture/start (same config → same pcap, visible in
+    Captures/Sessions), but the run also enables the env-gated UL diagnostics and
+    saves their output to <run_dir>/ul_diag.log for offline analysis. Meant for a
+    dense-area test where the extra UL instrumentation is wanted."""
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    cfg = config_mod.load()
+    if runner.running:
+        raise HTTPException(409, "sniffer already running")
+    try:
+        await runner.start(cfg, diag=True)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"failed to start: {e}")
+    return {"ok": True, "state": runner.state()}
+
+
+@app.post("/api/capture/stop")
+async def capture_stop() -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    await runner.stop()
+    return {"ok": True, "state": runner.state()}
+
+
+@app.post("/api/capture/restart")
+async def capture_restart(cfg: SnifferConfig | None = None) -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    if cfg is None:
+        cfg = config_mod.load()
+    else:
+        config_mod.save(cfg)
+    try:
+        await runner.restart(cfg)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"failed to restart: {e}")
+    return {"ok": True, "state": runner.state()}
+
+
+@app.get("/api/usrps")
+async def list_usrps() -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    # NEVER enumerate USB (uhd_find_devices) while a capture holds the USRPs —
+    # the scan resets the bus and disconnects the running radios.
+    if runner.running:
+        return {"devices": [], "running": True, "skipped": "capture running"}
+    return {"devices": await find_devices()}
+
+
+@app.get("/api/usrps/autoconfig")
+async def usrps_autoconfig() -> dict[str, Any]:
+    """Detect connected USRPs and return a suggested config patch.
+
+    The frontend can apply this patch to pre-fill serial numbers without the
+    user having to type them manually.  Keys starting with '_' are metadata
+    (not SnifferConfig fields) and should not be written to the config.
+    """
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    # Auto-detect runs uhd_find_devices — skip entirely while capturing so it
+    # can't reset the bus out from under the live radios.
+    if runner.running:
+        return {"_running": True,
+                "_message": "Capture running — USRP auto-detect skipped to avoid disturbing the radios."}
+    return await auto_config_patch()
+
+
+@app.get("/api/usrps/gpsdo")
+async def probe_usrps_gpsdo() -> dict[str, Any]:
+    """Probe all connected USRPs for GPSDO presence via uhd_usrp_probe.
+
+    Slow endpoint (~3-8 s per device, run concurrently).  The frontend calls
+    this in the background after auto-config and uses the result to
+    conditionally add clock=gpsdo to usrp_a_args / usrp_b_args.
+    """
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    # uhd_usrp_probe OPENS each device — absolutely must not run during a
+    # capture or it yanks the USRP away from the running sniffer.
+    if runner.running:
+        return {"devices": [], "running": True,
+                "message": "Capture running — GPSDO probe skipped (uhd_usrp_probe would reset the radios)."}
+    devices = await find_devices()
+    if not devices:
+        return {"devices": [], "message": "No USRPs detected."}
+    probed = await probe_all_gpsdo(devices)
+    with_gpsdo = [d["serial"] for d in probed if d.get("gpsdo") and d.get("serial")]
+    without_gpsdo = [d["serial"] for d in probed if not d.get("gpsdo") and d.get("serial")]
+    if not without_gpsdo:
+        msg = f"GPSDO detected on all {len(probed)} device(s) — clock=gpsdo applied."
+    elif not with_gpsdo:
+        msg = (
+            f"No GPSDO detected on any device ({', '.join(without_gpsdo)}). "
+            "Dual mode may have sync issues without a shared clock reference."
+        )
+    else:
+        msg = (
+            f"GPSDO found on {', '.join(with_gpsdo)}; "
+            f"NOT found on {', '.join(without_gpsdo)}."
+        )
+    return {"devices": probed, "message": msg}
+
+
+@app.get("/api/spectrum")
+async def spectrum_status() -> dict[str, Any]:
+    if spectrum is None:
+        raise HTTPException(404)
+    return spectrum.status()
+
+
+@app.post("/api/spectrum/launch")
+async def spectrum_launch(body: dict[str, Any]) -> dict[str, Any]:
+    if spectrum is None:
+        raise HTTPException(404)
+    freq = float(body.get("freq_hz") or 0)
+    sr = float(body.get("sample_rate_hz") or 0)
+    tool = body.get("tool")
+    device_args = body.get("device_args") or None
+    if freq <= 0:
+        raise HTTPException(400, "freq_hz required")
+    # Optional tuning knobs forwarded to the spectrum tool's argv. Each is
+    # passed through unchanged when set, omitted (tool default) when not.
+    extras = {
+        k: body.get(k)
+        for k in ("gain_db", "antenna", "fft_size", "fft_average", "update_rate")
+        if body.get(k) not in (None, "")
+    }
+    try:
+        return await spectrum.launch(freq, sr, tool, device_args, extras)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except RuntimeError as e:
+        # 422 keeps the body (with the stderr-derived message) for the UI to display.
+        raise HTTPException(422, str(e))
+
+
+@app.post("/api/spectrum/stop")
+async def spectrum_stop() -> dict[str, Any]:
+    if spectrum is None:
+        raise HTTPException(404)
+    return await spectrum.stop()
+
+
+# Whole block conditional, not just body guards: the request/response models
+# below (KnownCellsFile, KnownCell) are only imported on the capture role, and
+# FastAPI resolves parameter annotations at route-registration time (even
+# with `from __future__ import annotations`) — a body-only guard would still
+# NameError at import time on a decrypt-role process. This whole feature is
+# capture-side RF tuning aid anyway; doesn't apply to a decrypt instance.
+if GUI_ROLE != "decrypt":
+    @app.get("/api/known-cells")
+    async def get_known_cells() -> dict[str, Any]:
+        kcf = known_cells_mod.load()
+        return {"cells": [c.model_dump() for c in kcf.cells], "path": str(KNOWN_CELLS_PATH)}
+
+    @app.put("/api/known-cells")
+    async def put_known_cells(body: KnownCellsFile) -> dict[str, Any]:
+        try:
+            path = known_cells_mod.save(body)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        return {"ok": True, "path": str(path), "n_cells": len(body.cells)}
+
+    @app.post("/api/known-cells/{idx}/load")
+    async def load_known_cell_into_config(idx: int) -> dict[str, Any]:
+        """Copy a known cell's freq/USRP/mode settings into the active SnifferConfig.
+        Returns the updated config so the GUI can refresh the form."""
+        kcf = known_cells_mod.load()
+        if idx < 0 or idx >= len(kcf.cells):
+            raise HTTPException(404, f"known cell index {idx} out of range (have {len(kcf.cells)})")
+        cell = kcf.cells[idx]
+        cfg = config_mod.load()
+        cfg.rf_freq = cell.dl_freq_mhz * 1e6
+        cfg.ul_freq = cell.ul_freq_mhz * 1e6
+        cfg.nof_prb = cell.nof_prb
+        cfg.sniffer_mode = cell.sniffer_mode
+        cfg.usrp_a_args = cell.usrp_a_args
+        cfg.usrp_b_args = cell.usrp_b_args
+        cfg.rf_gain = cell.rf_gain
+        config_mod.save(cfg)
+        return {"ok": True, "loaded": cell.label, "config": cfg.model_dump()}
+
+    @app.post("/api/known-cells/save-current")
+    async def save_current_as_known_cell(body: dict[str, Any]) -> dict[str, Any]:
+        """Snapshot the active SnifferConfig + a label/notes into a new KnownCell.
+
+        The label is required; notes/PCI are optional. Other fields are copied from
+        the live SnifferConfig (freq, mode, USRP rfargs, gain, PRB).
+        """
+        import time as _t
+        label = (body.get("label") or "").strip()
+        if not label:
+            raise HTTPException(400, "label is required")
+        cfg = config_mod.load()
+        kcf = known_cells_mod.load()
+        cell = KnownCell(
+            label=label,
+            dl_freq_mhz=cfg.rf_freq / 1e6,
+            ul_freq_mhz=cfg.ul_freq / 1e6,
+            bandwidth_mhz=body.get("bandwidth_mhz"),
+            nof_prb=cfg.nof_prb,
+            pci=body.get("pci"),
+            sniffer_mode=cfg.sniffer_mode,
+            usrp_a_args=cfg.usrp_a_args,
+            usrp_b_args=cfg.usrp_b_args,
+            rf_gain=cfg.rf_gain,
+            last_success_iso=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+            notes=(body.get("notes") or "").strip(),
+        )
+        kcf.cells.append(cell)
+        path = known_cells_mod.save(kcf)
+        return {"ok": True, "path": str(path), "idx": len(kcf.cells) - 1, "cell": cell.model_dump()}
+
+    @app.put("/api/known-cells/{idx}")
+    async def update_known_cell(idx: int, cell: KnownCell) -> dict[str, Any]:
+        kcf = known_cells_mod.load()
+        if idx < 0 or idx >= len(kcf.cells):
+            raise HTTPException(404, f"known cell idx {idx} out of range")
+        kcf.cells[idx] = cell
+        known_cells_mod.save(kcf)
+        return {"ok": True, "cell": cell.model_dump()}
+
+    @app.delete("/api/known-cells/{idx}")
+    async def delete_known_cell(idx: int) -> dict[str, Any]:
+        kcf = known_cells_mod.load()
+        if idx < 0 or idx >= len(kcf.cells):
+            raise HTTPException(404, f"known cell idx {idx} out of range")
+        removed = kcf.cells.pop(idx)
+        known_cells_mod.save(kcf)
+        return {"ok": True, "removed_label": removed.label, "n_remaining": len(kcf.cells)}
+
+
+@app.get("/api/logs/history")
+async def list_log_history() -> dict[str, Any]:
+    """List past sniffer-run logs (one per capture run), newest first."""
+    cfg = config_mod.load()
+    return {"runs": runlogs.list_run_logs(cfg)}
+
+
+@app.get("/api/logs/content")
+async def get_log_content(path: str) -> dict[str, Any]:
+    """Return the text of one run's sniffer.log (restricted to captures_dir)."""
+    cfg = config_mod.load()
+    try:
+        return {"path": path, "text": runlogs.read_run_log(cfg, path)}
+    except FileNotFoundError:
+        raise HTTPException(404, f"log not found: {path}")
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+
+
+@app.get("/api/captures")
+async def list_captures() -> dict[str, Any]:
+    cfg = config_mod.load()
+    roots = [str(r) for r in captures_mod.allowed_roots(cfg)]
+    return {
+        "captures": captures_mod.list_pcaps(cfg, sniffer_running=runner.running),
+        "roots": roots,
+        "captures_dir": str(Path(cfg.captures_dir).expanduser()),
+    }
+
+
+@app.get("/api/captures/download")
+async def download_capture(path: str) -> FileResponse:
+    cfg = config_mod.load()
+    try:
+        p = captures_mod.resolve_for_download(cfg, path)
+    except FileNotFoundError:
+        raise HTTPException(404, "pcap not found")
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    return FileResponse(p, media_type="application/vnd.tcpdump.pcap", filename=p.name)
+
+
+@app.get("/api/captures/split-dims")
+async def split_dims() -> dict[str, Any]:
+    """Catalog of available split dimensions for the GUI."""
+    return {"dimensions": captures_mod.split_dimensions()}
+
+
+class _SplitBody(BaseModel):
+    path: str
+    dims: list[str]
+
+
+@app.post("/api/captures/split")
+async def split_capture(body: _SplitBody) -> dict[str, Any]:
+    """Partition a capture into nested sub-pcaps along the chosen dimensions
+    (RNTI / UE identity / direction / RNTI class / packet type / security).
+    Blocking tshark work → off the event loop; failures return ok=False."""
+    cfg = config_mod.load()
+    return await asyncio.to_thread(
+        captures_mod.split_capture, cfg, body.path, body.dims
+    )
+
+
+@app.get("/api/fs/browse")
+async def fs_browse(path: str | None = None) -> dict[str, Any]:
+    """Directory listing for the capture file picker. Defaults to captures_dir;
+    can navigate anywhere on the machine (authenticated local admin GUI)."""
+    cfg = config_mod.load()
+    return await asyncio.to_thread(captures_mod.browse_dir, cfg, path)
+
+
+class _OrganizeBody(BaseModel):
+    path: str
+
+
+@app.post("/api/captures/organize")
+async def organize_session(body: _OrganizeBody) -> dict[str, Any]:
+    """Build a per-session folder: full pcap + one sub-pcap per UE named by
+    TMSI/IMSI (else RNTI). Cleartext only. tshark/IO is blocking → run off the
+    event loop; failures return ok=False (not a 500)."""
+    cfg = config_mod.load()
+    return await asyncio.to_thread(
+        captures_mod.organize_session, cfg, body.path
+    )
+
+
+@app.websocket("/api/events")
+async def events_ws(ws: WebSocket) -> None:
+    # Auth check BEFORE accept(): we don't want to give an unauthed peer a
+    # 101 upgrade response with our subprotocol/server info. The browser
+    # auto-sends the same-origin session cookie on WS upgrade, so this
+    # works without any URL-side token.
+    if not await require_session_ws(ws):
+        return
+    await ws.accept()
+    # Subscribe *after* capturing the replay snapshot so events that arrive
+    # during the replay send (which could be hundreds of frames at real-LTE
+    # rates) don't fill the new subscriber's queue before it starts draining.
+    replay_events = runner.replay()
+    q = runner.subscribe()
+    try:
+        # Single envelope instead of N send_text calls — one frame, one parse
+        # on the frontend, one reducer dispatch.
+        if replay_events:
+            await ws.send_text(json.dumps({"t": "replay", "events": replay_events}))
+        while True:
+            # Each queue item is (event_dict, encoded_str). Use the cached
+            # encoding so we don't re-json.dumps per subscriber.
+            _ev, encoded = await q.get()
+            await ws.send_text(encoded)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        runner.unsubscribe(q)
+
+
+# --- Wireshark live-stream launcher ------------------------------------------
+#
+# `wireshark -k -i <fifo>` opens Wireshark and starts capturing immediately
+# on the named pipe. Pairs with the cfg.pcap_stream_fifo / LTESNIFFER_PCAP_STREAM
+# wiring on the C++ side so MAC PDUs are dissected as they are written.
+
+@app.post("/api/wireshark/open")
+async def open_wireshark() -> dict[str, Any]:
+    if GUI_ROLE == "decrypt":
+        raise HTTPException(404)
+    cfg = config_mod.load()
+    if not cfg.pcap_stream_fifo:
+        raise HTTPException(
+            400,
+            "No pcap_stream_fifo set in config. Pick a path on the Config page "
+            "(e.g. /tmp/lte.pcap) and Save first.",
+        )
+    if not shutil.which("wireshark"):
+        raise HTTPException(404, "wireshark not on PATH. Install with: sudo apt install wireshark")
+    # dumpcap is what Wireshark spawns under the hood to read from interfaces
+    # (incl. FIFOs). On Debian/Ubuntu it's mode 0754 group=wireshark, so the
+    # invoking user must be in the wireshark group OR dumpcap must have the
+    # right caps + be world-executable. Detect this up-front and surface a
+    # clear fix — otherwise Wireshark opens, fails internally, and the user
+    # just sees a cryptic GUI dialog ("Couldn't run /usr/bin/dumpcap in
+    # child process: Permission denied").
+    dumpcap = shutil.which("dumpcap") or "/usr/bin/dumpcap"
+    if os.path.exists(dumpcap) and not os.access(dumpcap, os.X_OK):
+        raise HTTPException(
+            403,
+            f"dumpcap ({dumpcap}) is not executable by the backend user. "
+            "Wireshark would die inside with 'Couldn't run dumpcap'. Fix:\n\n"
+            "  sudo usermod -aG wireshark $USER\n"
+            "  # then log out + back in, and restart the GUI backend\n\n"
+            "Or run:  sudo dpkg-reconfigure wireshark-common  (answer YES)."
+        )
+    disp = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if not disp:
+        raise HTTPException(
+            400,
+            "No $DISPLAY on the backend host; Wireshark needs a desktop session.",
+        )
+    # Make sure the FIFO exists *before* Wireshark opens it (Wireshark blocks
+    # on open until a writer connects, which is exactly what we want — but it
+    # needs the path to exist first).
+    try:
+        sniffer_mod._ensure_stream_fifo(cfg.pcap_stream_fifo)
+    except (PermissionError, OSError) as e:
+        raise HTTPException(400, f"pcap_stream_fifo rejected: {e}")
+    proc = await asyncio.create_subprocess_exec(
+        "wireshark", "-k", "-i", cfg.pcap_stream_fifo,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return {"ok": True, "pid": proc.pid, "fifo": cfg.pcap_stream_fifo}
+
+
+# --- User guide (auth-free; it's the same content as on disk in the repo) ----
+
+_USER_GUIDE = Path(__file__).resolve().parent.parent / "USER_GUIDE.txt"
+
+@app.get("/api/help", response_class=PlainTextResponse)
+async def help_text() -> PlainTextResponse:
+    if not _USER_GUIDE.exists():
+        raise HTTPException(404, f"USER_GUIDE.txt not found at {_USER_GUIDE}")
+    return PlainTextResponse(_USER_GUIDE.read_text(encoding="utf-8"))
+
+
+# --- Static frontend (served only if `npm run build` has been run) ----------
+
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def spa(full_path: str) -> FileResponse:
+        # A role-gated /api/* route that isn't registered on this instance
+        # (e.g. /api/known-cells on a decrypt-role process) must 404 cleanly,
+        # not silently fall through to the SPA shell — that would look like
+        # the route "worked" (200 + HTML) instead of correctly not existing.
+        if full_path.startswith("api/"):
+            raise HTTPException(404)
+        # no-store on the HTML so a fresh tab always picks up new hashed JS;
+        # the /assets/* files are content-hashed and safe to cache normally.
+        index = FRONTEND_DIST / "index.html"
+        return FileResponse(index, headers={"Cache-Control": "no-store, must-revalidate"})

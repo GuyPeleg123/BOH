@@ -39,6 +39,7 @@ void ArgManager::defaultArgs(Args& args) {
   args.disable_cfo = false;
   args.time_offset = 0;
   args.force_N_id_2 = -1; // Pick the best
+  args.force_N_id_1 = -1; // -N: -1 = any; >=0 forces the SSS N_id_1 (exact PCI)
   args.input_file_name = "";
   args.dci_file_name = "";
   args.stats_file_name = "";
@@ -58,6 +59,7 @@ void ArgManager::defaultArgs(Args& args) {
 #else
   args.rf_gain = 50.0;
 #endif
+  args.ul_rf_gain = -1.0;  // -G: independent UL (rf_b) gain; <0 = follow rf_gain/AGC
   args.decimate = 0;
   args.nof_sniffer_thread = DEFAULT_NOF_THREAD;
   // other args
@@ -119,15 +121,18 @@ void ArgManager::usage(Args& args, const std::string& prog) {
   printf("\t-f Downlink Frequency\n");
   printf("\t-u Uplink Frequency  \n");
   printf("\t-A Number of RX antennas [Default %d]\n", args.rf_nof_rx_ant);
-  printf("\t-m Sniffer mode, 0 for downlink sniffing mode, 1 for uplink sniffing mode\n");
+  printf("\t-m Sniffer mode, 0 for downlink only, 1 for uplink only, 2 for dual UL+DL (2 USRPs)\n");
   printf("\t-z API mode, 0 for identity mapping, 1 for IMSI collecting, 2 for UECapability profiling, 3 for all\n");
   printf("\t-d Enable debug mode, print debug message to screen (Defautl disable)\n");
+  printf("\t-J Path/FIFO for newline-delimited JSON events (used by the gui/ backend)\n");
+  printf("\t-X USRP A rfargs override (e.g. \"clock=gpsdo,serial=32FCD4C\")\n");
+  printf("\t-Z USRP B rfargs override (e.g. \"clock=gpsdo,serial=3367EF9\")\n");
 }
 
 void ArgManager::parseArgs(Args& args, int argc, char **argv) {
   int opt;
   defaultArgs(args);
-  while ((opt = getopt(argc, argv, "aAcCDdEfghHilLnpPrRsStTvwWyYqFIuUmOoz")) != -1) {
+  while ((opt = getopt(argc, argv, "aAcCDdEfgGhHilLNnpPrRsStTvwWyYqFIuUmOozJ:X:Z:")) != -1) {
     switch (opt) {
       case 'a':
         args.rf_args = argv[optind];
@@ -137,6 +142,9 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'g':
         args.rf_gain = strtod(argv[optind], nullptr);
+        break;
+      case 'G':
+        args.ul_rf_gain = strtod(argv[optind], nullptr);
         break;
       case 'L':
         args.enable_shortcut_discovery = false;
@@ -180,8 +188,12 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
       case 'l':
         args.force_N_id_2 = atoi(argv[optind]);
         break;
+      case 'N':
+        args.force_N_id_1 = atoi(argv[optind]);
+        break;
       case 'C':
         args.cell_search = true;
+        break;
       case 'm':
         args.sniffer_mode = static_cast<uint32_t>(strtoul(argv[optind], nullptr, 0));
         break;
@@ -236,6 +248,15 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
         break;
       case 'z':
         args.api_mode = static_cast<uint32_t>(strtoul(argv[optind], nullptr, 0));
+        break;
+      case 'J':
+        args.json_output = optarg;
+        break;
+      case 'X':
+        args.usrp_a_args = optarg;
+        break;
+      case 'Z':
+        args.usrp_b_args = optarg;
         break;
       case 'h':
       default:

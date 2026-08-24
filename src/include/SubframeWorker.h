@@ -10,6 +10,7 @@
 #include "ULSchedule.h"
 #include "falcon/prof/Lifetime.h"
 #include "UL_Sniffer_PUSCH.h"
+#include "UlDenseDecoder.h"
 #include "srsran/phy/io/filesink.h"
 #include "Sniffer_dependency.h"
 
@@ -33,7 +34,8 @@ public:
   void                  work();
   void                  printStats();
   cf_t*                 getBuffer(uint32_t antenna_idx);
-  cf_t**                getBuffers() {return sfb.sf_buffer;}
+  cf_t**                getBuffers_a() {return sfb.sf_buffer_a;}
+  cf_t**                getBuffers_b() {return sfb.sf_buffer_b;}
   cf_t**                getBuffers_offset() {return sfb.sf_buffer_offset;}
   uint32_t              getSfidx() const {return sf_idx;}
   uint32_t              getSfn() const {return sfn;}
@@ -76,7 +78,10 @@ private:
   bool                  has_pusch_config = false;
   ULSchedule            *ulsche;
   srsran_enb_ul_t       enb_ul = {};
+  srsran_enb_ul_t       enb_ul_b = {};
   PUSCH_Decoder         *puschdecoder;
+  PUSCH_Decoder         *puschdecoder_b;
+  UlDenseDecoder        *densedecoder = nullptr;   // from-scratch calibrated-window UL path (UL_DENSE2)
   srsran_ul_sf_cfg_t    ul_sf;
   srsran_ul_cfg_t       ul_cfg = {};
   UL_HARQ               *ul_harq;
