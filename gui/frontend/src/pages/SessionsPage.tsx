@@ -1,7 +1,13 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { SessionsResponse, SessionTa, UeSession } from "../lib/types";
+import type { ReceiveStatus, SessionsResponse, SessionTa, UeSession } from "../lib/types";
 import { FileBrowser } from "../components/FileBrowser";
+
+// How often the live view re-polls receive status + re-analyzes the
+// in-progress pcap. tshark re-parses the whole file each tick, so this is a
+// tradeoff between freshness and load — fine for capture-session-length
+// files; a very long-running live run will make each tick slower.
+const LIVE_POLL_MS = 3000;
 
 function fmtRange(m: number | null): string {
   if (m == null) return "—";
@@ -73,6 +79,42 @@ export function SessionsPage() {
   // Default to showing only UEs confirmed on THIS serving cell (TMSI + TA, or a
   // TMSI seen in the uplink). Paging alone is tracking-area-wide, not cell-proof.
   const [servingOnly, setServingOnly] = useState(true);
+
+  // Live mode: instead of a user-picked file, keep following whatever pcap
+  // the receiver is CURRENTLY writing (pcap_receive.py's last_file), which
+  // switches automatically to a fresh file the instant a new run connects —
+  // so this never shows a stale/old run once a new one starts pushing.
+  const [live, setLive] = useState(false);
+  const [rxStatus, setRxStatus] = useState<ReceiveStatus | null>(null);
+
+  useEffect(() => {
+    if (!live) return;
+    let cancelled = false;
+    async function tick() {
+      let rx: ReceiveStatus;
+      try {
+        rx = await api.receiveStatus();
+      } catch {
+        return;   // transient — try again next tick
+      }
+      if (cancelled) return;
+      setRxStatus(rx);
+      if (!rx.last_file) return;   // never received anything yet — nothing to analyze
+      setPath(rx.last_file);
+      setName(rx.last_file.split("/").pop() ?? rx.last_file);
+      try {
+        const r = await api.analyzeSessions(rx.last_file);
+        if (cancelled) return;
+        setResp(r);
+        setErr(r.ok ? null : r.error);
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      }
+    }
+    tick();
+    const id = setInterval(tick, LIVE_POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [live]);
 
   async function run() {
     setErr(null); setResp(null); setRunning(true);
@@ -184,12 +226,41 @@ export function SessionsPage() {
       <div className="flex items-center gap-2 mb-3 text-xs bg-bg border border-border rounded px-2 py-1.5 flex-wrap">
         <span className="text-muted uppercase text-[10px] shrink-0">Capture</span>
         <span className="font-mono text-slate-100 truncate" title={path ?? ""}>{name}</span>
-        <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => setBrowsing(true)}>📁 Browse…</button>
-        <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => { setPath(null); setName("(latest capture)"); }}>↺ latest</button>
-        <button className="btn btn-primary !px-3.5 !py-1.5 !text-sm ml-auto" disabled={running} onClick={run}>
-          {running ? "Analyzing…" : "Analyze sessions"}
+        {!live && (
+          <>
+            <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => setBrowsing(true)}>📁 Browse…</button>
+            <button className="btn !px-3 !py-1.5 !text-sm" onClick={() => { setPath(null); setName("(latest capture)"); }}>↺ latest</button>
+            <button className="btn btn-primary !px-3.5 !py-1.5 !text-sm" disabled={running} onClick={run}>
+              {running ? "Analyzing…" : "Analyze sessions"}
+            </button>
+          </>
+        )}
+        <button
+          className={`btn !px-3.5 !py-1.5 !text-sm ${live ? "!bg-bad/25 !border-bad/50 !text-bad" : ""} ml-auto`}
+          title="Follow whatever pcap the receiver is currently writing, re-analyzing it every few seconds. Switches automatically to a new run's file the instant one starts pushing."
+          onClick={() => setLive((v) => !v)}>
+          {live ? "⏹ Stop live" : "🔴 Show live"}
         </button>
       </div>
+
+      {live && (
+        <div className="flex items-center gap-3 mb-3 text-xs bg-bg border border-bad/40 rounded px-2 py-1.5 flex-wrap">
+          {rxStatus?.state === "connected" ? (
+            <>
+              <span className="flex items-center gap-1.5 text-bad font-semibold">
+                <span className="inline-block w-2 h-2 rounded-full bg-bad animate-pulse" /> LIVE
+              </span>
+              <span className="text-muted">receiving from <span className="text-slate-100 font-mono">{rxStatus.peer}</span></span>
+              <span className="text-muted">records: <span className="text-slate-100">{rxStatus.records.toLocaleString()}</span></span>
+              <span className="text-muted">bytes: <span className="text-slate-100">{rxStatus.bytes_in.toLocaleString()}</span></span>
+            </>
+          ) : rxStatus?.last_file ? (
+            <span className="text-muted">⏸ No run connected right now — showing the last received run (<span className="font-mono text-slate-100">{rxStatus.last_file.split("/").pop()}</span>). Will switch automatically when a new one connects.</span>
+          ) : (
+            <span className="text-muted">⏳ Waiting for a capture instance to connect and start forwarding…</span>
+          )}
+        </div>
+      )}
 
       {err && <div className="text-bad text-xs font-mono border border-bad/40 rounded p-2 mb-3">{err}</div>}
 

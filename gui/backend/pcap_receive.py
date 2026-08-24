@@ -186,8 +186,11 @@ class PcapReceiver:
                     with self._lock:
                         self._status["records"] += 1
                         self._status["bytes_in"] += _REC_HDR_LEN + caplen
-                    if nrec % 50 == 0:
-                        f.flush()
+                    # Flush every record, not batched — a live viewer re-reading
+                    # this file (tshark) must see each record promptly, and a
+                    # flush() here is just an OS-buffer handoff (no fsync), so
+                    # it's cheap even at real capture rates.
+                    f.flush()
             log.info("pcap receive: closed %s:%d (%d records, %d bytes) -> %s",
                       addr[0], addr[1], nrec, nbytes, out_path)
         finally:
